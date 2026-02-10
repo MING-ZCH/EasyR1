@@ -121,6 +121,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
                 else:
                     lora_weights[key] = lora_weight.detach().cpu()
 
+            submodule._is_root = False
             if self.use_param_offload:
                 offload_fsdp_submodule(submodule)
 
