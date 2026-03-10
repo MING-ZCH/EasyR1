@@ -16,7 +16,7 @@ ray[default]
 
 tensordict==0.8.3
 # torch==2.5.1 
-transformers==4.52.3 # 对应 torch==2.6.0
+transformers>=4.52.3,<5.0.0  # relax upper bound for Qwen3-VL (upstream #663); torch 2.6.0 stack
 # transformers==4.51.0
 # vllm>=0.7.3 
 # vllm==0.7.3 # 对应 torch==2.5.1 
@@ -25,5 +25,5 @@ torch==2.6.0
 torchaudio==2.6.0  # 对应 torch==2.6.0 
 torchvision==0.21.0  # 对应 torch==2.6.0 
 torchdata
-vllm==0.8.2  # 对应 torch==2.6.0 
+vllm==0.8.2  # 对应 torch==2.6.0
 wandb
