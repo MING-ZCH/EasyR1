@@ -32,6 +32,7 @@ from jinja2 import Template
 
 from ...protocol import DataProto
 from ...utils import torch_functional as VF
+from ...utils.dataset import process_image, process_video
 from ...utils.tokenizer import get_processor
 from ...utils.torch_dtypes import PrecisionType
 from .base import BaseRollout
@@ -65,6 +66,55 @@ def _resolve_stop_token_id(tokenizer: PreTrainedTokenizer, stop_text: str) -> Op
         return token_id
 
     return None
+
+
+def _process_multi_modal_data(
+    multi_modal_data: dict[str, Any],
+    min_pixels: int,
+    max_pixels: int,
+    video_fps: float,
+    return_video_metadata: bool = False,
+) -> dict[str, Any]:
+    """Convert paths / raw multimodal payloads into vLLM-ready dict.
+
+    Supports both upstream-style keys (`images` / `videos`) and this fork's dataset keys
+    (`image` / `video`).
+    """
+    images, videos = [], []
+    image_iterable = multi_modal_data.get("images")
+    if image_iterable is None and "image" in multi_modal_data:
+        image_iterable = multi_modal_data["image"]
+    if image_iterable is not None:
+        if not isinstance(image_iterable, list):
+            image_iterable = [image_iterable]
+        for image in image_iterable:
+            images.append(process_image(image, min_pixels, max_pixels))
+
+    video_iterable = multi_modal_data.get("videos")
+    if video_iterable is None and "video" in multi_modal_data:
+        video_iterable = multi_modal_data["video"]
+    if video_iterable is not None:
+        if not isinstance(video_iterable, list):
+            video_iterable = [video_iterable]
+        for video in video_iterable:
+            videos.append(
+                process_video(
+                    video,
+                    min_pixels,
+                    max_pixels,
+                    video_fps,
+                    return_metadata=return_video_metadata,
+                )
+            )
+
+    if len(images) != 0:
+        return {"image": images}
+
+    if len(videos) != 0:
+        return {"video": videos}
+
+    # No recognizable multimodal fields; keep original (already vLLM-ready or empty).
+    return multi_modal_data
 
 
 class _LLMProxy:
@@ -423,6 +473,10 @@ class vLLMRollout(BaseRollout):
         self.config = config
         self.tokenizer = tokenizer
         self.pad_token_id = tokenizer.pad_token_id
+        _proc = get_processor(model_path, trust_remote_code=config.trust_remote_code)
+        self.return_video_metadata = (
+            _proc is not None and "Qwen3VLProcessor" in _proc.__class__.__name__
+        )
         if config.tensor_parallel_size > torch.distributed.get_world_size():
             raise ValueError("Tensor parallelism size should be less than world size.")
 
@@ -1162,10 +1216,22 @@ class vLLMRollout(BaseRollout):
         has_multi_modal = "multi_modal_data" in non_tensor_batch
         if has_multi_modal:
             vllm_inputs = []
+            _vfps = float(prompts.meta_info.get("video_fps", 2.0))
             for raw_prompt_ids, multi_modal_data in zip(
                 non_tensor_batch.pop("raw_prompt_ids"), non_tensor_batch.pop("multi_modal_data")
             ):
-                vllm_inputs.append({"prompt_token_ids": list(raw_prompt_ids), "multi_modal_data": multi_modal_data})
+                vllm_inputs.append(
+                    {
+                        "prompt_token_ids": list(raw_prompt_ids),
+                        "multi_modal_data": _process_multi_modal_data(
+                            multi_modal_data,
+                            prompts.meta_info["min_pixels"],
+                            prompts.meta_info["max_pixels"],
+                            _vfps,
+                            return_video_metadata=self.return_video_metadata,
+                        ),
+                    }
+                )
         else:
             vllm_inputs = [
                 {"prompt_token_ids": list(raw_prompt_ids)} for raw_prompt_ids in non_tensor_batch.pop("raw_prompt_ids")

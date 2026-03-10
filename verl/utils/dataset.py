@@ -24,6 +24,7 @@ from datasets import load_dataset
 from jinja2 import Template
 from PIL import Image
 from PIL.Image import Image as ImageObject
+from qwen_vl_utils.vision_process import fetch_video
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer, ProcessorMixin
 
@@ -73,6 +74,18 @@ def process_image(image: Union[Dict[str, Any], ImageObject, str], min_pixels: in
         image = image.convert("RGB")
 
     return image
+
+
+def process_video(
+    video: str,
+    min_pixels: Optional[int],
+    max_pixels: Optional[int],
+    video_fps: float,
+    return_fps: bool = False,
+    return_metadata: bool = False,
+) -> Any:
+    vision_info = {"video": video, "min_pixels": min_pixels, "max_pixels": max_pixels, "fps": video_fps}
+    return fetch_video(vision_info, return_video_sample_fps=return_fps, return_video_metadata=return_metadata)
 
 
 class RLHFDataset(Dataset):
