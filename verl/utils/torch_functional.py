@@ -16,7 +16,6 @@
 Contain small torch utilities
 """
 
-import math
 from typing import List, Literal, Optional, Tuple, Union
 
 import torch
@@ -65,7 +64,7 @@ def log_probs_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> torch.T
     if FLAH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE:
         output = log_probs_from_logits_flash_attn(logits, labels)
     else:  # fall back to torch kernel, upcast logits to fp32
-        output = -F.cross_entropy(logits.float(), labels, reduction="none")
+        output = F.cross_entropy(logits.float(), labels, reduction="none")
 
     return output.view(*batch_dim)
 
@@ -196,60 +195,7 @@ def get_constant_schedule_with_warmup(
     """Get the lr scheduler for constant lr."""
 
     def lr_lambda(current_step: int) -> float:
-        if current_step < num_warmup_steps:
-            return min(1.0, float(current_step) / float(max(1, num_warmup_steps)))
-
-        return 1.0
-
-    return LambdaLR(optimizer, lr_lambda, last_epoch)
-
-
-def get_cosine_schedule_with_warmup(
-    optimizer: torch.optim.Optimizer,
-    num_warmup_steps: int,
-    num_training_steps: int,
-    min_lr_ratio: Optional[float] = 0.0,
-    num_cycles: float = 0.5,
-    last_epoch: int = -1,
-    init_lr_ratio: Optional[float] = None,
-):
-    """
-    Creates a learning rate schedule that linearly increases the learning rate ratio from `init_lr_ratio`
-    to 1.0 over the first `num_warmup_steps`, then applies a cosine decay from 1.0 down to `min_lr_ratio`
-    over the remaining training steps.
-    Args:
-        optimizer (:class:`~torch.optim.Optimizer`):
-            The optimizer for which to schedule the learning rate.
-        num_warmup_steps (:obj:`int`):
-            The number of steps for the warmup phase.
-        num_training_steps (:obj:`int`):
-            The total number of training steps.
-        min_lr_ratio (:obj:`float`, `optional`, defaults to 0.0):
-            The minimum lr ratio w.r.t the maximum.
-        num_cycles (:obj:`float`, `optional`, defaults to 0.5):
-            The number of waves in the cosine schedule (the defaults is to just decrease from the max value to 0
-            following a half-cosine).
-        last_epoch (:obj:`int`, `optional`, defaults to -1):
-            The index of the last epoch when resuming training.
-        init_lr_ratio (:obj:`float`, `optional`, defaults to None):
-            The initial lr ratio w.r.t the maximum.
-    Return:
-        :obj:`torch.optim.lr_scheduler.LambdaLR` with the appropriate schedule.
-    """
-    min_lr_ratio = 0.0 if min_lr_ratio is None else min_lr_ratio
-    assert min_lr_ratio >= 0 and min_lr_ratio <= 1.0
-    coef = (1 - min_lr_ratio) * 0.5
-    intercept = (1 + min_lr_ratio) * 0.5
-
-    init_lr_ratio = 0.0 if init_lr_ratio is None else init_lr_ratio
-    assert init_lr_ratio >= 0 and init_lr_ratio <= 1.0
-
-    def lr_lambda(current_step):
-        if current_step < num_warmup_steps:
-            return init_lr_ratio + (1.0 - init_lr_ratio) * (float(current_step) / float(max(1, num_warmup_steps)))
-        progress = float(current_step - num_warmup_steps) / float(max(1, num_training_steps - num_warmup_steps))
-        x = math.cos(math.pi * float(num_cycles) * 2.0 * progress)
-        return max(min_lr_ratio, x * coef + intercept)
+        return min(1.0, float(current_step) / float(max(1, num_warmup_steps)))
 
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 

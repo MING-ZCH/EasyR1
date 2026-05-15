@@ -1,7 +1,7 @@
 accelerate
 codetiming
 datasets
-flash-attn>=2.4.3
+# flash-attn>=2.4.3
 liger-kernel
 mathruler
 numpy
@@ -13,8 +13,17 @@ pyarrow>=15.0.0
 pylatexenc
 qwen-vl-utils
 ray[default]
-tensordict
+
+tensordict==0.8.3
+# torch==2.5.1 
+transformers==4.52.3 # 对应 torch==2.6.0
+# transformers==4.51.0
+# vllm>=0.7.3 
+# vllm==0.7.3 # 对应 torch==2.5.1 
+# xformers==0.0.28.post3 # 对应 torch==2.5.1 
+torch==2.6.0 
+torchaudio==2.6.0  # 对应 torch==2.6.0 
+torchvision==0.21.0  # 对应 torch==2.6.0 
 torchdata
-transformers>=4.54.0,<=4.57.0
-vllm>=0.8.0
+vllm==0.8.2  # 对应 torch==2.6.0 
 wandb

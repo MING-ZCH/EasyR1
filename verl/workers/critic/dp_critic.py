@@ -17,18 +17,17 @@ Implement Critic
 
 import os
 from collections import defaultdict
-from typing import Any
+from typing import Any, Dict
 
 import torch
-import torch.distributed as dist
 from ray.experimental.tqdm_ray import tqdm
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 
-from ...protocol import DataProto, batch_collate
-from ...trainer.core_algos import compute_value_loss
+from ...protocol import DataProto
+from ...trainer import core_algos
+from ...utils import torch_functional as VF
 from ...utils.py_functional import append_to_dict
-from ...utils.seqlen_balancing import prepare_dynamic_batch, restore_dynamic_batch
 from ...utils.ulysses import gather_outputs_and_unpad, ulysses_pad_and_slice_inputs
 from .base import BasePPOCritic
 from .config import CriticConfig
@@ -47,11 +46,10 @@ class DataParallelPPOCritic(BasePPOCritic):
     def __init__(self, config: CriticConfig, critic_module: nn.Module, critic_optimizer: torch.optim.Optimizer):
         super().__init__(config)
         self.rank = int(os.getenv("RANK", "0"))
-        self.world_size = int(os.getenv("WORLD_SIZE", "1"))
         self.critic_module = critic_module
         self.critic_optimizer = critic_optimizer
 
-    def _forward_micro_batch(self, micro_batch: dict[str, torch.Tensor]) -> torch.Tensor:
+    def _forward_micro_batch(self, micro_batch: Dict[str, torch.Tensor]) -> torch.Tensor:
         input_ids = micro_batch["input_ids"]
         batch_size, seqlen = input_ids.shape
         attention_mask = micro_batch["attention_mask"]
@@ -59,13 +57,29 @@ class DataParallelPPOCritic(BasePPOCritic):
         responses = micro_batch["responses"]
         response_length = responses.size(-1)
         if position_ids.dim() == 3:  # qwen2vl mrope
-            position_ids = position_ids.transpose(0, 1)  # (bsz, 4, seqlen) -> (4, bsz, seqlen)
+            position_ids = position_ids.transpose(0, 1)  # (bsz, 3, seqlen) -> (3, bsz, seqlen)
 
+        multi_modal_inputs = {}
         if "multi_modal_inputs" in micro_batch:
-            multi_modal_inputs = batch_collate(micro_batch["multi_modal_inputs"])
-            multi_modal_inputs = {key: torch.cat(value, dim=0) for key, value in multi_modal_inputs.items()}
-        else:
-            multi_modal_inputs = {}
+            # Collect all tensors for each key, ensuring they're on the same device
+            device = input_ids.device
+            for key in micro_batch["multi_modal_inputs"][0].keys():
+                tensors_to_cat = []
+                for inputs in micro_batch["multi_modal_inputs"]:
+                    tensor = inputs[key]
+                    # Convert to tensor if needed and move to the correct device
+                    if not isinstance(tensor, torch.Tensor):
+                        tensor = torch.as_tensor(tensor)
+                    # Ensure tensor is on the same device as input_ids
+                    if tensor.device != device:
+                        tensor = tensor.to(device)
+                    tensors_to_cat.append(tensor)
+                
+                if len(tensors_to_cat) > 0:
+                    # Concatenate along the first dimension (batch dimension)
+                    # For pixel_values: (num_images_per_sample, ...) -> (total_images, ...)
+                    # For image_grid_thw: (num_images_per_sample, 3) -> (total_images, 3)
+                    multi_modal_inputs[key] = torch.cat(tensors_to_cat, dim=0)
 
         if self.config.padding_free:
             input_ids_rmpad, indices, *_ = unpad_input(
@@ -79,16 +93,16 @@ class DataParallelPPOCritic(BasePPOCritic):
                     index_first_axis(rearrange(position_ids, "c b s ... -> (b s) c ..."), indices)
                     .transpose(0, 1)
                     .unsqueeze(1)
-                )  # (4, bsz, seqlen) -> (4, 1, bsz * seqlen)
+                )  # (3, bsz, seqlen) -> (3, 1, bsz * seqlen)
             else:
                 position_ids_rmpad = index_first_axis(
                     rearrange(position_ids.unsqueeze(-1), "b s ... -> (b s) ..."), indices
                 ).transpose(0, 1)
 
             # pad and slice the inputs if sp > 1
-            if self.config.ulysses_size > 1:
+            if self.config.ulysses_sequence_parallel_size > 1:
                 input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad_and_slice_inputs(
-                    input_ids_rmpad, position_ids_rmpad, sp_size=self.config.ulysses_size
+                    input_ids_rmpad, position_ids_rmpad, sp_size=self.config.ulysses_sequence_parallel_size
                 )
 
             # only pass input_ids and position_ids to enable flash_attn_varlen
@@ -103,7 +117,7 @@ class DataParallelPPOCritic(BasePPOCritic):
             values_rmpad = values_rmpad.squeeze(0)  # (total_nnz)
 
             # gather output if sp > 1
-            if self.config.ulysses_size > 1:
+            if self.config.ulysses_sequence_parallel_size > 1:
                 values_rmpad = gather_outputs_and_unpad(values_rmpad, gather_dim=0, unpad_dim=0, padding_size=pad_size)
 
             # pad it back
@@ -142,19 +156,19 @@ class DataParallelPPOCritic(BasePPOCritic):
     def compute_values(self, data: DataProto) -> torch.Tensor:
         self.critic_module.eval()
 
-        select_keys = ["input_ids", "attention_mask", "position_ids", "responses", "response_mask"]
-        non_tensor_select_keys = ["multi_modal_inputs"]
-
-        data = data.select(select_keys, non_tensor_select_keys)
-        if self.config.dynamic_batching:
-            max_token_len = self.config.micro_batch_size_per_device_for_experience * data.batch["input_ids"].size(-1)
-            micro_batches, batch_idx_list = prepare_dynamic_batch(data, max_token_len=max_token_len)
+        select_keys = ["responses", "input_ids", "attention_mask", "position_ids"]
+        if "multi_modal_inputs" in data.non_tensor_batch.keys():
+            non_tensor_select_keys = ["multi_modal_inputs"]
         else:
-            micro_batches = data.split(self.config.micro_batch_size_per_device_for_experience)
+            non_tensor_select_keys = []
 
+        micro_batches = data.select(select_keys, non_tensor_select_keys).split(
+            self.config.micro_batch_size_per_device_for_experience
+        )
         values_lst = []
         if self.rank == 0:
-            micro_batches = tqdm(micro_batches, desc="Compute values", position=1)
+            # Disable tqdm to avoid log spam
+            # micro_batches = tqdm(micro_batches, desc="Compute values", position=2)
 
         for micro_batch in micro_batches:
             model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
@@ -162,19 +176,20 @@ class DataParallelPPOCritic(BasePPOCritic):
             values_lst.append(values)
 
         values = torch.concat(values_lst, dim=0)
-
-        if self.config.dynamic_batching:
-            values = restore_dynamic_batch(values, batch_idx_list)
-
-        values = values * data.batch["response_mask"]  # only action tokens have values
+        responses = data.batch["responses"]
+        attention_mask = data.batch["attention_mask"]
+        response_length = responses.size(1)
+        values = values * attention_mask[:, -response_length - 1 : -1]
         return values
 
-    def update_critic(self, data: DataProto) -> dict[str, Any]:
+    def update_critic(self, data: DataProto) -> Dict[str, Any]:
         self.critic_module.train()
 
-        select_keys = ["input_ids", "attention_mask", "position_ids", "responses", "response_mask"]
-        select_keys.extend(["values", "returns"])
-        non_tensor_select_keys = ["multi_modal_inputs"]
+        select_keys = ["input_ids", "responses", "attention_mask", "position_ids", "values", "returns"]
+        if "multi_modal_inputs" in data.non_tensor_batch.keys():
+            non_tensor_select_keys = ["multi_modal_inputs"]
+        else:
+            non_tensor_select_keys = []
 
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details. https://arxiv.org/abs/1707.06347
@@ -183,42 +198,43 @@ class DataParallelPPOCritic(BasePPOCritic):
         metrics = defaultdict(list)
         for _ in range(self.config.ppo_epochs):
             if self.rank == 0:
-                mini_batches = tqdm(mini_batches, desc="Train mini-batches", position=1)
+                # Disable tqdm to avoid log spam
+                # mini_batches = tqdm(mini_batches, desc="Train mini-batches", position=2)
 
             for mini_batch in mini_batches:
-                total_response_tokens = torch.sum(mini_batch.batch["response_mask"])
-                dist.all_reduce(total_response_tokens, op=dist.ReduceOp.SUM)
-
-                if self.config.dynamic_batching:
-                    max_input_len = mini_batch.batch["input_ids"].size(-1)
-                    max_token_len = self.config.micro_batch_size_per_device_for_update * max_input_len
-                    micro_batches, _ = prepare_dynamic_batch(mini_batch, max_token_len=max_token_len)
-                else:
-                    micro_batches = mini_batch.split(self.config.micro_batch_size_per_device_for_update)
-
+                gradient_accumulation = (
+                    self.config.global_batch_size_per_device // self.config.micro_batch_size_per_device_for_update
+                )
+                micro_batches = mini_batch.split(self.config.micro_batch_size_per_device_for_update)
                 if self.rank == 0:
-                    micro_batches = tqdm(micro_batches, desc="Update critic", position=2)
+                    # Disable tqdm to avoid log spam
+                    # micro_batches = tqdm(micro_batches, desc="Update critic", position=3)
 
                 for micro_batch in micro_batches:
                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
-                    response_mask = model_inputs["response_mask"]
+                    responses = model_inputs["responses"]
+                    attention_mask = model_inputs["attention_mask"]
                     values = model_inputs["values"]
                     returns = model_inputs["returns"]
+                    response_length = responses.size(1)
+                    action_mask = attention_mask[:, -response_length - 1 : -1]  # shift left for value computation
 
                     vpreds = self._forward_micro_batch(model_inputs)
-                    vf_loss, vf_metrics = compute_value_loss(
+                    vf_loss, vf_clipfrac = core_algos.compute_value_loss(
                         vpreds=vpreds,
                         returns=returns,
                         values=values,
-                        response_mask=response_mask,
+                        action_mask=action_mask,
                         cliprange_value=self.config.cliprange_value,
-                        loss_avg_mode=self.config.loss_avg_mode,
                     )
-                    loss = vf_loss * torch.sum(response_mask) * self.world_size / total_response_tokens
+                    loss = vf_loss / gradient_accumulation
                     loss.backward()
 
-                    batch_metrics = {f"critic/{k}": v for k, v in vf_metrics.items()}
-                    batch_metrics["critic/vf_loss"] = vf_loss.detach().item()
+                    batch_metrics = {
+                        "critic/vf_loss": vf_loss.detach().item(),
+                        "critic/vf_clipfrac": vf_clipfrac.detach().item(),
+                        "critic/vpred_mean": VF.masked_mean(vpreds, action_mask).detach().item(),
+                    }
                     append_to_dict(metrics, batch_metrics)
 
                 grad_norm = self._optimizer_step()

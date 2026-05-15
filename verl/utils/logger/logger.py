@@ -15,10 +15,9 @@
 A unified tracking interface that supports logging data to different backend
 """
 
-import json
 import os
 from abc import ABC, abstractmethod
-from typing import Any, Optional, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 
@@ -44,53 +43,34 @@ if is_package_available("swanlab"):
 
 class Logger(ABC):
     @abstractmethod
-    def __init__(self, config: dict[str, Any]) -> None: ...
+    def __init__(self, config: Dict[str, Any]) -> None: ...
 
     @abstractmethod
-    def log(self, data: dict[str, Any], step: int) -> None: ...
+    def log(self, data: Dict[str, Any], step: int) -> None: ...
 
     def finish(self) -> None:
         pass
 
 
 class ConsoleLogger(Logger):
-    def __init__(self, config: dict[str, Any]) -> None:
+    def __init__(self, config: Dict[str, Any]) -> None:
         print("Config\n" + convert_dict_to_str(config))
 
-    def log(self, data: dict[str, Any], step: int) -> None:
+    def log(self, data: Dict[str, Any], step: int) -> None:
         print(f"Step {step}\n" + convert_dict_to_str(unflatten_dict(data)))
 
 
-class FileLogger(Logger):
-    def __init__(self, config: dict[str, Any]) -> None:
-        self.config = config
-        print(f"Initializing logging file to {config['trainer']['save_checkpoint_path']}.")
-        os.makedirs(config["trainer"]["save_checkpoint_path"], exist_ok=True)
-        with open(os.path.join(config["trainer"]["save_checkpoint_path"], "experiment_config.json"), "w") as f:
-            json.dump(config, f, indent=2)
-
-        with open(os.path.join(config["trainer"]["save_checkpoint_path"], "experiment_log.jsonl"), "w") as f:
-            pass
-
-        with open(os.path.join(config["trainer"]["save_checkpoint_path"], "generations.log"), "w") as f:
-            pass
-
-    def log(self, data: dict[str, Any], step: int) -> None:
-        with open(os.path.join(self.config["trainer"]["save_checkpoint_path"], "experiment_log.jsonl"), "a") as f:
-            f.write(json.dumps({"step": step, **unflatten_dict(data)}) + "\n")
-
-
 class MlflowLogger(Logger):
-    def __init__(self, config: dict[str, Any]) -> None:
+    def __init__(self, config: Dict[str, Any]) -> None:
         mlflow.start_run(run_name=config["trainer"]["experiment_name"])
         mlflow.log_params(flatten_dict(config))
 
-    def log(self, data: dict[str, Any], step: int) -> None:
+    def log(self, data: Dict[str, Any], step: int) -> None:
         mlflow.log_metrics(metrics=data, step=step)
 
 
 class SwanlabLogger(Logger):
-    def __init__(self, config: dict[str, Any]) -> None:
+    def __init__(self, config: Dict[str, Any]) -> None:
         swanlab_key = os.getenv("SWANLAB_API_KEY")
         swanlab_dir = os.getenv("SWANLAB_DIR", "swanlab_log")
         swanlab_mode = os.getenv("SWANLAB_MODE", "cloud")
@@ -105,7 +85,7 @@ class SwanlabLogger(Logger):
             mode=swanlab_mode,
         )
 
-    def log(self, data: dict[str, Any], step: int) -> None:
+    def log(self, data: Dict[str, Any], step: int) -> None:
         swanlab.log(data=data, step=step)
 
     def finish(self) -> None:
@@ -113,11 +93,8 @@ class SwanlabLogger(Logger):
 
 
 class TensorBoardLogger(Logger):
-    def __init__(self, config: dict[str, Any]) -> None:
+    def __init__(self, config: Dict[str, Any]) -> None:
         tensorboard_dir = os.getenv("TENSORBOARD_DIR", "tensorboard_log")
-        tensorboard_dir = os.path.join(
-            tensorboard_dir, config["trainer"]["project_name"], config["trainer"]["experiment_name"]
-        )
         os.makedirs(tensorboard_dir, exist_ok=True)
         print(f"Saving tensorboard log to {tensorboard_dir}.")
         self.writer = SummaryWriter(tensorboard_dir)
@@ -130,7 +107,7 @@ class TensorBoardLogger(Logger):
 
         self.writer.add_hparams(hparam_dict=config_dict, metric_dict={"placeholder": 0})
 
-    def log(self, data: dict[str, Any], step: int) -> None:
+    def log(self, data: Dict[str, Any], step: int) -> None:
         for key, value in data.items():
             self.writer.add_scalar(key, value, step)
 
@@ -139,14 +116,14 @@ class TensorBoardLogger(Logger):
 
 
 class WandbLogger(Logger):
-    def __init__(self, config: dict[str, Any]) -> None:
+    def __init__(self, config: Dict[str, Any]) -> None:
         wandb.init(
             project=config["trainer"]["project_name"],
             name=config["trainer"]["experiment_name"],
             config=config,
         )
 
-    def log(self, data: dict[str, Any], step: int) -> None:
+    def log(self, data: Dict[str, Any], step: int) -> None:
         wandb.log(data=data, step=step)
 
     def finish(self) -> None:
@@ -155,7 +132,6 @@ class WandbLogger(Logger):
 
 LOGGERS = {
     "console": ConsoleLogger,
-    "file": FileLogger,
     "mlflow": MlflowLogger,
     "swanlab": SwanlabLogger,
     "tensorboard": TensorBoardLogger,
@@ -164,24 +140,24 @@ LOGGERS = {
 
 
 class Tracker:
-    def __init__(self, loggers: Union[str, list[str]] = "console", config: Optional[dict[str, Any]] = None):
+    def __init__(self, loggers: Union[str, List[str]] = "console", config: Optional[Dict[str, Any]] = None):
         if isinstance(loggers, str):
             loggers = [loggers]
 
-        self.loggers: list[Logger] = []
+        self.loggers: List[Logger] = []
         for logger in loggers:
             if logger not in LOGGERS:
                 raise ValueError(f"{logger} is not supported.")
 
             self.loggers.append(LOGGERS[logger](config))
 
-        self.gen_logger = AggregateGenerationsLogger(loggers, config)
+        self.gen_logger = AggregateGenerationsLogger(loggers)
 
-    def log(self, data: dict[str, Any], step: int) -> None:
+    def log(self, data: Dict[str, Any], step: int) -> None:
         for logger in self.loggers:
             logger.log(data=data, step=step)
 
-    def log_generation(self, samples: list[tuple[str, str, str, float]], step: int) -> None:
+    def log_generation(self, samples: List[Tuple[str, str, str, float]], step: int) -> None:
         self.gen_logger.log(samples, step)
 
     def __del__(self):

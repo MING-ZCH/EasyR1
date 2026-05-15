@@ -15,19 +15,19 @@
 Reward config
 """
 
+import os
 from dataclasses import dataclass, field
 from typing import Optional
-
-from ...utils.py_functional import get_abs_path
 
 
 @dataclass
 class RewardConfig:
+    reward_type: str = "batch"
     reward_function: Optional[str] = None
     reward_function_kwargs: dict = field(default_factory=dict)
     skip_special_tokens: bool = True
     num_cpus: int = 1
-    # below are auto keys
+    """auto keys"""
     reward_function_name: Optional[str] = field(default=None, init=False)
 
     def post_init(self):
@@ -37,4 +37,7 @@ class RewardConfig:
             else:
                 self.reward_function, self.reward_function_name = self.reward_function.rsplit(":", maxsplit=1)
 
-            self.reward_function = get_abs_path(self.reward_function, prompt="Reward function")
+            if os.path.exists(self.reward_function):  # ray job uses absolute path
+                self.reward_function = os.path.abspath(self.reward_function)
+            else:
+                self.reward_function = None

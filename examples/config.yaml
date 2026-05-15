@@ -1,23 +1,19 @@
 data:
-  train_files: hiyouga/math12k@train
-  val_files: hiyouga/math12k@test
+  train_files: hiyouga/math12k@train # Hugging Face dataset
+  val_files: hiyouga/math12k@test # Hugging Face dataset
   prompt_key: problem
   answer_key: answer
   image_key: images
-  video_key: videos
-  image_dir: null
-  video_fps: 2.0
-  max_prompt_length: 2048
-  max_response_length: 2048
-  rollout_batch_size: 512  # equivalent to verl's data.train_batch_size
-  mini_rollout_batch_size: null  # equivalent to verl's data.gen_batch_size
-  val_batch_size: 1024
-  format_prompt: ./examples/format_prompt/math.jinja
+  max_prompt_length: 4096
+  max_response_length: 4096
+  rollout_batch_size: 64 # 256 for 8 GPUs, 64 for 2 GPUs
+  val_batch_size: 64 # 256 for 8 GPUs, 32 for 2 GPUs
+  format_prompt: ./examples/format_prompt/math_format.jinja
   override_chat_template: null
-  shuffle: true
-  seed: 1
-  min_pixels: 262144
-  max_pixels: 4194304
+  shuffle: false  # 打乱data顺序
+  seed: 42
+  max_pixels: 12845056 # 16384 * 28 * 28 image_tokens = mix_pixels/28/28
+  min_pixels: 262144  # 512x512
   filter_overlong_prompts: true
 
 algorithm:
@@ -26,30 +22,22 @@ algorithm:
   use_kl_loss: true
   kl_penalty: low_var_kl
   kl_coef: 1.0e-2
-  online_filtering: false  # dapo filter groups
-  filter_key: overall
-  filter_low: 0.01
-  filter_high: 0.99
 
 worker:
   actor:
-    global_batch_size: 128  # equivalent to verl's actor.ppo_mini_batch_size
-    micro_batch_size_per_device_for_update: 1  # equivalent to verl's actor.ppo_micro_batch_size_per_gpu
-    micro_batch_size_per_device_for_experience: 2  # equivalent to verl's rollout.log_prob_micro_batch_size_per_gpu
+    global_batch_size: 64 # 128 for 8 GPUs, 32 for 2 GPUs, actor global batch size = global_batch_size x worker.rollout.n
+    micro_batch_size_per_device_for_update: 8 #  8，Actor 训练阶段，每个 GPU 每次前向/反向传播处理多少个 responses
+    micro_batch_size_per_device_for_experience: 16 # 16. Rollout 阶段，每个 GPU 一次性处理多少个 prompts
     max_grad_norm: 1.0
     padding_free: true
-    dynamic_batching: true
-    ulysses_size: 1
+    ulysses_sequence_parallel_size: 1
+    # worker.actor.clip_ratio_low: 0.2  # DAPO 
+    # worker.actor.clip_ratio_high: 0.28  # DAPO 
     model:
       model_path: Qwen/Qwen2.5-7B-Instruct
       enable_gradient_checkpointing: true
       trust_remote_code: false
       freeze_vision_tower: false
-      lora:
-        rank: 0  # Set to a positive integer to enable LoRA
-        alpha: 64  # LoRA scaling factor
-        target_modules: all-linear  # all-linear or q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
-        exclude_modules: .*visual.*  # Exclude modules from applying LoRA; example: '.*visual.*' for excluding the ViT in Qwen2.5-VL, as vLLM does not support ViT LoRA
     optim:
       lr: 1.0e-6
       weight_decay: 1.0e-2
@@ -64,18 +52,16 @@ worker:
       offload_optimizer: true  # true: more CPU memory; false: more GPU memory
 
   rollout:
-    n: 5
+    n: 16 # grpo experience 5
     temperature: 1.0
     top_p: 1.0
-    limit_images: 0
-    gpu_memory_utilization: 0.6
+    gpu_memory_utilization: 0.48  # 0.48
     enforce_eager: false
     enable_chunked_prefill: false
-    tensor_parallel_size: 2
-    disable_tqdm: false
+    tensor_parallel_size: 1
+    limit_images: 0
     val_override_config:
-      temperature: 0.6
-      top_p: 0.95
+      temperature: 0.01
       n: 1
 
   ref:
@@ -87,24 +73,22 @@ worker:
       offload_params: false
 
   reward:
+    reward_type: batch
     reward_function: ./examples/reward_function/math.py:compute_score
 
 trainer:
-  total_epochs: 15
+  total_epochs: 1
   max_steps: null
   project_name: easy_r1
-  experiment_name: qwen2_5_7b_math_grpo
-  logger: ["file", "wandb"]
+  experiment_name: qwen2_5_7b_StepCount_grpo
+  logger: ["console", "wandb"]
   nnodes: 1
   n_gpus_per_node: 8
-  max_try_make_batch: 20  # -1 means no limit
-  val_freq: 5  # -1 to disable
+  val_freq: 10  # -1 to disable 33
   val_before_train: true
   val_only: false
   val_generations_to_log: 3
-  save_freq: 5  # -1 to disable
-  save_limit: 3  # -1 to disable
-  save_model_only: false
-  save_checkpoint_path: null
+  save_freq: 1500  # -1 to disable
+  save_limit: 5  # -1 to disable
+  save_checkpoint_path: /weiyang/share/250010212/EasyR1/easy_r1
   load_checkpoint_path: null
-  find_last_checkpoint: true

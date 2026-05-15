@@ -13,11 +13,13 @@
 # limitations under the License.
 
 import importlib.util
+import math
 import os
 import sys
+from abc import ABC, abstractmethod
 from collections import defaultdict
 from functools import partial
-from typing import Callable, Optional, Tuple, TypedDict
+from typing import Callable, Dict, List, Optional, Tuple, TypedDict
 
 import torch
 from transformers import PreTrainedTokenizer
@@ -26,85 +28,18 @@ from ...protocol import DataProto
 from .config import RewardConfig
 
 
-class RewardInput(TypedDict):
-    response: str
-    response_length: int
-    ground_truth: str
-
-
 class RewardScore(TypedDict):
     overall: float
     format: Optional[float]
     accuracy: Optional[float]
 
 
-SequentialRewardFunction = Callable[[RewardInput], RewardScore]
+SequentialRewardFunction = Callable[[str, str], RewardScore]
 
-BatchRewardFunction = Callable[[list[RewardInput]], list[RewardScore]]
-
-
-class SequentialFunctionRewardManagerMixin:
-    reward_fn: SequentialRewardFunction
-
-    def compute_reward_sequential(self, data: DataProto) -> Tuple[torch.Tensor, dict[str, list[float]]]:
-        reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
-        reward_metrics = defaultdict(list)
-        response_ids = data.batch["responses"]
-        response_length = torch.sum(data.batch["response_mask"], dim=-1)
-        for i in range(len(data)):
-            cur_response_length = int(response_length[i].item())  # avoid tensor indexing error
-            valid_response_ids = response_ids[i][:cur_response_length]
-            response_str = self.tokenizer.decode(
-                valid_response_ids, skip_special_tokens=self.config.skip_special_tokens
-            )
-            score = self.reward_fn(
-                {
-                    "response": response_str,
-                    "response_length": cur_response_length,
-                    "ground_truth": data.non_tensor_batch["ground_truth"][i],
-                }
-            )
-            reward_tensor[i, cur_response_length - 1] = score["overall"]
-            for key, value in score.items():
-                reward_metrics[key].append(value)
-
-        return reward_tensor, reward_metrics
+BatchRewardFunction = Callable[[List[str], List[str]], List[RewardScore]]
 
 
-class BatchFunctionRewardManagerMixin:
-    reward_fn: BatchRewardFunction
-
-    def compute_reward_batch(self, data: DataProto) -> Tuple[torch.Tensor, dict[str, list[float]]]:
-        reward_inputs = []
-        response_ids = data.batch["responses"]
-        response_length = torch.sum(data.batch["response_mask"], dim=-1)
-        for i in range(len(data)):
-            cur_response_length = int(response_length[i].item())  # avoid tensor indexing error
-            valid_response_ids = response_ids[i][:cur_response_length]
-            response_str = self.tokenizer.decode(
-                valid_response_ids, skip_special_tokens=self.config.skip_special_tokens
-            )
-            reward_inputs.append(
-                {
-                    "response": response_str,
-                    "response_length": cur_response_length,
-                    "ground_truth": data.non_tensor_batch["ground_truth"][i],
-                }
-            )
-
-        scores = self.reward_fn(reward_inputs)
-        reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
-        reward_metrics = defaultdict(list)
-        for i, score in enumerate(scores):
-            cur_response_length = int(response_length[i].item())  # avoid tensor indexing error
-            reward_tensor[i, cur_response_length - 1] = score["overall"]
-            for key, value in score.items():
-                reward_metrics[key].append(value)
-
-        return reward_tensor, reward_metrics
-
-
-class AutoRewardManager(BatchFunctionRewardManagerMixin, SequentialFunctionRewardManagerMixin):
+class FunctionRewardManager(ABC):
     """Reward manager for rule-based reward."""
 
     def __init__(self, config: RewardConfig, tokenizer: PreTrainedTokenizer):
@@ -126,20 +61,295 @@ class AutoRewardManager(BatchFunctionRewardManagerMixin, SequentialFunctionRewar
             raise AttributeError(f"Module {module} does not have function {config.reward_function_name}.")
 
         reward_fn = getattr(module, config.reward_function_name)
-        reward_name = getattr(module, "REWARD_NAME", "unknown")
-        reward_type = getattr(module, "REWARD_TYPE", "batch")
         print(f"Using reward function `{config.reward_function_name}` from `{config.reward_function}`.")
-        print(f"Reward name: {reward_name}, reward type: {reward_type}.")
         self.reward_fn = partial(reward_fn, **config.reward_function_kwargs)
-        self.reward_type = reward_type
         self.config = config
         self.tokenizer = tokenizer
+        self._reward_debug_calls = 0
+        self._reward_debug_every = max(1, int(os.environ.get("EASYR1_REWARD_DEBUG_EVERY", "50")))
+        self._reward_sample_debug = os.environ.get("EASYR1_REWARD_SAMPLE_DEBUG", "1") == "1"
+        self._reward_sample_debug_max = max(1, int(os.environ.get("EASYR1_REWARD_SAMPLE_DEBUG_MAX", "3")))
+        self._reward_health_debug = os.environ.get("EASYR1_REWARD_HEALTH_DEBUG", "1") == "1"
+        self._reward_health_every = max(1, int(os.environ.get("EASYR1_REWARD_HEALTH_DEBUG_EVERY", str(self._reward_debug_every))))
 
-    def compute_reward(self, data: DataProto) -> Tuple[torch.Tensor, dict[str, list[float]]]:
+    @staticmethod
+    def _safe_mean(values: List[float]) -> Optional[float]:
+        if not values:
+            return None
+        try:
+            nums = [float(v) for v in values]
+            nums = [v for v in nums if not math.isnan(v)]
+            if not nums:
+                return None
+            return float(sum(nums) / len(nums))
+        except Exception:
+            return None
+
+    @abstractmethod
+    def compute_reward(self, data: DataProto) -> Tuple[torch.Tensor, Dict[str, List[float]]]:
         """Compute reward for a batch of data."""
-        if self.reward_type == "batch":
-            return self.compute_reward_batch(data)
-        elif self.reward_type == "sequential":
-            return self.compute_reward_sequential(data)
-        else:
-            raise ValueError(f"Unsupported reward type: {self.reward_type}.")
+        ...
+
+
+class SequentialFunctionRewardManager(FunctionRewardManager):
+    reward_fn: SequentialRewardFunction
+
+    @staticmethod
+    def _extract_first_image_path(multi_modal_data) -> Optional[str]:
+        if not isinstance(multi_modal_data, dict) or "image" not in multi_modal_data:
+            return None
+
+        images = multi_modal_data["image"]
+        if not isinstance(images, list) or len(images) == 0:
+            return None
+
+        first_image = images[0]
+        if isinstance(first_image, str):
+            return first_image
+        # HuggingFace datasets often store images as dicts: {"bytes": ..., "path": "xxx.jpg"}
+        if isinstance(first_image, dict):
+            path = first_image.get("path")
+            if isinstance(path, str) and path:
+                return path
+        return None
+
+    @staticmethod
+    def _extract_problem_text(non_tensor_batch: Dict[str, List], index: int) -> Optional[str]:
+        for key in ("problem", "prompt", "question", "query", "instruction"):
+            if key in non_tensor_batch:
+                value = non_tensor_batch[key][index]
+                if isinstance(value, str):
+                    return value
+        return None
+
+    def compute_reward(self, data: DataProto) -> Tuple[torch.Tensor, Dict[str, List[float]]]:
+        self._reward_debug_calls += 1
+        reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
+        reward_metrics = defaultdict(list)
+        response_ids = data.batch["responses"]
+        response_length = data.batch["response_mask"].sum(dim=-1)
+        with_images_count = 0
+        with_problem_count = 0
+        sample_debug_rows = []
+        for i in range(len(data)):
+            valid_response_ids = response_ids[i][: response_length[i]]
+            response_str = self.tokenizer.decode(
+                valid_response_ids, skip_special_tokens=self.config.skip_special_tokens
+            )
+            ground_truth = data.non_tensor_batch["ground_truth"][i]
+
+            # Pass images to reward function if available
+            kwargs = {}
+            if "multi_modal_data" in data.non_tensor_batch:
+                multi_modal_data = data.non_tensor_batch["multi_modal_data"][i]
+                if isinstance(multi_modal_data, dict) and "image" in multi_modal_data:
+                    kwargs["images"] = multi_modal_data["image"]
+                    with_images_count += 1
+                image_path = self._extract_first_image_path(multi_modal_data)
+                if image_path is not None:
+                    kwargs["image_path"] = image_path
+
+            problem_text = self._extract_problem_text(data.non_tensor_batch, i)
+            if problem_text is not None:
+                kwargs["problem"] = problem_text
+                with_problem_count += 1
+
+            if "id" in data.non_tensor_batch:
+                kwargs["sample_id"] = data.non_tensor_batch["id"][i]
+
+            kwargs["sample_index"] = i
+            kwargs["is_eval"] = bool(getattr(data, "meta_info", {}).get("is_validation", False))
+
+            try:
+                score = self.reward_fn(response_str, ground_truth, **kwargs)
+            except Exception as exc:
+                try:
+                    response_tail = response_str[-260:].replace("\n", " ")
+                except Exception:
+                    response_tail = ""
+                print(
+                    "[RewardError] "
+                    f"reward_fn_exception idx={i} sample_id={kwargs.get('sample_id')} "
+                    f"has_image={('images' in kwargs)} has_problem={('problem' in kwargs)} "
+                    f"image_path={kwargs.get('image_path')} gt={str(ground_truth)} "
+                    f"exc={type(exc).__name__}: {exc} tail='{response_tail}'"
+                )
+                raise
+
+            if not isinstance(score, dict) or "overall" not in score:
+                print(
+                    "[RewardError] "
+                    f"malformed_reward_output idx={i} sample_id={kwargs.get('sample_id')} "
+                    f"type={type(score).__name__} keys={list(score.keys()) if isinstance(score, dict) else 'na'}; "
+                    "fallback overall=0"
+                )
+                score = {
+                    "overall": 0.0,
+                    "format": 0.0,
+                    "content": 0.0,
+                    "answer": 0.0,
+                    "point": 0.0,
+                    "format_fail": 1.0,
+                    "stop_violation": 1.0,
+                }
+
+            # --- Per-turn process reward placement ---
+            _step_token_positions = []
+            # When enabled, distribute per-step point rewards at turn boundary
+            # token positions (</point> tags), with the answer+format portion
+            # at the last token. This enables step-level GRPO (GSPO).
+            _process_reward_mode = os.environ.get("PROCESS_REWARD_ENABLE", "0") in ("1", "true", "yes")
+            if _process_reward_mode and "_step_rewards" in score:
+                step_rewards = score["_step_rewards"]  # list of floats (per-turn point scores)
+                # Find </point> token positions in the response
+                import re as _re
+                _point_end_tag = "</point>"
+                _tag_char_positions = []
+                _search_start = 0
+                for _ in range(50):  # safety bound
+                    _pos = response_str.find(_point_end_tag, _search_start)
+                    if _pos == -1:
+                        break
+                    _tag_char_positions.append(_pos + len(_point_end_tag))
+                    _search_start = _pos + len(_point_end_tag)
+
+                if _tag_char_positions and step_rewards:
+                    # Map character positions to token positions
+                    # Encode prefix strings to get token offsets
+                    _n_placed = 0
+                    for _step_idx, _char_pos in enumerate(_tag_char_positions):
+                        if _step_idx >= len(step_rewards):
+                            break
+                        # Encode the prefix up to this character position
+                        _prefix_text = response_str[:_char_pos]
+                        _prefix_tokens = self.tokenizer.encode(
+                            _prefix_text, add_special_tokens=False
+                        )
+                        _token_pos = min(len(_prefix_tokens) - 1, response_length[i].item() - 1)
+                        if _token_pos >= 0 and _token_pos < reward_tensor.shape[1]:
+                            reward_tensor[i, _token_pos] = float(step_rewards[_step_idx])
+                            _step_token_positions.append(int(_token_pos))
+                            _n_placed += 1
+
+                    # Place answer portion at the last token
+                    # answer_reward = overall - sum(step_rewards placed)
+                    _placed_sum = sum(step_rewards[:_n_placed]) if _n_placed > 0 else 0.0
+                    _answer_portion = float(score["overall"]) - _placed_sum
+                    reward_tensor[i, response_length[i] - 1] = _answer_portion
+                else:
+                    # Fallback: place entire reward at last token
+                    reward_tensor[i, response_length[i] - 1] = score["overall"]
+            else:
+                reward_tensor[i, response_length[i] - 1] = score["overall"]
+
+            if _process_reward_mode:
+                reward_metrics["_point_step_token_positions"].append(_step_token_positions)
+
+            for key, value in score.items():
+                if not key.startswith("_"):  # skip internal keys
+                    reward_metrics[key].append(value)
+
+            if self._reward_sample_debug and len(sample_debug_rows) < self._reward_sample_debug_max:
+                try:
+                    response_tail = response_str[-220:].replace("\n", " ")
+                except Exception:
+                    response_tail = ""
+                sample_debug_rows.append(
+                    {
+                        "idx": i,
+                        "gt": str(ground_truth),
+                        "overall": float(score.get("overall", 0.0)),
+                        "format": float(score.get("format", 0.0)),
+                        "point": float(score.get("point", 0.0)),
+                        "answer": float(score.get("answer", 0.0)),
+                        "stop_violation": float(score.get("stop_violation", 0.0)),
+                        "format_fail": float(score.get("format_fail", 0.0)),
+                        "tail": response_tail,
+                    }
+                )
+
+        if self._reward_debug_calls % self._reward_debug_every == 0:
+            metric_keys = sorted([key for key in reward_metrics.keys() if not str(key).startswith("_")])
+            print(
+                "[RewardDebug] "
+                f"calls={self._reward_debug_calls} batch_size={len(data)} "
+                f"with_images={with_images_count}/{len(data)} "
+                f"with_problem={with_problem_count}/{len(data)} "
+                f"metrics={metric_keys}"
+            )
+            if self._reward_sample_debug:
+                for row in sample_debug_rows:
+                    print(
+                        "[RewardDebug][sample] "
+                        f"idx={row['idx']} gt={row['gt']} "
+                        f"overall={row['overall']:.4f} format={row['format']:.4f} "
+                        f"point={row['point']:.4f} answer={row['answer']:.4f} "
+                        f"stop_violation={row['stop_violation']:.1f} format_fail={row['format_fail']:.1f} "
+                        f"tail='{row['tail']}'"
+                    )
+
+        if self._reward_health_debug and (self._reward_debug_calls % self._reward_health_every == 0):
+            overall_mean = self._safe_mean(reward_metrics.get("overall", []))
+            answer_mean = self._safe_mean(reward_metrics.get("answer", []))
+            point_mean = self._safe_mean(reward_metrics.get("point", []))
+            format_fail_mean = self._safe_mean(reward_metrics.get("format_fail", []))
+            stop_violation_mean = self._safe_mean(reward_metrics.get("stop_violation", []))
+            stopped_by_answer_mean = self._safe_mean(reward_metrics.get("stopped_by_answer", []))
+            turns_exceeded_mean = self._safe_mean(reward_metrics.get("turns_exceeded", []))
+            no_point_pred_mean = self._safe_mean(reward_metrics.get("no_point_pred", []))
+
+            def _fmt(x: Optional[float]) -> str:
+                return "na" if x is None else f"{x:.4f}"
+
+            print(
+                "[RewardHealth] "
+                f"calls={self._reward_debug_calls} "
+                f"overall_mean={_fmt(overall_mean)} answer_mean={_fmt(answer_mean)} point_mean={_fmt(point_mean)} "
+                f"format_fail_rate={_fmt(format_fail_mean)} stop_violation_rate={_fmt(stop_violation_mean)} "
+                f"stopped_by_answer_rate={_fmt(stopped_by_answer_mean)} turns_exceeded_rate={_fmt(turns_exceeded_mean)} "
+                f"no_point_pred_rate={_fmt(no_point_pred_mean)}"
+            )
+
+            if (
+                overall_mean is not None
+                and stop_violation_mean is not None
+                and format_fail_mean is not None
+                and stopped_by_answer_mean is not None
+                and overall_mean <= 0.01
+                and (stop_violation_mean >= 0.80 or format_fail_mean >= 0.80)
+            ):
+                dominant_failure = "stop_violation" if stop_violation_mean >= format_fail_mean else "format_fail"
+                print(
+                    "[RewardHealth][ALERT] "
+                    f"reward collapse detected: dominant={dominant_failure} "
+                    f"overall_mean={overall_mean:.4f} stop_violation_rate={stop_violation_mean:.4f} "
+                    f"format_fail_rate={format_fail_mean:.4f} stopped_by_answer_rate={stopped_by_answer_mean:.4f}. "
+                    "Check interleaved prompt composition/termination and trajectory reward reasons."
+                )
+
+        return reward_tensor, reward_metrics
+
+
+class BatchFunctionRewardManager(FunctionRewardManager):
+    reward_fn: BatchRewardFunction
+
+    def compute_reward(self, data: DataProto) -> Tuple[torch.Tensor, Dict[str, List[float]]]:
+        response_str, ground_truth = [], []
+        response_ids = data.batch["responses"]
+        response_length = data.batch["response_mask"].sum(dim=-1)
+        for i in range(len(data)):
+            valid_response_ids = response_ids[i][: response_length[i]]
+            response_str.append(
+                self.tokenizer.decode(valid_response_ids, skip_special_tokens=self.config.skip_special_tokens)
+            )
+            ground_truth.append(data.non_tensor_batch["ground_truth"][i])
+
+        scores = self.reward_fn(response_str, ground_truth)
+        reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
+        reward_metrics = defaultdict(list)
+        for i, score in enumerate(scores):
+            reward_tensor[i, response_length[i] - 1] = score["overall"]
+            for key, value in score.items():
+                reward_metrics[key].append(value)
+
+        return reward_tensor, reward_metrics

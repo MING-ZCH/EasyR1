@@ -16,6 +16,7 @@ import argparse
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor
+from typing import Dict, List, Tuple
 
 import numpy as np
 import torch
@@ -23,14 +24,14 @@ from torch.distributed._tensor import DTensor, Placement, Shard
 from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
-    AutoModelForImageTextToText,
     AutoModelForTokenClassification,
+    AutoModelForVision2Seq,
     PretrainedConfig,
     PreTrainedModel,
 )
 
 
-def merge_by_placement(tensors: list[torch.Tensor], placement: Placement):
+def merge_by_placement(tensors: List[torch.Tensor], placement: Placement):
     if placement.is_replicate():
         return tensors[0]
     elif placement.is_partial():
@@ -112,8 +113,8 @@ if __name__ == "__main__":
         for rank in range(1, total_shards):
             executor.submit(process_one_shard, rank, model_state_dict_lst)
 
-    state_dict: dict[str, list[torch.Tensor]] = {}
-    param_placements: dict[str, list[Placement]] = {}
+    state_dict: Dict[str, List[torch.Tensor]] = {}
+    param_placements: Dict[str, List[Placement]] = {}
     keys = set(model_state_dict_lst[0].keys())
     for key in keys:
         state_dict[key] = []
@@ -146,7 +147,7 @@ if __name__ == "__main__":
 
         if key in param_placements:
             # merge shards
-            placements: tuple[Shard] = param_placements[key]
+            placements: Tuple[Shard] = param_placements[key]
             if len(mesh_shape) == 1:
                 # 1-D list, FSDP without TP
                 assert len(placements) == 1
@@ -160,15 +161,23 @@ if __name__ == "__main__":
 
     print("Merge completed.")
     hf_path = os.path.join(local_dir, "huggingface")
+    
+    if not os.path.isdir(hf_path):
+        raise ValueError(f"Directory {hf_path} does not exist. Please create it and copy the base model's config.json (and tokenizer files) into it.")
+
     config: PretrainedConfig = AutoConfig.from_pretrained(hf_path)
-    architectures: list[str] = getattr(config, "architectures", ["Unknown"])
+    architectures: List[str] = getattr(config, "architectures", ["Unknown"])
+
+    # Fix for TypeError if architectures is None
+    if architectures is None:
+        architectures = ["Unknown"]
 
     if "ForTokenClassification" in architectures[0]:
         AutoClass = AutoModelForTokenClassification
-    elif "ForConditionalGeneration" in architectures[0]:
-        AutoClass = AutoModelForImageTextToText
     elif "ForCausalLM" in architectures[0]:
         AutoClass = AutoModelForCausalLM
+    elif "ForConditionalGeneration" in architectures[0]:
+        AutoClass = AutoModelForVision2Seq
     else:
         raise NotImplementedError(f"Unknown architecture {architectures}.")
 

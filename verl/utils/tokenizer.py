@@ -22,10 +22,7 @@ def get_tokenizer(model_path: str, override_chat_template: Optional[str] = None,
     """Create a huggingface pretrained tokenizer."""
     tokenizer = AutoTokenizer.from_pretrained(model_path, **kwargs)
     if override_chat_template is not None:
-        with open(override_chat_template) as f:
-            tokenizer.chat_template = f.read()
-
-        print(f"New chat template: {tokenizer.chat_template}")
+        tokenizer.chat_template = override_chat_template
 
     if tokenizer.bos_token == "<bos>" and tokenizer.eos_token == "<eos>":
         # the EOS token in gemma2 & gemma3 is ambiguious, which may worsen RL performance.
@@ -44,13 +41,10 @@ def get_processor(model_path: str, override_chat_template: Optional[str] = None,
     """Create a huggingface pretrained processor."""
     processor = AutoProcessor.from_pretrained(model_path, **kwargs)
     if override_chat_template is not None:
-        with open(override_chat_template) as f:
-            processor.chat_template = f.read()
-
-        print(f"New chat template: {processor.chat_template}")
+        processor.chat_template = override_chat_template
 
     # Avoid load tokenizer, see:
-    # https://github.com/huggingface/transformers/blob/v4.52.4/src/transformers/models/auto/processing_auto.py#L386
+    # https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/models/auto/processing_auto.py#L344
     if processor is not None and "Processor" not in processor.__class__.__name__:
         processor = None
 

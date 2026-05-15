@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import json
+import os
 
 import ray
 from omegaconf import OmegaConf
@@ -20,7 +21,7 @@ from omegaconf import OmegaConf
 from ..single_controller.ray import RayWorkerGroup
 from ..utils.tokenizer import get_processor, get_tokenizer
 from ..workers.fsdp_workers import FSDPWorker
-from ..workers.reward import AutoRewardManager
+from ..workers.reward import BatchFunctionRewardManager, SequentialFunctionRewardManager
 from .config import PPOConfig
 from .data_loader import create_dataloader
 from .ray_trainer import RayPPOTrainer, ResourcePoolManager, Role
@@ -52,20 +53,29 @@ class Runner:
         # define worker classes
         ray_worker_group_cls = RayWorkerGroup
         role_worker_mapping = {
-            Role.ActorRolloutRef: ray.remote(FSDPWorker),
+            Role.ActorRollout: ray.remote(FSDPWorker),
             Role.Critic: ray.remote(FSDPWorker),
+            Role.RefPolicy: ray.remote(FSDPWorker),
         }
         global_pool_id = "global_pool"
         resource_pool_spec = {
             global_pool_id: [config.trainer.n_gpus_per_node] * config.trainer.nnodes,
         }
         mapping = {
-            Role.ActorRolloutRef: global_pool_id,
+            Role.ActorRollout: global_pool_id,
             Role.Critic: global_pool_id,
+            Role.RefPolicy: global_pool_id,
         }
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 
-        RemoteRewardManager = ray.remote(AutoRewardManager).options(num_cpus=config.worker.reward.num_cpus)
+        if config.worker.reward.reward_type == "sequential":
+            RewardManager = SequentialFunctionRewardManager
+        elif config.worker.reward.reward_type == "batch":
+            RewardManager = BatchFunctionRewardManager
+        else:
+            raise NotImplementedError(f"Unknown reward type {config.worker.reward.reward_type}.")
+
+        RemoteRewardManager = ray.remote(RewardManager).options(num_cpus=config.worker.reward.num_cpus)
         reward_fn = RemoteRewardManager.remote(config.worker.reward, tokenizer)
         val_reward_fn = RemoteRewardManager.remote(config.worker.reward, tokenizer)
 
@@ -101,25 +111,64 @@ def main():
     ppo_config.deep_post_init()
 
     if not ray.is_initialized():
+        # 从环境变量中获取 NCCL 超时设置，如果没有则使用默认值
+        nccl_timeout = os.environ.get("NCCL_TIMEOUT", "1800")  # 默认 30 分钟
+        torch_distributed_timeout = os.environ.get("TORCH_DISTRIBUTED_TIMEOUT", "1800")
+        ray_address = os.environ.get("RAY_ADDRESS", "").strip()
+        ray_address_candidates = os.environ.get("RAY_ADDRESS_CANDIDATES", "").strip()
+        
         runtime_env = {
             "env_vars": {
                 "TOKENIZERS_PARALLELISM": "true",
-                "NCCL_DEBUG": "WARN",
+                "NCCL_DEBUG": os.environ.get("NCCL_DEBUG", "WARN"),
                 "VLLM_LOGGING_LEVEL": "WARN",
                 "TORCH_NCCL_AVOID_RECORD_STREAMS": "1",
                 "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False",
-                "CUDA_DEVICE_MAX_CONNECTIONS": "1",
-                "VLLM_ALLREDUCE_USE_SYMM_MEM": "0",
+                "PYTHONUNBUFFERED": "1",
+                # NCCL 超时配置（确保传递到 Ray worker）
+                "NCCL_TIMEOUT": nccl_timeout,
+                "TORCH_DISTRIBUTED_TIMEOUT": torch_distributed_timeout,
+                "NCCL_ASYNC_ERROR_HANDLING": os.environ.get("NCCL_ASYNC_ERROR_HANDLING", "1"),
+                # CPU 线程限制（避免占用过多 CPU 资源影响 NCCL 通信）
+                "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "8"),
+                "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS", "8"),
+                "NUMEXPR_NUM_THREADS": os.environ.get("NUMEXPR_NUM_THREADS", "8"),
+                "TORCH_NUM_THREADS": os.environ.get("TORCH_NUM_THREADS", "8"),
             }
         }
-        ray.init(runtime_env=runtime_env)
+        if ray_address:
+            addrs = []
+            if ray_address_candidates:
+                addrs.extend([x.strip() for x in ray_address_candidates.split(",") if x.strip()])
+            if ray_address not in addrs:
+                addrs.insert(0, ray_address)
+
+            last_error = None
+            for addr in addrs:
+                print(f"[EasyR1] Connecting to existing Ray cluster: {addr}")
+                try:
+                    ray.init(address=addr, runtime_env=runtime_env)
+                    last_error = None
+                    break
+                except Exception as e:
+                    last_error = e
+                    print(f"[EasyR1] Ray connect failed at {addr}: {e}")
+
+            if last_error is not None:
+                hint = (
+                    "\n[EasyR1][RayConnectHint] Failed to connect remote Ray.\n"
+                    "- If this driver runs outside Kubernetes, '*.svc.cluster.local' may be unreachable.\n"
+                    "- Prefer Ray Client endpoint 'ray://<head-host>:10001' for remote submit.\n"
+                    "- Use routable IP/hostname or port-forward to 10001.\n"
+                    f"- Tried addresses: {addrs}\n"
+                )
+                raise RuntimeError(hint) from last_error
+        else:
+            print("[EasyR1] RAY_ADDRESS is empty, starting local Ray runtime.")
+            ray.init(runtime_env=runtime_env)
 
     runner = Runner.remote()
     ray.get(runner.run.remote(ppo_config))
-
-    if ppo_config.trainer.ray_timeline is not None:
-        # use `export RAY_PROFILING=1` to record the ray timeline
-        ray.timeline(filename=ppo_config.trainer.ray_timeline)
 
 
 if __name__ == "__main__":

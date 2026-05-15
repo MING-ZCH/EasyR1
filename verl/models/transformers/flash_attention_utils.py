@@ -36,27 +36,26 @@ if is_flash_attn_2_available():
 
     _flash_supports_window_size = "window_size" in inspect.signature(flash_attn_func).parameters
     _flash_supports_deterministic = "deterministic" in inspect.signature(flash_attn_func).parameters
-    _flash_deterministic_enabled = os.getenv("FLASH_ATTENTION_DETERMINISTIC", "0") == "1"
+    _flash_deterministic_enabled = os.environ.get("FLASH_ATTENTION_DETERMINISTIC", "0") == "1"
     _flash_use_top_left_mask = not is_flash_attn_greater_or_equal_2_10()
 
 
 def prepare_fa2_from_position_ids(
     query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, position_ids: torch.Tensor
 ):
-    assert position_ids.ndim == 2  # (batch_size, seq_length)
-    query = query.contiguous().view(-1, query.size(-2), query.size(-1))
+    query = query.view(-1, query.size(-2), query.size(-1))
     key = key.contiguous().view(-1, key.size(-2), key.size(-1))
     value = value.contiguous().view(-1, value.size(-2), value.size(-1))
-    tensor_kwargs = {"dtype": torch.int32, "device": position_ids.device}
-    position_ids = position_ids.view(-1)
+    position_ids = position_ids.flatten()
+    indices_q = torch.arange(position_ids.size(0), device=position_ids.device, dtype=torch.int32)
     cu_seqlens = torch.cat(
         (
-            (position_ids == 0).nonzero().view(-1).to(**tensor_kwargs),
-            torch.tensor(position_ids.size(), **tensor_kwargs),
+            indices_q[position_ids == 0],
+            torch.tensor(position_ids.size(), device=position_ids.device, dtype=torch.int32),
         )
     )
     max_length = cu_seqlens.diff().max()  # use cu_seqlens to infer max_length for qwen2vl mrope
-    return (query, key, value, (cu_seqlens, cu_seqlens), (max_length, max_length))
+    return (query, key, value, indices_q, (cu_seqlens, cu_seqlens), (max_length, max_length))
 
 
 def _custom_flash_attention_forward(
@@ -75,6 +74,11 @@ def _custom_flash_attention_forward(
     """
     Patches flash attention forward to handle 3D position ids in mrope. (3, batch_size, seq_length)
     """
+    if not use_top_left_mask:
+        causal = is_causal
+    else:
+        causal = is_causal and query_length != 1
+
     # Assuming 4D tensors, key_states.shape[1] is the key/value sequence length (source length).
     use_sliding_windows = (
         _flash_supports_window_size and sliding_window is not None and key_states.shape[1] > sliding_window
@@ -93,30 +97,35 @@ def _custom_flash_attention_forward(
 
     sp_size = get_ulysses_sequence_parallel_world_size()
     if sp_size > 1:
-        # qkv: (batch_size, seq_length / sp_size, num_head, head_size)
+        # (batch_size, seq_length, num_head, head_size)
         query_states = gather_seq_scatter_heads(query_states, seq_dim=1, head_dim=2)
         key_states = gather_seq_scatter_heads(key_states, seq_dim=1, head_dim=2)
         value_states = gather_seq_scatter_heads(value_states, seq_dim=1, head_dim=2)
         position_ids_lst = [torch.empty_like(position_ids) for _ in range(sp_size)]
         position_ids = dist.all_gather(position_ids_lst, position_ids, group=get_ulysses_sequence_parallel_group())
-        position_ids = torch.cat(position_ids_lst, dim=-1)  # (batch_size, seq_length)
+        position_ids = torch.cat(position_ids_lst, dim=-1)  # (..., batch_size, seq_length)
+
+    if position_ids is not None and position_ids.dim() == 3:  # qwen2vl mrope
+        position_ids = position_ids[0]
 
     if position_ids is not None and query_length != 1 and not (torch.diff(position_ids, dim=-1) >= 0).all():
         batch_size = query_states.size(0)
-        q, k, v, (cu_seqlens_q, cu_seqlens_k), (max_seqlen_q, max_seqlen_k) = prepare_fa2_from_position_ids(
+        query_states, key_states, value_states, _, cu_seq_lens, max_seq_lens = prepare_fa2_from_position_ids(
             query_states, key_states, value_states, position_ids
         )
+        cu_seqlens_q, cu_seqlens_k = cu_seq_lens
+        max_seqlen_in_batch_q, max_seqlen_in_batch_k = max_seq_lens
         attn_output = flash_attn_varlen_func(
-            q,
-            k,
-            v,
+            query_states,
+            key_states,
+            value_states,
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_k=max_seqlen_k,
+            max_seqlen_q=max_seqlen_in_batch_q,
+            max_seqlen_k=max_seqlen_in_batch_k,
             dropout_p=kwargs.pop("dropout", 0.0),
             softmax_scale=kwargs.pop("softmax_scale", None),
-            causal=is_causal,
+            causal=causal,
             **flash_kwargs,
         )
         attn_output = attn_output.view(batch_size, -1, attn_output.size(-2), attn_output.size(-1))
@@ -128,15 +137,14 @@ def _custom_flash_attention_forward(
             attention_mask,
             query_length,
             is_causal=is_causal,
-            position_ids=position_ids,
             sliding_window=sliding_window,
             use_top_left_mask=use_top_left_mask,
             deterministic=deterministic,
             **kwargs,
-        )
+        )  # do not pass position_ids to old flash_attention_forward
 
     if sp_size > 1:
-        # output: (batch_size, seq_length / sp_size, num_head, head_size)
+        # (batch_size, seq_length, num_head, head_size)
         attn_output = gather_heads_scatter_seq(attn_output, head_dim=2, seq_dim=1)
 
     return attn_output
@@ -162,10 +170,8 @@ def flash_attention_forward(
     key = key.transpose(1, 2)
     value = value.transpose(1, 2)
 
-    # FA2 uses the kwargs value if explicitly passed, otherwise it uses the module attribute
-    is_causal = kwargs.pop("is_causal", None)
-    if is_causal is None:
-        is_causal = getattr(module, "is_causal", True)
+    # FA2 always relies on the value set in the module, so remove it if present in kwargs to avoid passing it twice
+    kwargs.pop("is_causal", None)
 
     attn_output = _custom_flash_attention_forward(
         query,
@@ -173,7 +179,7 @@ def flash_attention_forward(
         value,
         attention_mask,
         query_length=q_len,
-        is_causal=is_causal,
+        is_causal=True,
         dropout=dropout,
         softmax_scale=scaling,
         sliding_window=sliding_window,

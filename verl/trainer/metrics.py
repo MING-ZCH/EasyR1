@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
+from typing import Any, Dict, List
 
 import numpy as np
 import torch
@@ -20,32 +20,11 @@ import torch
 from ..protocol import DataProto
 
 
-def reduce_metrics(metrics: dict[str, list[Any]]) -> dict[str, Any]:
+def reduce_metrics(metrics: Dict[str, List[Any]]) -> Dict[str, Any]:
     return {key: np.mean(value) for key, value in metrics.items()}
 
 
-def compute_length_metrics(batch: DataProto) -> dict[str, Any]:
-    max_response_length = batch.batch["responses"].size(-1)
-    max_prompt_length = batch.batch["attention_mask"].size(-1) - max_response_length
-
-    prompt_length = batch.batch["attention_mask"][:, :-max_response_length].sum(-1).float()
-    response_length = batch.batch["attention_mask"][:, -max_response_length:].sum(-1).float()
-
-    return {
-        # response length
-        "response_length/mean": torch.mean(response_length).detach().item(),
-        "response_length/max": torch.max(response_length).detach().item(),
-        "response_length/min": torch.min(response_length).detach().item(),
-        "response_length/clip_ratio": torch.eq(response_length, max_response_length).float().mean().detach().item(),
-        # prompt length
-        "prompt_length/mean": torch.mean(prompt_length).detach().item(),
-        "prompt_length/max": torch.max(prompt_length).detach().item(),
-        "prompt_length/min": torch.min(prompt_length).detach().item(),
-        "prompt_length/clip_ratio": torch.eq(prompt_length, max_prompt_length).float().mean().detach().item(),
-    }
-
-
-def compute_data_metrics(batch: DataProto, use_critic: bool = False) -> dict[str, Any]:
+def compute_data_metrics(batch: DataProto, use_critic: bool = False) -> Dict[str, Any]:
     sequence_score = batch.batch["token_level_scores"].sum(-1)
     sequence_reward = batch.batch["token_level_rewards"].sum(-1)
 
@@ -53,7 +32,13 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = False) -> dict[str
     returns = batch.batch["returns"]
 
     max_response_length = batch.batch["responses"].size(-1)
+
+    prompt_mask = batch.batch["attention_mask"][:, :-max_response_length].bool()
     response_mask = batch.batch["attention_mask"][:, -max_response_length:].bool()
+
+    max_prompt_length = prompt_mask.size(-1)
+    prompt_length = prompt_mask.sum(-1).float()
+    response_length = response_mask.sum(-1).float()
 
     valid_adv = torch.masked_select(advantages, response_mask)
     valid_returns = torch.masked_select(returns, response_mask)
@@ -64,7 +49,7 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = False) -> dict[str
         return_diff_var = torch.var(valid_returns - valid_values)
         return_var = torch.var(valid_returns)
 
-    return {
+    metrics = {
         # score
         "critic/score/mean": torch.mean(sequence_score).detach().item(),
         "critic/score/max": torch.max(sequence_score).detach().item(),
@@ -93,27 +78,53 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = False) -> dict[str
             if use_critic
             else {}
         ),
-        **compute_length_metrics(batch),
+        # response length
+        "response_length/mean": torch.mean(response_length).detach().item(),
+        "response_length/max": torch.max(response_length).detach().item(),
+        "response_length/min": torch.min(response_length).detach().item(),
+        "response_length/clip_ratio": torch.mean(torch.eq(response_length, max_response_length).float())
+        .detach()
+        .item(),
+        # prompt length
+        "prompt_length/mean": torch.mean(prompt_length).detach().item(),
+        "prompt_length/max": torch.max(prompt_length).detach().item(),
+        "prompt_length/min": torch.min(prompt_length).detach().item(),
+        "prompt_length/clip_ratio": torch.mean(torch.eq(prompt_length, max_prompt_length).float()).detach().item(),
     }
+    return metrics
 
 
-def compute_timing_metrics(batch: DataProto, timing_raw: dict[str, float]) -> dict[str, Any]:
+def compute_timing_metrics(batch: DataProto, timing_raw: Dict[str, float]) -> Dict[str, Any]:
     num_response_tokens = torch.sum(batch.batch["response_mask"]).item()
     num_overall_tokens = sum(batch.meta_info["global_token_num"])
     num_tokens_of_section = {
         **dict.fromkeys(["gen", "reward"], num_response_tokens),
         **dict.fromkeys(["ref", "old", "values", "adv", "update_critic", "update_actor"], num_overall_tokens),
     }
-    return {
-        **{f"timing_s/{name}": value for name, value in timing_raw.items()},
-        **{
-            f"timing_per_token_ms/{name}": timing_raw[name] * 1000 / num_tokens_of_section[name]
-            for name in set(num_tokens_of_section.keys()) & set(timing_raw.keys())
-        },
-    }
+    
+    # Build timing metrics with NaN protection
+    timing_metrics = {}
+    for name, value in timing_raw.items():
+        if value is not None and not (isinstance(value, float) and (value != value or value <= 0)):  # Check for NaN and <= 0
+            timing_metrics[f"timing_s/{name}"] = value
+        else:
+            timing_metrics[f"timing_s/{name}"] = 0.0
+    
+    # Compute per-token timing with NaN protection
+    for name in set(num_tokens_of_section.keys()) & set(timing_raw.keys()):
+        timing_value = timing_raw[name]
+        num_tokens = num_tokens_of_section[name]
+        if (timing_value is not None and 
+            not (isinstance(timing_value, float) and (timing_value != timing_value or timing_value <= 0)) and
+            num_tokens > 0):
+            timing_metrics[f"timing_per_token_ms/{name}"] = timing_value * 1000 / num_tokens
+        else:
+            timing_metrics[f"timing_per_token_ms/{name}"] = 0.0
+    
+    return timing_metrics
 
 
-def compute_throughout_metrics(batch: DataProto, timing_raw: dict[str, float], num_gpus: int) -> dict[str, Any]:
+def compute_throughout_metrics(batch: DataProto, timing_raw: Dict[str, float], num_gpus: int) -> Dict[str, Any]:
     total_num_tokens = sum(batch.meta_info["global_token_num"])
     time = timing_raw["step"]
     return {
