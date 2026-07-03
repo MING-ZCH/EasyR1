@@ -104,13 +104,13 @@
 ## 4. 启动 & 消融
 
 ```bash
-cd /mnt/shared-storage-user/zhangchenhao/work/EasyR1-latest
+cd /data/workspace/hyleochang/EasyR1-latest
 
 # 主推：v26c-v2
 bash examples/qwen2_5_vl_7b_StepCount_0_10_grpo_interleaved_traj_v26c_sparse_verified.sh
 
 # 安全底（若主推 cap 失效可回退）
-STEPCOUNT_TRAIN_DATA=/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/StepCountQA-RL-Traj_0_10 \
+STEPCOUNT_TRAIN_DATA=/data/workspace/hyleochang/work/StepcountModel/dataset/StepCountQA-RL-Traj_0_10 \
   ACTOR_LR=1e-6 BOK_CLIP=4.0 RUN_NAME_PREFIX=v26c_v23SC_repro \
   bash examples/qwen2_5_vl_7b_StepCount_0_10_grpo_interleaved_traj_v26c_sparse_verified.sh
 ```

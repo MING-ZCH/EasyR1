@@ -111,7 +111,7 @@ The correct V28 response is not to disable smart filtering; it is to keep smart 
 Use the standalone script:
 
 ```bash
-cd /mnt/shared-storage-user/zhangchenhao/work/EasyR1-latest
+cd /data/workspace/hyleochang/EasyR1-latest
 bash examples/qwen2_5_vl_7b_StepCount_0_10_grpo_interleaved_traj_v28_stable_strict_h200.sh
 ```
 

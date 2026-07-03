@@ -31,10 +31,11 @@ import json
 import math
 import logging
 import os
+import threading
 from typing import Dict, Optional, List, Any, Set, Tuple, Union
 from PIL import Image as PILImage
 import numpy as np
-from collections import defaultdict
+from collections import defaultdict, OrderedDict
 
 logger = logging.getLogger(__name__)
 
@@ -60,8 +61,8 @@ _TRAJ_MASK_DEBUG_CALLS = 0
 _MASK_CONFIG_LOGGED = False
 
 # 默认路径（可用环境变量覆盖）
-_DEFAULT_MASKS_METADATA_PATH = "/mnt/shared-storage-user/zhangchenhao/StepCount-RL_masks_output/masks_metadata.json"
-_DEFAULT_MASKS_DIR = "/mnt/shared-storage-user/zhangchenhao/StepCount-RL_Masks//masks"
+_DEFAULT_MASKS_METADATA_PATH = "/apdcephfs_hldy2/share_305110755/hunyuan/chenhaoz/datasets/StepCount-RL_Masks-Sharded/extracted/masks_metadata.json"
+_DEFAULT_MASKS_DIR = "/apdcephfs_hldy2/share_305110755/hunyuan/chenhaoz/datasets/StepCount-RL_Masks-Sharded/extracted//masks"
 
 
 def _mask_require_enabled() -> bool:
@@ -388,7 +389,18 @@ class MaskRewardHelper:
         cache_masks: bool = True
     ):
         self.metadata = {}  # sample_id -> metadata
-        self.masks_cache = {}  # sample_id -> masks array
+        # Bounded LRU cache: sample_id -> masks array.
+        # An OrderedDict gives O(1) move-to-end / pop-oldest so we can cap RAM
+        # usage while still reusing masks across rollouts/steps that share a
+        # sequence (rollout_n trajectories of the same prompt all need the same
+        # masks, so a persistent cache removes ~rollout_n x redundant CephFS loads).
+        self.masks_cache: "OrderedDict[str, np.ndarray]" = OrderedDict()
+        self._cache_lock = threading.Lock()  # guards masks_cache mutations (4 reward threads)
+        # 0 / negative => unbounded (legacy behaviour). Default cap keeps RAM bounded.
+        try:
+            self._mask_cache_max = int(os.environ.get("STEPCOUNT_MASK_CACHE_MAX", "20000"))
+        except Exception:
+            self._mask_cache_max = 20000
         self.cache_masks = cache_masks
         self.masks_dir = masks_dir
         
@@ -573,15 +585,16 @@ class MaskRewardHelper:
 
         return "", []
     
-    def get_masks(self, sample_id: str) -> Optional[np.ndarray]:
-        """获取单个样本的 mask"""
-        if sample_id in self.masks_cache:
-            return self.masks_cache[sample_id]
-        
+    def _load_masks_from_disk(self, sample_id: str) -> Optional[np.ndarray]:
+        """Load a sample's masks from disk (CephFS). No caching side-effects.
+
+        Returns the exact same array the legacy code returned; only the
+        load-vs-cache bookkeeping moved out so callers can cache results.
+        """
         meta = self.metadata.get(sample_id)
         if not meta:
             return None
-        
+
         mask_path = meta.get("mask_path")
         if not mask_path:
             return None
@@ -598,16 +611,50 @@ class MaskRewardHelper:
 
         if not os.path.exists(mask_path):
             return None
-        
+
         try:
             data = np.load(mask_path)
-            masks = data["masks"]
-            if self.cache_masks:
-                self.masks_cache[sample_id] = masks
-            return masks
+            return data["masks"]
         except Exception as e:
             logger.error(f"加载 mask 失败 {mask_path}: {e}")
             return None
+
+    def get_masks(self, sample_id: str) -> Optional[np.ndarray]:
+        """获取单个样本的 mask（带有界 LRU 缓存）。
+
+        缓存关闭时行为与旧版完全一致（每次从磁盘加载）。缓存开启时：
+        - 命中：移动到 LRU 末尾并直接返回（避免重复 CephFS np.load）。
+        - 未命中：在锁外执行磁盘加载（允许多线程并发 I/O），加载后在锁内写入，
+          超出 STEPCOUNT_MASK_CACHE_MAX 时淘汰最久未用项。
+        返回的数组与旧版逐 byte 一致，因此不改变任何 reward 数值。
+        """
+        if not self.cache_masks:
+            return self._load_masks_from_disk(sample_id)
+
+        # Fast path: cache hit.
+        with self._cache_lock:
+            cached = self.masks_cache.get(sample_id)
+            if cached is not None:
+                self.masks_cache.move_to_end(sample_id)
+                return cached
+
+        # Miss: load outside the lock so concurrent reward threads can issue
+        # parallel CephFS reads instead of serialising on the cache lock.
+        masks = self._load_masks_from_disk(sample_id)
+        if masks is None:
+            return None
+
+        with self._cache_lock:
+            existing = self.masks_cache.get(sample_id)
+            if existing is not None:
+                # Another thread loaded it concurrently; reuse that one.
+                self.masks_cache.move_to_end(sample_id)
+                return existing
+            self.masks_cache[sample_id] = masks
+            if self._mask_cache_max > 0:
+                while len(self.masks_cache) > self._mask_cache_max:
+                    self.masks_cache.popitem(last=False)  # evict least-recently-used
+            return masks
     
     def get_sequence_masks(self, sequence_id: str) -> List[Tuple[str, int, np.ndarray]]:
         """获取整个序列的所有 masks"""
@@ -632,9 +679,15 @@ class MaskRewardHelper:
         point: Tuple[float, float],
         used_sample_ids: Set[str],
         is_pixel_coord: bool = True,
-        reference_sample_id: str = None
+        reference_sample_id: str = None,
+        sequence_masks: Optional[List[Tuple[str, int, np.ndarray]]] = None,
     ) -> Dict[str, Any]:
-        """检查点是否落在序列的任意 mask 内"""
+        """检查点是否落在序列的任意 mask 内。
+
+        ``sequence_masks`` 可由调用方预加载并传入，避免对同一条 trajectory 的
+        每个预测点都重新调用 ``get_sequence_masks``（后者会对整条序列逐个
+        ``np.load``）。传入与否不影响判定结果，仅消除重复磁盘 I/O。
+        """
         result = {
             "in_any_mask": False,
             "in_unused_mask": False,
@@ -645,7 +698,8 @@ class MaskRewardHelper:
             "nearest_unused_distance": None,
         }
         
-        sequence_masks = self.get_sequence_masks(sequence_id)
+        if sequence_masks is None:
+            sequence_masks = self.get_sequence_masks(sequence_id)
         if not sequence_masks:
             return result
         
@@ -863,6 +917,42 @@ def parse_coordinates_from_text(text: str) -> Optional[List[Tuple[float, float]]
     return None
 
 
+def _normalize_point_keys(raw: str) -> str:
+    """Recover the canonical "point_2d" JSON key from benign RL-drift typos.
+
+    TARGETED on purpose (only quoted JSON keys observed in rollouts): it cannot
+    turn arbitrary broken JSON valid, and format scoring can still distinguish
+    canonical keys from recovered aliases via TRAJ_FORMAT_STRICT_KEY.
+
+    Observed recoverable aliases:
+      - "point_22d" / "point_222d" / ... -> "point_2d"
+      - "point_22" / "point_222" / ...   -> "point_2d"
+      - "pointpointlabel"                 -> "point_2d"
+      - "pointinglabel"                   -> "point_2d"
+
+    This keeps answer/point reward computable while strict format credit can
+    still require the original "point_2d" key.
+    Gated by TRAJ_POINT_KEY_NORMALIZE (default ON)."""
+    if os.environ.get("TRAJ_POINT_KEY_NORMALIZE", "1") != "1":
+        return raw
+    return re.sub(
+        r'"(?:point_2+d|point_2{2,}|pointpointlabel|pointinglabel)"\s*:',
+        '"point_2d":',
+        raw,
+    )
+
+
+_POINT_KEY_ALIAS_RE = re.compile(
+    r'"(?:point_2{2,}d|point_2{2,}|point_2{2,}_2d|pointpointlabel|pointinglabel)"\s*:'
+)
+_BROKEN_POINT_KEY_ALIAS_RE = re.compile(r'"point_2{2,}[A-Za-z0-9_]*(?=\s*\[)')
+
+
+def _count_point_key_aliases(predict: str) -> int:
+    """Count observed non-canonical point-key aliases for drift monitoring."""
+    return len(_POINT_KEY_ALIAS_RE.findall(predict)) + len(_BROKEN_POINT_KEY_ALIAS_RE.findall(predict))
+
+
 def _parse_pred_point(predict: str) -> Optional[Tuple[Tuple[float, float], str]]:
     """从预测中解析点坐标与标签
 
@@ -870,6 +960,8 @@ def _parse_pred_point(predict: str) -> Optional[Tuple[Tuple[float, float], str]]
     "point_2d" 键时直接返回 None，不再回退到 regex 提取坐标。
     这是为了防止 reward hacking：模型输出破损 JSON 如 {"point_2 [x,y]}
     仄获相同 point_reward 但省更少 token，导致策略向格式漂移。
+    （但良性 key typo "point_22d" 先经 _normalize_point_keys 归一恢复，
+     避免漂移诱发的 format 死门吸收态。）
 
     宽松模式 (TRAJ_POINT_STRICT_JSON=0, 向后兼容)：JSON 失败时回退到 regex
     提取 [x,y] 坐标，恢复 v26 之前的行为。
@@ -878,7 +970,7 @@ def _parse_pred_point(predict: str) -> Optional[Tuple[Tuple[float, float], str]]
     if not content_match:
         return None
 
-    raw = content_match.group(1).strip()
+    raw = _normalize_point_keys(content_match.group(1).strip())
 
     # 优先 JSON
     try:
@@ -924,6 +1016,7 @@ def _has_answer_tag(predict: str) -> bool:
 
 
 def _trajectory_format_reward(predict: str, expected_point_steps: int) -> float:
+    # --- Hard (structural) format failures: genuine garbage MUST be rejected to 0. ---
     if not _has_answer_tag(predict):
         return 0.0
 
@@ -935,19 +1028,74 @@ def _trajectory_format_reward(predict: str, expected_point_steps: int) -> float:
     if expected_point_steps > 0 and len(point_tags) == 0:
         return 0.0
 
-    # STRICT JSON validation: each <point> must contain valid JSON with "point_2d" key.
-    # This prevents format drift where the model outputs malformed JSON like
-    # {"point_2d [x, y], ...} (missing colon) which the regex fallback parser would
-    # still accept -- allowing format corruption to go unpunished during training.
-    for raw in point_tags:
-        try:
-            data = json.loads(raw.strip())
-            if not isinstance(data, dict) or "point_2d" not in data:
-                return 0.0
-        except (json.JSONDecodeError, TypeError, ValueError):
-            return 0.0
+    # No points emitted (and none required) -> structurally well-formed.
+    if len(point_tags) == 0:
+        return 1.0
 
-    return 1.0
+    # --- Per-point JSON validity for FORMAT credit (two-tier: exact vs benign typo). ---
+    # The PARSER used for answer/point rewards (_parse_pred_point) stays typo-tolerant
+    # via _normalize_point_keys, so answer/point are unaffected and never crash. FORMAT
+    # credit, however, can be made to reward the *canonical* key so that benign key-drift
+    # ("point_22d"/"point_222d"/... -> "point_2d") loses score and the policy gets a
+    # gradient back toward the original format.
+    #   - n_exact: valid JSON whose key is literally "point_2d".
+    #   - n_typo : valid JSON only AFTER benign key-drift normalization.
+    #
+    # TRAJ_FORMAT_STRICT_KEY (default "0" -> fully backward-compatible / inert):
+    #   0 : typo counts == exact (identical to the previous normalize-first logic).
+    #   1 : typo points earn only TRAJ_FORMAT_TYPO_CREDIT (default 0.0) of the credit,
+    #       exact points earn full credit.
+    # SAFETY: when strict scoring drives format_score to 0 on a heavily-drifted batch,
+    # the legacy TRAJ_FORMAT_REJECTION=1 hard-zero would collapse the whole trajectory
+    # (and, on a >50% typo batch, the whole group -> dead gradient). Pair strict scoring
+    # with EITHER TRAJ_FORMAT_REJECTION=structural (hard-zero only on real structural
+    # garbage) OR TRAJ_FORMAT_TYPO_CREDIT > 0 (keeps format_score strictly above 0).
+    n_exact = 0
+    n_typo = 0
+    for raw in point_tags:
+        s = raw.strip()
+        ok_exact = False
+        try:
+            data = json.loads(s)
+            if isinstance(data, dict) and "point_2d" in data:
+                ok_exact = True
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+        if ok_exact:
+            n_exact += 1
+            continue
+        try:
+            data = json.loads(_normalize_point_keys(s))
+            if isinstance(data, dict) and "point_2d" in data:
+                n_typo += 1
+        except (json.JSONDecodeError, TypeError, ValueError):
+            pass
+
+    strict_key = str(os.environ.get("TRAJ_FORMAT_STRICT_KEY", "0")).lower() in ("1", "true", "yes")
+    if strict_key:
+        try:
+            typo_credit = clamp_reward(float(os.environ.get("TRAJ_FORMAT_TYPO_CREDIT", "0.0")))
+        except (TypeError, ValueError):
+            typo_credit = 0.0  # non-numeric env -> safe strict default (do not crash scoring)
+        valid = float(n_exact) + typo_credit * float(n_typo)
+        n_binary_ok = n_exact  # binary mode requires the canonical key on every point
+    else:
+        valid = float(n_exact + n_typo)  # legacy: benign typo counts as fully valid
+        n_binary_ok = n_exact + n_typo
+
+    # GRADED format (default): score = fraction of valid-JSON points, NOT binary
+    # all-or-nothing. Binary strict-JSON over a long point chain is geometrically
+    # fragile (P(format=1) ~ p^N): a single malformed point among 11-20 zeroes the
+    # whole trajectory -> format_rejection death-trap -> the model abandons pointing
+    # even when it pointed well and answered correctly. Grading keeps format pressure
+    # (the all-invalid / structural cases above still hard-zero -> format_rejection)
+    # while giving recoverable gradient on partial JSON drift.
+    # Set TRAJ_FORMAT_GRADED=0 to restore legacy binary strict-JSON (e.g. for 0-10).
+    graded = str(os.environ.get("TRAJ_FORMAT_GRADED", "1")).lower() in ("1", "true", "yes")
+    if not graded:
+        return 1.0 if n_binary_ok == len(point_tags) else 0.0
+
+    return clamp_reward(valid / float(len(point_tags)))
 
 
 def _trajectory_point_dense_reward(
@@ -1167,6 +1315,13 @@ def _trajectory_point_dense_reward_without_gt_points_details(
     max_eval_steps = int(min(len(pred_points), target_count))
     ref_sample_id = sequence_samples[0].get("sample_id") if sequence_samples else None
 
+    # Load the sequence's masks ONCE for this trajectory and reuse across every
+    # predicted point. Previously check_point_in_sequence_masks() reloaded the
+    # whole sequence (one np.load per sample) on every step -> O(max_eval_steps x
+    # seq_len) CephFS reads per trajectory. This is the dominant cost when GPUs
+    # idle during reward evaluation. Result is numerically identical.
+    cached_sequence_masks = helper.get_sequence_masks(sequence_id)
+
     denom = float(max(target_count, 1))
     step_contribs: List[float] = []
     step_hit_any: List[float] = []
@@ -1190,6 +1345,7 @@ def _trajectory_point_dense_reward_without_gt_points_details(
             used_sample_ids=used_sample_ids,
             is_pixel_coord=is_pixel_coord,
             reference_sample_id=ref_sample_id,
+            sequence_masks=cached_sequence_masks,
         )
 
         hit_any = 1.0 if check.get("in_any_mask") else 0.0
@@ -1241,6 +1397,97 @@ def _trajectory_point_dense_reward_without_gt_points_details(
         _extra_penalty = _extra_pt_lambda * _extra_points / denom
         point_dense_score = clamp_reward(point_dense_score - _extra_penalty)
     return point_dense_score, step_contribs, step_hit_any, step_is_duplicate, float(target_count), float(max_eval_steps)
+
+
+def _trajectory_coverage_stats(
+    predict: str,
+    gt_data: Dict,
+    image_path: Optional[str],
+) -> Tuple[int, int, int]:
+    """Return (gt_count, matched_unused, uncovered) for coverage penalty.
+
+    Uses mask-based matching (gt_count - matched_unused) rather than
+    expected_steps - num_predicted. Falls back to step-count proxy when masks
+    are unavailable.
+    """
+    pred_points = _parse_pred_points(predict)
+    gt_count_raw = gt_data.get("count_number")
+    gt_count = parse_number(str(gt_count_raw)) if gt_count_raw is not None else None
+    expected_steps = len(gt_data.get("point_sequence", []))
+    if expected_steps <= 0 and gt_count is not None:
+        expected_steps = int(gt_count)
+    if gt_count is None or gt_count < 0:
+        gt_count = int(expected_steps)
+    gt_count = int(max(gt_count, 0))
+
+    helper = _get_mask_helper()
+    if helper is None or not image_path or gt_count <= 0:
+        matched_proxy = min(len(pred_points), gt_count)
+        uncovered = max(0, gt_count - matched_proxy)
+        return gt_count, matched_proxy, uncovered
+
+    sequence_id, sequence_samples = helper.get_sequence_from_image_path(image_path)
+    if not sequence_samples:
+        matched_proxy = min(len(pred_points), gt_count)
+        uncovered = max(0, gt_count - matched_proxy)
+        return gt_count, matched_proxy, uncovered
+
+    used_sample_ids: Set[str] = set()
+    matched_unused = 0
+    max_eval_steps = int(min(len(pred_points), gt_count))
+    ref_sample_id = sequence_samples[0].get("sample_id") if sequence_samples else None
+    cached_sequence_masks = helper.get_sequence_masks(sequence_id)
+
+    for step_idx in range(max_eval_steps):
+        pred_point, _ = pred_points[step_idx]
+        is_pixel_coord = not (0.0 <= pred_point[0] <= 1.0 and 0.0 <= pred_point[1] <= 1.0)
+        check = helper.check_point_in_sequence_masks(
+            sequence_id=sequence_id,
+            point=pred_point,
+            used_sample_ids=used_sample_ids,
+            is_pixel_coord=is_pixel_coord,
+            reference_sample_id=ref_sample_id,
+            sequence_masks=cached_sequence_masks,
+        )
+        if check.get("in_unused_mask"):
+            sample_id = check.get("matched_sample_id")
+            if sample_id:
+                used_sample_ids.add(sample_id)
+            matched_unused += 1
+
+    uncovered = max(0, gt_count - matched_unused)
+    return gt_count, matched_unused, uncovered
+
+
+def _dense_continuous_answer_reward(pred_answer: int, gt_answer: int) -> Optional[float]:
+    """Capped Gaussian partial credit for dense counting (Phase2, training only)."""
+    enable = str(os.environ.get("TRAJ_DENSE_CONTINUOUS_REWARD", "0")).lower() in ("1", "true", "yes")
+    if not enable:
+        return None
+    min_gt = int(os.environ.get("TRAJ_DENSE_CONTINUOUS_MIN_GT", "11"))
+    if gt_answer < min_gt:
+        return None
+    if pred_answer == gt_answer:
+        return 1.0
+    err = abs(int(pred_answer) - int(gt_answer))
+    rel_denom = max(0.06 * float(gt_answer), 1.0)
+    norm_err = err / rel_denom
+    raw = math.exp(-0.5 * norm_err * norm_err)
+    wrong_cap = float(os.environ.get("TRAJ_DENSE_CONTINUOUS_WRONG_CAP", "0.35"))
+    within1_cap = float(os.environ.get("TRAJ_DENSE_CONTINUOUS_WITHIN1_CAP", "0.45"))
+    score = min(wrong_cap, raw)
+    if err <= 1:
+        score = min(within1_cap, score + 0.1)
+    return clamp_reward(score)
+
+
+def _has_explicit_stop_none(predict: str) -> bool:
+    """Detect explicit no-more-points stop token."""
+    if re.search(r"<none\s*/?>", predict, re.IGNORECASE):
+        return True
+    if re.search(r"no[-\s]?more[-\s]?points", predict, re.IGNORECASE):
+        return True
+    return False
 
 
 def is_pixel_coordinate(coord: List[float], img_width: int = 1024, img_height: int = 1024) -> bool:
@@ -1894,41 +2141,92 @@ def compute_score(
                         # Mirrors accuracy_reward(): exp(-alpha * |pred-gt|/max(gt,1))
                         # 多数 (pred > gt): hallucination → heavier penalty (alpha * 2)
                         # 漏数 (pred < gt): miss → base alpha
-                        _soft_answer_decay = str(os.environ.get("TRAJ_SOFT_ANSWER_DECAY", "0")).lower() in ("1", "true", "yes")
-                        if _soft_answer_decay and pred_answer is not None and gt_answer is not None:
-                            _pred_int = int(pred_answer)
-                            _gt_int = int(gt_answer)
-                            _error = _pred_int - _gt_int
-                            _abs_error = abs(_error)
-                            _denom = max(_gt_int, 1)
-                            _norm_err = min(_abs_error / _denom, 5.0)
-                            # Asymmetric alpha: overcount penalized 2x harder (hallucination is worse)
-                            _alpha_base = float(os.environ.get("TRAJ_ANSWER_DECAY_ALPHA", "8.0"))
-                            # Asymmetric alpha + GT-scaled undercounting penalty
-                            if _error > 0:
-                                _alpha = _alpha_base * 2.0  # overcount: 2x harder
-                            else:
-                                _under_gt_scale = float(os.environ.get("TRAJ_UNDER_ALPHA_GT_SCALE", "0.5"))
-                                _under_gt_th = int(float(os.environ.get("TRAJ_UNDER_ALPHA_GT_THRESHOLD", "5")))
-                                if _gt_int > _under_gt_th and _under_gt_scale > 0:
-                                    _alpha = _alpha_base * (1.0 + _under_gt_scale * (_gt_int - _under_gt_th) / max(_under_gt_th, 1))
+                        _dense_partial = None
+                        if pred_answer is not None and gt_answer is not None:
+                            _dense_partial = _dense_continuous_answer_reward(int(pred_answer), int(gt_answer))
+                        if _dense_partial is not None:
+                            answer_score = _dense_partial
+                        else:
+                            _soft_answer_decay = str(os.environ.get("TRAJ_SOFT_ANSWER_DECAY", "0")).lower() in ("1", "true", "yes")
+                            if _soft_answer_decay and pred_answer is not None and gt_answer is not None:
+                                _pred_int = int(pred_answer)
+                                _gt_int = int(gt_answer)
+                                _error = _pred_int - _gt_int
+                                _abs_error = abs(_error)
+                                _denom = max(_gt_int, 1)
+                                _norm_err = min(_abs_error / _denom, 5.0)
+                                # Asymmetric alpha: overcount penalized 2x harder (hallucination is worse)
+                                _alpha_base = float(os.environ.get("TRAJ_ANSWER_DECAY_ALPHA", "8.0"))
+                                # Asymmetric alpha + GT-scaled undercounting penalty
+                                if _error > 0:
+                                    _alpha = _alpha_base * 2.0  # overcount: 2x harder
                                 else:
-                                    _alpha = _alpha_base
-                            _raw_decay = safe_exp(-_alpha * _norm_err)
-                            # Cap: wrong answer reward never exceeds this ceiling (prevents close-enough local optimum)
-                            _decay_cap = float(os.environ.get("TRAJ_ANSWER_DECAY_CAP", "0.4"))
-                            answer_score = clamp_reward(min(_raw_decay, _decay_cap))
-                            if _traj_event_should_log("answer_decay"):
-                                logger.info(
-                                    "[trajectory_reward] sample_index=%s answer_decay: pred=%d gt=%d error=%+d alpha=%.1f raw=%.4f cap=%.2f score=%.4f",
-                                    sample_index, _pred_int, _gt_int, _error, _alpha, _raw_decay, _decay_cap, answer_score,
-                                )
+                                    _under_gt_scale = float(os.environ.get("TRAJ_UNDER_ALPHA_GT_SCALE", "0.5"))
+                                    _under_gt_th = int(float(os.environ.get("TRAJ_UNDER_ALPHA_GT_THRESHOLD", "5")))
+                                    if _gt_int > _under_gt_th and _under_gt_scale > 0:
+                                        _alpha = _alpha_base * (1.0 + _under_gt_scale * (_gt_int - _under_gt_th) / max(_under_gt_th, 1))
+                                    else:
+                                        _alpha = _alpha_base
+                                _raw_decay = safe_exp(-_alpha * _norm_err)
+                                # Cap: wrong answer reward never exceeds this ceiling (prevents close-enough local optimum)
+                                _decay_cap = float(os.environ.get("TRAJ_ANSWER_DECAY_CAP", "0.4"))
+                                answer_score = clamp_reward(min(_raw_decay, _decay_cap))
+                                if _traj_event_should_log("answer_decay"):
+                                    logger.info(
+                                        "[trajectory_reward] sample_index=%s answer_decay: pred=%d gt=%d error=%+d alpha=%.1f raw=%.4f cap=%.2f score=%.4f",
+                                        sample_index, _pred_int, _gt_int, _error, _alpha, _raw_decay, _decay_cap, answer_score,
+                                    )
 
 
                     # Consistency penalty: pred_answer != len(pred_points)
                     if not answer_point_count_consistent:
                         cv_penalty = float(os.environ.get("TRAJ_CONSISTENCY_PENALTY", "0.5"))
                         answer_score = answer_score * cv_penalty
+
+                    # Explicit <none> / no-more-points stop bonus (Phase3 stop mechanism)
+                    _stop_none_enable = str(os.environ.get("TRAJ_STOP_NONE_ENABLE", "0")).lower() in ("1", "true", "yes")
+                    if _stop_none_enable and _has_explicit_stop_none(predict):
+                        _stop_bonus = float(os.environ.get("TRAJ_STOP_NONE_BONUS", "0.05"))
+                        answer_score = clamp_reward(answer_score + _stop_bonus)
+                        score["stop_none_bonus"] = _stop_bonus
+                    elif _stop_none_enable and stopped_by_answer and pred_answer is not None and gt_answer is not None:
+                        if int(pred_answer) < int(gt_answer) and len(pred_points) < int(gt_answer):
+                            _early_stop_pen = float(os.environ.get("TRAJ_EARLY_STOP_PENALTY", "0.15"))
+                            answer_score = max(0.0, answer_score - _early_stop_pen)
+                            score["early_stop_penalty"] = _early_stop_pen
+
+                # --- Coverage Penalty (Phase 1B, V34: mask-based uncovered count) ---
+                # Penalises early stopping when the model gives <answer> but GT still
+                # has uncovered masks (gt_count - matched_unused), not merely fewer
+                # predicted steps than expected_steps.
+                _coverage_penalty_enable = str(
+                    os.environ.get("TRAJ_COVERAGE_PENALTY_ENABLE", "0")
+                ).lower() in ("1", "true")
+                if _coverage_penalty_enable and stopped_by_answer and not turns_exceeded:
+                    _cov_mode = str(os.environ.get("TRAJ_COVERAGE_PENALTY_MODE", "mask")).lower()
+                    if _cov_mode == "mask":
+                        _gt_cov, _matched_cov, _num_uncovered = _trajectory_coverage_stats(
+                            predict=predict,
+                            gt_data=gt_data,
+                            image_path=image_path,
+                        )
+                        score["coverage_gt_count"] = float(_gt_cov)
+                        score["coverage_matched"] = float(_matched_cov)
+                    else:
+                        _num_uncovered = max(0, expected_steps - len(pred_points))
+                    if _num_uncovered > 0:
+                        _penalty_per_miss = float(
+                            os.environ.get("TRAJ_COVERAGE_PENALTY_PER_MISS", "0.3")
+                        )
+                        _penalty_cap = float(
+                            os.environ.get("TRAJ_COVERAGE_PENALTY_CAP", "0.6")
+                        )
+                        _coverage_penalty = min(
+                            _num_uncovered * _penalty_per_miss, _penalty_cap
+                        )
+                        answer_score = max(0.0, answer_score - _coverage_penalty)
+                        score["coverage_penalty"] = _coverage_penalty
+                        score["coverage_uncovered"] = float(_num_uncovered)
 
                 # --- Weighted overall score ---
                 if eval_answer_only_on_no_mask:
@@ -1941,10 +2239,29 @@ def compute_score(
                     )
 
                 # --- Format Rejection: zero reward for format-broken trajectories ---
-                format_rejection = str(os.environ.get("TRAJ_FORMAT_REJECTION", "0")).lower() in ("1", "true", "yes")
+                # Modes: "1"/"true"/"yes" = legacy (hard-zero whenever format_score<=0);
+                #        "structural"      = hard-zero ONLY on genuine structural garbage
+                #                            (no <answer>, unparseable answer, or zero <point>
+                #                            tags when points expected). JSON-key drift that
+                #                            still has <point> tags is left to graded format,
+                #                            avoiding the format=0 -> hard-zero -> dead-gradient
+                #                            absorbing collapse on long dense chains.
+                _fmt_rej_raw = str(os.environ.get("TRAJ_FORMAT_REJECTION", "0")).lower()
+                format_rejection = _fmt_rej_raw in ("1", "true", "yes", "structural")
                 if format_rejection and format_score <= 0.0:
-                    overall_score = 0.0
-                    score["format_rejected"] = 1.0
+                    if _fmt_rej_raw == "structural":
+                        _has_point_tag = re.search(r"<point>", predict) is not None
+                        _structural_fail = (
+                            (not _has_answer_tag(predict))
+                            or (_extract_last_answer_number(predict) is None)
+                            or (expected_steps > 0 and not _has_point_tag)
+                        )
+                        if _structural_fail:
+                            overall_score = 0.0
+                            score["format_rejected"] = 1.0
+                    else:
+                        overall_score = 0.0
+                        score["format_rejected"] = 1.0
 
                 # --- Invalid trajectories: no answer or max-turns exceeded ---
                 if (not stopped_by_answer) or (pred_answer is None):
@@ -1987,6 +2304,13 @@ def compute_score(
             score["consistency_violation"] = consistency_violation
             score["answer_gated"] = 1.0 if answer_gated else 0.0
             score["format_fail"] = 1.0 if format_score <= 0.0 else 0.0
+            # Observability: count all known point-key drift aliases, including recoverable
+            # aliases normalized by _normalize_point_keys and broken aliases seen before OOM.
+            # `point_key_typo` is the per-sample alias count; `point_key_typo_rate`
+            # is a batch-meanable sample-level drift rate.
+            point_key_alias_count = _count_point_key_aliases(predict)
+            score["point_key_typo"] = float(point_key_alias_count)
+            score["point_key_typo_rate"] = 1.0 if point_key_alias_count > 0 else 0.0
             score["no_point_pred"] = 1.0 if len(pred_points) == 0 else 0.0
             score["turns_exceeded"] = 1.0 if turns_exceeded else 0.0
             score["stopped_by_answer"] = 1.0 if stopped_by_answer else 0.0
@@ -2004,6 +2328,60 @@ def compute_score(
                 # This naturally includes answer_weight*answer + format_weight*format
                 # + any rounding difference
                 score["_step_rewards"] = _per_turn_rewards
+
+                # --- Unified per-turn step VALUE for advantage credit (B/C arms) ---
+                # BOK_STEP_SIGNAL: pointhit (default; no override -> estimator uses
+                # token_level_rewards = legacy) | progress | stoptiming.
+                # We emit a parallel `_point_step_value` list aligned 1:1 with
+                # `_step_rewards` (i.e. with the </point> turn boundaries). The reward
+                # worker records these at the same token positions; the step estimator
+                # consumes them instead of the placed token reward when present.
+                _bok_step_signal = os.environ.get("BOK_STEP_SIGNAL", "pointhit").strip().lower()
+                if _bok_step_signal in ("progress", "stoptiming"):
+                    _n_steps = len(_per_turn_rewards)
+                    _step_value: List[float] = []
+                    if _bok_step_signal == "progress":
+                        # Dedup-aware coverage delta: +1 new GT, -dup repeat, 0 miss.
+                        # FAIL-FAST OBSERVABILITY (reviewer P1): if step_hit_any/duplicate
+                        # are empty (e.g. data carries point_sequence -> the _details path
+                        # is skipped), every progress value collapses to 0.0 and Arm C
+                        # SILENTLY degrades to outcome-only (== Arm A). Surface it as a
+                        # metric so smoke/train logs catch it instead of a misleading null.
+                        if _n_steps > 0 and len(step_hit_any) == 0:
+                            score["progress_degraded"] = 1.0
+                            if _traj_event_should_log("progress_degraded"):
+                                logger.warning(
+                                    "[trajectory_reward] sample_index=%s progress_degraded: "
+                                    "step_hit_any empty (point_sequence path?) -> Arm C aux=0",
+                                    sample_index,
+                                )
+                        _dup_pen = float(os.environ.get("BOK_PROGRESS_DUP_PENALTY", "1.0"))
+                        for _k in range(_n_steps):
+                            _hit = step_hit_any[_k] if _k < len(step_hit_any) else 0.0
+                            _dup = step_is_duplicate[_k] if _k < len(step_is_duplicate) else 0.0
+                            if _dup > 0.5:
+                                _step_value.append(-_dup_pen)
+                            elif _hit > 0.5:
+                                _step_value.append(1.0)
+                            else:
+                                _step_value.append(0.0)
+                    else:  # stoptiming: sign(N - running_count) on the continue (point) token
+                        _N = None
+                        try:
+                            _N = int(gt_answer) if gt_answer is not None else None
+                        except Exception:
+                            _N = None
+                        if _N is not None and _N > 0:
+                            for _k in range(_n_steps):
+                                _cnt = _k + 1  # running count at this point-turn (1-indexed)
+                                if _cnt < _N:
+                                    _step_value.append(1.0)   # keep going (under target)
+                                elif _cnt == _N:
+                                    _step_value.append(0.0)   # at target (neutral)
+                                else:
+                                    _step_value.append(-1.0)  # overshoot (suppress extra points)
+                    if _step_value:
+                        score["_point_step_value"] = _step_value
 
             if _traj_reason_debug_enabled():
                 _TRAJ_REASON_DEBUG_CALLS += 1

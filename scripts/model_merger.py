@@ -28,10 +28,14 @@ from transformers import (
     AutoConfig,
     AutoModelForCausalLM,
     AutoModelForTokenClassification,
-    AutoModelForVision2Seq,
     PretrainedConfig,
     PreTrainedModel,
 )
+
+try:
+    from transformers import AutoModelForVision2Seq
+except ImportError:
+    from transformers import AutoModelForImageTextToText as AutoModelForVision2Seq
 
 
 def merge_by_placement(tensors: List[torch.Tensor], placement: Placement):

@@ -42,7 +42,7 @@ All BoK-GRPO parameters remain identical to the V17 initial run:
 
 ## Retrain Command
 ```bash
-cd /mnt/shared-storage-user/zhangchenhao/work/EasyR1-latest
+cd /data/workspace/hyleochang/EasyR1-latest
 bash examples/launch_v17_experiments.sh C
 ```
 
@@ -50,12 +50,12 @@ bash examples/launch_v17_experiments.sh C
 After training completes, merge FSDP sharded checkpoints to HuggingFace format:
 ```bash
 # Find the new V17 save directory (with updated timestamp)
-V17_SAVE=$(ls -td /mnt/shared-storage-user/zhangchenhao/work/EasyR1-latest/save/StepCount-7B-SFT-30k_v17_* | head -1)
+V17_SAVE=$(ls -td /data/workspace/hyleochang/EasyR1-latest/save/StepCount-7B-SFT-30k_v17_* | head -1)
 
 # Merge each checkpoint
 for step_dir in ${V17_SAVE}/global_step_*/actor; do
     echo "Merging: ${step_dir}"
-    python3 /mnt/shared-storage-user/zhangchenhao/work/EasyR1/scripts/model_merger.py \
+    python3 /data/workspace/hyleochang/EasyR1-latest/scripts/model_merger.py \
         --local_dir "${step_dir}" 2>&1 | tail -3
 done
 ```

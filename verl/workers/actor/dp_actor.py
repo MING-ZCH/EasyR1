@@ -25,7 +25,10 @@ from einops import rearrange
 from ray.experimental.tqdm_ray import tqdm
 from torch import nn
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from transformers.modeling_flash_attention_utils import index_first_axis, pad_input, unpad_input
+try:
+    from transformers.modeling_flash_attention_utils import index_first_axis, pad_input, unpad_input
+except ImportError:
+    from ...utils.padding_utils import index_first_axis, pad_input, unpad_input
 
 from ...protocol import DataProto
 from ...trainer import core_algos

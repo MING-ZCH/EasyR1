@@ -18,7 +18,7 @@
 
 ```bash
 # v27 (4GPU A100, lr=1.5e-6)
-cd /mnt/shared-storage-user/zhangchenhao/work/EasyR1-latest
+cd /data/workspace/hyleochang/EasyR1-latest
 bash examples/qwen2_5_vl_7b_StepCount_0_10_grpo_interleaved_traj_v27_sparse_guarded.sh
 
 # v27b (2GPU H200, lr=2e-6, 对比探索)

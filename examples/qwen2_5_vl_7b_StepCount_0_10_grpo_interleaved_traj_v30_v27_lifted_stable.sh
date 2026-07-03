@@ -22,7 +22,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 cd "${PROJECT_ROOT}"
 
-LOG_DIR="/mnt/shared-storage-user/zhangchenhao/work/EasyR1-latest/logs/train"
+LOG_DIR="/apdcephfs_hldy2/share_305110755/hunyuan/chenhaoz/logs/rl"
 mkdir -p "${LOG_DIR}"
 export output_path='./'
 export ckpt_path='./ckpt'
@@ -32,18 +32,18 @@ export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:Tr
 export PYTHONHASHSEED=${PYTHONHASHSEED:-0}
 
 # Data: v27's strongest transfer signal came from mixed easy+hard.
-export STEPCOUNT_TRAIN_DATA=${STEPCOUNT_TRAIN_DATA:-/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/StepCountQA-RL-Traj_0_10_easy_plus_hard}
+export STEPCOUNT_TRAIN_DATA=${STEPCOUNT_TRAIN_DATA:-/apdcephfs_hldy2/share_305110755/hunyuan/chenhaoz/datasets/StepCountQA-RL-Traj_0_10_easy_plus_hard}
 export BOK_TOTAL_STEPS=${BOK_TOTAL_STEPS:-213}
 export TRAIN_OVERSAMPLE_NO_MASK_FACTOR=${TRAIN_OVERSAMPLE_NO_MASK_FACTOR:-1}
 export TRAIN_HARD_OVERSAMPLE_FACTOR=${TRAIN_HARD_OVERSAMPLE_FACTOR:-1}
-export TRAIN_HARD_REFERENCE_PATH=${TRAIN_HARD_REFERENCE_PATH:-/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/StepCountQA-RL-Traj_0_10_hard_only/data}
-export TRAIN_SAVE_FREQ=${TRAIN_SAVE_FREQ:-40}
+export TRAIN_HARD_REFERENCE_PATH=${TRAIN_HARD_REFERENCE_PATH:-/apdcephfs_hldy2/share_305110755/hunyuan/chenhaoz/datasets/StepCountQA-RL-Traj_0_10_hard_only/data}
+export TRAIN_SAVE_FREQ=${TRAIN_SAVE_FREQ:-20}
 export TRAIN_SAVE_LIMIT=${TRAIN_SAVE_LIMIT:-6}
 export TRAIN_VAL_FREQ=${TRAIN_VAL_FREQ:-20}
 
 # Reward and trajectory configuration.
-export STEPCOUNT_MASKS_METADATA=${STEPCOUNT_MASKS_METADATA:-/mnt/shared-storage-user/zhangchenhao/StepCount-RL_masks_output/masks_metadata.json}
-export STEPCOUNT_MASKS_DIR=${STEPCOUNT_MASKS_DIR:-/mnt/shared-storage-user/zhangchenhao/StepCount-RL_masks_output/masks}
+export STEPCOUNT_MASKS_METADATA=${STEPCOUNT_MASKS_METADATA:-/apdcephfs_hldy2/share_305110755/hunyuan/chenhaoz/datasets/StepCount-RL_Masks-Sharded/extracted/masks_metadata.json}
+export STEPCOUNT_MASKS_DIR=${STEPCOUNT_MASKS_DIR:-/apdcephfs_hldy2/share_305110755/hunyuan/chenhaoz/datasets/StepCount-RL_Masks-Sharded/extracted/masks}
 export STEPCOUNT_MASK_REQUIRE=${STEPCOUNT_MASK_REQUIRE:-1}
 export STEPCOUNT_MASK_PREFILL_BY_TURN=${STEPCOUNT_MASK_PREFILL_BY_TURN:-1}
 export STEPCOUNT_MASK_LOG_CONFIG=${STEPCOUNT_MASK_LOG_CONFIG:-1}
@@ -150,7 +150,7 @@ export V30_FAILFAST_LOWVAR_CRITICAL=${V30_FAILFAST_LOWVAR_CRITICAL:-45}
 export V30_FAILFAST_ZEROREWARD_CRITICAL=${V30_FAILFAST_ZEROREWARD_CRITICAL:-30}
 export V30_FAILFAST_BOK_CONSEC=${V30_FAILFAST_BOK_CONSEC:-2}
 
-MODEL_PATH=${MODEL_PATH:-/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/model/StepCount-7B-SFT-30k-high/checkpoint-3537}
+MODEL_PATH=${MODEL_PATH:-/apdcephfs_hldy2/share_305110755/hunyuan/chenhaoz/models/StepCount-7B-SFT-30k-high/checkpoint-3537}
 CONFIG_PATH=${CONFIG_PATH:-${PROJECT_ROOT}/examples/config.yaml}
 REWARD_FN_PATH=${REWARD_FN_PATH:-${PROJECT_ROOT}/examples/reward_function/StepCount_mask_reward.py:compute_score}
 
@@ -162,7 +162,7 @@ fi
 for required_file in "${CONFIG_PATH}" "${PROJECT_ROOT}/examples/reward_function/StepCount_mask_reward.py"; do
     [[ -f "${required_file}" ]] || { echo "[FATAL] required file not found: ${required_file}" >&2; exit 1; }
 done
-for required_path in "${MODEL_PATH}" "${STEPCOUNT_TRAIN_DATA}" "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/pixmo-test" "${STEPCOUNT_MASKS_METADATA}" "${STEPCOUNT_MASKS_DIR}"; do
+for required_path in "${MODEL_PATH}" "${STEPCOUNT_TRAIN_DATA}" "/apdcephfs_hldy2/share_305110755/hunyuan/chenhaoz/datasets/pixmo-test" "${STEPCOUNT_MASKS_METADATA}" "${STEPCOUNT_MASKS_DIR}"; do
     [[ -e "${required_path}" ]] || { echo "[FATAL] required path not found: ${required_path}" >&2; exit 1; }
 done
 [[ -z "${INTERLEAVED_PROCESS_PROMPT_FILE}" || -f "${INTERLEAVED_PROCESS_PROMPT_FILE}" ]] || { echo "[FATAL] interleaved process prompt file not found: ${INTERLEAVED_PROCESS_PROMPT_FILE}" >&2; exit 1; }
@@ -188,7 +188,7 @@ echo "[RunConfig] strict_json=${TRAJ_POINT_STRICT_JSON} fmt_rej=${TRAJ_FORMAT_RE
 echo "[RunConfig] BOK_CLIP=${BOK_CLIP} smart_filter=${BOK_SMART_FILTER_THRESHOLD} tau=${BOK_TAU_INIT}->${BOK_TAU_FINAL}"
 echo "[RunConfig] grad_spike_threshold=${GRAD_SPIKE_THRESHOLD} spike_brake=${GRAD_SPIKE_BRAKE_MAX}/${GRAD_SPIKE_BRAKE_WINDOW} nonfinite_brake=${GRAD_NONFINITE_BRAKE_MAX}/${GRAD_NONFINITE_BRAKE_WINDOW}"
 echo "[RunConfig] failfast=${V30_FAILFAST_ENABLE} nan_limit=${V30_FAILFAST_NAN_LIMIT} entropy>${V30_FAILFAST_ENTROPY_CRITICAL}x${V30_FAILFAST_ENTROPY_CONSEC} format>${V30_FAILFAST_FORMAT_CRITICAL}x${V30_FAILFAST_FORMAT_CONSEC}"
-echo "[RunConfig] rollout_batch_size=64 val_batch_size=64 gpu_memory_utilization=0.65 n_gpus=4"
+echo "[RunConfig] rollout_batch_size=${V31_ROLLOUT_BATCH_SIZE:-64} val_batch_size=${V31_VAL_BATCH_SIZE:-64} gpu_memory_utilization=0.65 nnodes=${V31_NNODES:-1} n_gpus_per_node=${V31_N_GPUS_PER_NODE:-8}"
 echo "[RunConfig] save_freq=${TRAIN_SAVE_FREQ} save_limit=${TRAIN_SAVE_LIMIT} val_freq=${TRAIN_VAL_FREQ}"
 echo "[RunConfig] log=${LOG_FILE}"
 echo "================================================================"
@@ -258,7 +258,7 @@ python3 -m verl.trainer.main \
     data.train_files=${STEPCOUNT_TRAIN_DATA} \
     data.system_prompt_file=${SYSTEM_PROMPT_FILE} \
     data.format_prompt=null \
-    data.val_files=/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/pixmo-test \
+    data.val_files=/apdcephfs_hldy2/share_305110755/hunyuan/chenhaoz/datasets/pixmo-test \
     data.max_prompt_length=7500 \
     data.max_response_length=3200 \
     data.shuffle=true \
@@ -270,10 +270,13 @@ python3 -m verl.trainer.main \
     worker.actor.ppo_epochs=1 \
     worker.actor.max_grad_norm=1.0 \
     worker.actor.model.model_path=${MODEL_PATH} \
-    worker.actor.micro_batch_size_per_device_for_update=8 \
-    worker.actor.micro_batch_size_per_device_for_experience=8 \
-    worker.rollout.gpu_memory_utilization=0.65 \
+    worker.actor.micro_batch_size_per_device_for_update=${V31_MICRO_BATCH_UPDATE:-8} \
+    worker.actor.micro_batch_size_per_device_for_experience=${V31_MICRO_BATCH_EXP:-8} \
+    worker.rollout.gpu_memory_utilization=${V31_GPU_MEM_UTIL:-0.65} \
     worker.rollout.tensor_parallel_size=1 \
+    worker.rollout.max_model_len=${V31_MAX_MODEL_LEN:-16384} \
+    worker.rollout.max_num_batched_tokens=${V31_MAX_NUM_BATCHED_TOKENS:-32768} \
+    worker.rollout.enforce_eager=${V31_ENFORCE_EAGER:-false} \
     worker.rollout.n=${ROLLOUT_N} \
     worker.rollout.temperature=${ROLLOUT_TEMPERATURE} \
     worker.rollout.stop='["</answer>"]' \
@@ -294,17 +297,18 @@ python3 -m verl.trainer.main \
     worker.reward.reward_function_kwargs.point_weight=${POINT_WEIGHT} \
     worker.reward.reward_function_kwargs.trajectory_format_weight=${TRAJECTORY_FORMAT_WEIGHT} \
     worker.reward.reward_function_kwargs.max_turns=${INTERLEAVED_MAX_TURNS} \
-    trainer.experiment_name=StepCount-7B-SFT-30k_v30_v27_lifted_stable_${ADV_ESTIMATOR}_$(date +%Y%m%d_%H%M) \
+    trainer.experiment_name=${V31_EXPERIMENT_NAME:-StepCount-7B-SFT-30k_v30_v27_lifted_stable_${ADV_ESTIMATOR}_$(date +%Y%m%d_%H%M)} \
     trainer.logger=['console','wandb'] \
-    trainer.save_checkpoint_path=/mnt/shared-storage-user/zhangchenhao/work/EasyR1-latest/save/StepCount-7B-SFT-30k_v30_v27_lifted_stable_${ADV_ESTIMATOR}_$(date +%Y%m%d_%H%M) \
+    trainer.save_checkpoint_path=${V31_SAVE_CHECKPOINT_PATH:-/apdcephfs_hldy2/share_305110755/hunyuan/chenhaoz/checkpoints/StepCount-7B-SFT-30k_v30_${ADV_ESTIMATOR}_$(date +%Y%m%d_%H%M)} \
     trainer.total_epochs=${STEPCOUNT_TOTAL_EPOCHS:-1} \
     trainer.save_freq=${TRAIN_SAVE_FREQ} \
     trainer.save_limit=${TRAIN_SAVE_LIMIT} \
     trainer.val_freq=${TRAIN_VAL_FREQ} \
-    data.rollout_batch_size=64 \
-    data.val_batch_size=64 \
-    worker.actor.global_batch_size=64 \
-    trainer.n_gpus_per_node=4 > >(tee "${LOG_FILE}") 2>&1 &
+    data.rollout_batch_size=${V31_ROLLOUT_BATCH_SIZE:-64} \
+    data.val_batch_size=${V31_VAL_BATCH_SIZE:-64} \
+    worker.actor.global_batch_size=${V31_GLOBAL_BATCH_SIZE:-64} \
+    trainer.nnodes=${V31_NNODES:-1} \
+    trainer.n_gpus_per_node=${V31_N_GPUS_PER_NODE:-8} > >(tee "${LOG_FILE}") 2>&1 &
 
 TRAIN_PID=$!
 if [[ "${V30_FAILFAST_ENABLE}" == "1" ]]; then

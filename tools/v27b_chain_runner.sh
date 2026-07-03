@@ -6,7 +6,7 @@
 #   touch logs/monitor/v27b_chain_runner.stop   # graceful abort between experiments
 
 set -u
-REPO_DIR="${REPO_DIR:-/mnt/shared-storage-user/zhangchenhao/work/EasyR1-latest}"
+REPO_DIR="${REPO_DIR:-/data/workspace/hyleochang/EasyR1-latest}"
 TRAIN_LOG="${TRAIN_LOG:-${REPO_DIR}/logs/train/training_interleaved_traj_v27b_easy_data_bok_grpo_bok_grpo_20260502_105036.log}"
 MONITOR_DIR="${MONITOR_DIR:-${REPO_DIR}/logs/monitor}"
 CHAIN_LOG="${CHAIN_LOG:-${MONITOR_DIR}/v27b_chain_runner.log}"
@@ -22,8 +22,8 @@ ts() { date '+%Y-%m-%d %H:%M:%S'; }
 clog() { echo "[$(ts)] $*" | tee -a "${CHAIN_LOG}" ; }
 
 EXPERIMENTS=(
-  "exp2_v27b_easy_plus_hard|examples/qwen2_5_vl_7b_StepCount_0_10_grpo_interleaved_traj_v27b_easy_data.sh|STEPCOUNT_TRAIN_DATA=/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/StepCountQA-RL-Traj_0_10_easy_plus_hard TRAIN_SAVE_FREQ=60 TRAIN_VAL_FREQ=20 TRAIN_SAVE_LIMIT=6 ACTOR_LR=1.5e-6 BOK_SMART_FILTER_THRESHOLD=0.965 GRAD_SPIKE_THRESHOLD=3.0 V27B_FAILFAST_ENABLE=0"
-  "exp3_v27b_hard_oversample|examples/qwen2_5_vl_7b_StepCount_0_10_grpo_interleaved_traj_v27b_easy_data.sh|STEPCOUNT_TRAIN_DATA=/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/StepCountQA-RL-Traj_0_10_easy_plus_hard TRAIN_HARD_OVERSAMPLE_FACTOR=2 TRAIN_OVERSAMPLE_NO_MASK_FACTOR=3 TRAIN_SAVE_FREQ=90 TRAIN_VAL_FREQ=30 TRAIN_SAVE_LIMIT=6 ACTOR_LR=1.5e-6 BOK_SMART_FILTER_THRESHOLD=0.965 GRAD_SPIKE_THRESHOLD=3.0 V27B_FAILFAST_ENABLE=0"
+  "exp2_v27b_easy_plus_hard|examples/qwen2_5_vl_7b_StepCount_0_10_grpo_interleaved_traj_v27b_easy_data.sh|STEPCOUNT_TRAIN_DATA=/apdcephfs_hldy2/share_305110755/hunyuan/chenhaoz/datasets/StepCountQA-RL-Traj_0_10_easy_plus_hard TRAIN_SAVE_FREQ=60 TRAIN_VAL_FREQ=20 TRAIN_SAVE_LIMIT=6 ACTOR_LR=1.5e-6 BOK_SMART_FILTER_THRESHOLD=0.965 GRAD_SPIKE_THRESHOLD=3.0 V27B_FAILFAST_ENABLE=0"
+  "exp3_v27b_hard_oversample|examples/qwen2_5_vl_7b_StepCount_0_10_grpo_interleaved_traj_v27b_easy_data.sh|STEPCOUNT_TRAIN_DATA=/apdcephfs_hldy2/share_305110755/hunyuan/chenhaoz/datasets/StepCountQA-RL-Traj_0_10_easy_plus_hard TRAIN_HARD_OVERSAMPLE_FACTOR=2 TRAIN_OVERSAMPLE_NO_MASK_FACTOR=3 TRAIN_SAVE_FREQ=90 TRAIN_VAL_FREQ=30 TRAIN_SAVE_LIMIT=6 ACTOR_LR=1.5e-6 BOK_SMART_FILTER_THRESHOLD=0.965 GRAD_SPIKE_THRESHOLD=3.0 V27B_FAILFAST_ENABLE=0"
 )
 
 print_plan() {

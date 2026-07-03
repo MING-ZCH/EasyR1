@@ -127,14 +127,28 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.KLController, kl_penal
     kld = core_algos.compute_kl(data.batch["old_log_probs"], data.batch["ref_log_probs"], kl_penalty=kl_penalty)
     kld = kld * response_mask  # (batch_size, response_length)
 
-    data.batch["token_level_rewards"] = token_level_scores - kl_ctrl.kl_coef * kld
+    kl_coef_before = kl_ctrl.kl_coef
+    data.batch["token_level_rewards"] = token_level_scores - kl_coef_before * kld
 
     current_kl = VF.masked_mean(kld, mask=response_mask, dim=-1)  # average over sequence
     current_kl = torch.mean(current_kl, dim=0).item()
-    metrics = {"critic/kl": current_kl, "critic/kl_coef": kl_ctrl.kl_coef}
+    kl_penalty_mean = current_kl * kl_coef_before
 
     # According to https://github.com/huggingface/trl/blob/v0.11.0/trl/trainer/ppo_trainer.py#L880
     kl_ctrl.update(current_kl=current_kl, n_steps=batch_size)
+    metrics = {
+        "critic/kl": current_kl,
+        "critic/kl_coef": kl_coef_before,
+        "critic/kl_penalty": kl_penalty_mean,
+        "adaptive_kl/kl_loss": current_kl,
+        "adaptive_kl/kl_coef": kl_coef_before,
+        "adaptive_kl/kl_coef_next": kl_ctrl.kl_coef,
+        "adaptive_kl/kl_penalty": kl_penalty_mean,
+        # Alias for dashboards that historically watched actor/kl_loss. When
+        # algorithm.use_kl_loss=false, this is the reward-side equivalent KL.
+        "actor/kl_loss_equiv": current_kl,
+        "actor/kl_coef_equiv": kl_coef_before,
+    }
     return data, metrics
 
 
@@ -199,6 +213,7 @@ def compute_advantage(data: DataProto, adv_estimator: AdvantageEstimator, gamma:
         _ts = _ts_meta if _ts_meta > 1 else int(os.environ.get("BOK_TOTAL_STEPS", "1"))
         _answer_scores = data.batch.get("answer_scores", None)
         _point_step_mask = data.batch.get("point_step_mask", None)
+        _point_step_value = data.batch.get("point_step_value", None)
         advantages, returns = core_algos.compute_bok_grpo_step_advantage(
             token_level_rewards, response_mask, index,
             bok_tau=bok_tau, bok_clip=bok_clip, bok_uniform_mix=bok_uniform_mix,
@@ -206,6 +221,7 @@ def compute_advantage(data: DataProto, adv_estimator: AdvantageEstimator, gamma:
             global_step=_gs, total_steps=_ts,
             answer_scores=_answer_scores,
             point_step_mask=_point_step_mask,
+            point_step_value=_point_step_value,
         )
     else:
         raise NotImplementedError
@@ -589,7 +605,16 @@ class RayPPOTrainer:
                         pass
                 
                 if is_actor_died:
-                    prompt_len = len(test_gen_batch[i].batch['input_ids'][0]) if len(test_gen_batch[i].batch['input_ids']) > 0 else 0
+                    try:
+                        ids = test_gen_batch[i].batch['input_ids']
+                        if ids.dim() == 0:
+                            prompt_len = 0
+                        elif ids.dim() == 1:
+                            prompt_len = ids.shape[0]
+                        else:
+                            prompt_len = ids.shape[1] if ids.shape[0] > 0 else 0
+                    except (TypeError, IndexError, AttributeError):
+                        prompt_len = 0
                     # Check memory usage for logging
                     _, usage_ratio = self._check_gpu_memory_usage()
                     print(f"Warning: Skipping sample {i} due to OOM (GPU memory: {usage_ratio*100:.1f}%, prompt length: {prompt_len} tokens)")
@@ -752,8 +777,13 @@ class RayPPOTrainer:
         The driver process only need to call the compute functions of the worker group through RPC to construct the PPO dataflow.
         The light-weight advantage computation is done on the driver process.
         """
-        # Setup logging - only log to file, avoid console spam
-        log_file = f'./logs/training_debug_{int(time.time())}.log'
+        # Setup logging - save debug logs to shared CephFS (accessible from all nodes & dev machine)
+        debug_log_dir = os.environ.get(
+            'TRAINING_DEBUG_LOG_DIR',
+            '/apdcephfs_hldy2/share_305110755/hunyuan/chenhaoz/logs/debug'
+        )
+        os.makedirs(debug_log_dir, exist_ok=True)
+        log_file = os.path.join(debug_log_dir, f'training_debug_{int(time.time())}.log')
         file_handler = logging.FileHandler(log_file, encoding='utf-8')
         file_handler.setLevel(logging.INFO)
         file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
@@ -932,18 +962,35 @@ class RayPPOTrainer:
                                 reward_tensor, reward_metrics = ray.get(reward_ref)
                                 batch.batch["token_level_scores"] = reward_tensor
                                 _raw_point_step_positions = reward_metrics.pop("_point_step_token_positions", None)
+                                _raw_point_step_values = reward_metrics.pop("_point_step_value", None)
                                 if _raw_point_step_positions is not None and len(_raw_point_step_positions) == reward_tensor.shape[0]:
                                     point_step_mask = torch.zeros_like(reward_tensor, dtype=torch.float32)
+                                    # Parallel value tensor (progress/stoptiming arms). When the
+                                    # reward worker did not emit per-step values, this stays all-zero
+                                    # and the estimator falls back to token_level_rewards (legacy).
+                                    _has_step_values = (
+                                        _raw_point_step_values is not None
+                                        and len(_raw_point_step_values) == reward_tensor.shape[0]
+                                    )
+                                    point_step_value = torch.zeros_like(reward_tensor, dtype=torch.float32)
                                     for _row_idx, _positions in enumerate(_raw_point_step_positions):
                                         if isinstance(_positions, (list, tuple)):
-                                            for _pos in _positions:
+                                            _vals = _raw_point_step_values[_row_idx] if _has_step_values else None
+                                            for _k, _pos in enumerate(_positions):
                                                 try:
                                                     _pos_int = int(_pos)
                                                 except (TypeError, ValueError):
                                                     continue
                                                 if 0 <= _pos_int < point_step_mask.shape[1]:
                                                     point_step_mask[_row_idx, _pos_int] = 1.0
+                                                    if _vals is not None and _k < len(_vals):
+                                                        try:
+                                                            point_step_value[_row_idx, _pos_int] = float(_vals[_k])
+                                                        except (TypeError, ValueError):
+                                                            pass
                                     batch.batch["point_step_mask"] = point_step_mask
+                                    if _has_step_values:
+                                        batch.batch["point_step_value"] = point_step_value
                                 # Extract per-sample answer_scores before reduce_metrics destroys the list
                                 _raw_answer_list = reward_metrics.get("answer", [])
                                 if _raw_answer_list and len(_raw_answer_list) == reward_tensor.shape[0]:

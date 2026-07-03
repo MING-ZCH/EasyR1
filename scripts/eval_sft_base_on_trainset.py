@@ -28,13 +28,13 @@ from typing import List, Dict, Tuple
 # ==================== Config ====================
 class Config:
     # SFT base model (same as training base)
-    MODEL_PATH = '/mnt/shared-storage-user/zhangchenhao/work/EasyR1-latest/save/StepCount-7B-SFT-30k_v24_mask_reward_v4bok_grpo_hm0_gateoff_bok_grpo_20260412_0456/global_step_213/actor/huggingface'
+    MODEL_PATH = '/data/workspace/hyleochang/EasyR1-latest/save/StepCount-7B-SFT-30k_v24_mask_reward_v4bok_grpo_hm0_gateoff_bok_grpo_20260412_0456/global_step_213/actor/huggingface'
 
     # Training data (parquet with embedded images)
-    TRAIN_DATA_DIR = '/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/StepCountQA-RL-Traj_0_10_hard_only/data'
+    TRAIN_DATA_DIR = '/apdcephfs_hldy2/share_305110755/hunyuan/chenhaoz/datasets/StepCountQA-RL-Traj_0_10_hard_only/data'
 
     # Output
-    OUTPUT_DIR = '/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/eval_rl_base_trainset'
+    OUTPUT_DIR = '/apdcephfs_hldy2/share_305110755/hunyuan/chenhaoz/datasets/eval_rl_base_trainset'
     OUTPUT_JSON_PATH = os.path.join(OUTPUT_DIR, 'eval_rl_base_trainset_v24.json')
     OUTPUT_EASY_IDS_PATH = os.path.join(OUTPUT_DIR, 'easy_sample_ids_v24.json')
 
@@ -45,7 +45,7 @@ class Config:
     MAX_PIXELS = 12845056
 
     # Load prompts from training prompt files to guarantee exact match
-    _PROMPT_DIR = '/mnt/shared-storage-user/zhangchenhao/work/EasyR1-latest/examples/format_prompt'
+    _PROMPT_DIR = '/data/workspace/hyleochang/EasyR1-latest/examples/format_prompt'
 
     @classmethod
     def _load_prompt(cls, filename):

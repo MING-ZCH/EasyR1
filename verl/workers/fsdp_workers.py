@@ -21,6 +21,15 @@ import numpy as np
 import psutil
 import torch
 import torch.distributed as dist
+
+# H20 SIGFPE protection: force TF32 + cublaslt in worker processes
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+try:
+    torch.backends.cuda.preferred_blas_library("cublaslt")
+except (AttributeError, RuntimeError):
+    pass
+
 from copy import deepcopy
 from accelerate import init_empty_weights
 from codetiming import Timer
@@ -207,24 +216,56 @@ class FSDPWorker(Worker):
         else:
             auto_class = AutoModelForCausalLM
 
+        # Determine best available attention implementation
+        try:
+            import flash_attn  # noqa: F401
+            _attn_impl = "flash_attention_2"
+        except ImportError:
+            # sdpa can segfault with qwen2_5_vl on transformers 4.55+
+            # Use eager as the safest fallback
+            _attn_impl = "eager"
+        self.print_rank0(f"Using attention implementation: {_attn_impl}")
+
         if (not fsdp_config.enable_rank0_init) or self.device_mesh.get_local_rank("fsdp") == 0:
             model = auto_class.from_pretrained(
                 model_config.model_path,
                 config=self.model_config,
                 torch_dtype=torch_dtype,
-                attn_implementation="flash_attention_2",
+                attn_implementation=_attn_impl,
                 device_map="cpu" if fsdp_config.enable_rank0_init else "cuda",
                 low_cpu_mem_usage=True,
                 trust_remote_code=model_config.trust_remote_code,
             )
         else:
             with no_init_weights(), init_empty_weights():
-                model = auto_class.from_config(
-                    self.model_config,
+                # transformers >= 4.49: from_config() no longer accepts
+                # torch_dtype, attn_implementation, or trust_remote_code as kwargs.
+                # Try progressively stripped-down calls.
+                from_config_kwargs = dict(
                     torch_dtype=torch_dtype,
-                    attn_implementation="flash_attention_2",
+                    attn_implementation=_attn_impl,
                     trust_remote_code=model_config.trust_remote_code,
                 )
+                model = None
+                while from_config_kwargs is not None:
+                    try:
+                        model = auto_class.from_config(self.model_config, **from_config_kwargs)
+                        break
+                    except TypeError as e:
+                        # Remove the offending kwarg and retry
+                        bad_kwarg = None
+                        err_msg = str(e)
+                        for kw in list(from_config_kwargs.keys()):
+                            if kw in err_msg:
+                                bad_kwarg = kw
+                                break
+                        if bad_kwarg:
+                            del from_config_kwargs[bad_kwarg]
+                        else:
+                            # Can't identify which kwarg is wrong; try bare call
+                            from_config_kwargs = None
+                if model is None:
+                    model = auto_class.from_config(self.model_config)
 
         assert isinstance(model, PreTrainedModel)  # lint
         model.tie_weights()  # avoid hanging

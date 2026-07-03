@@ -71,7 +71,7 @@ CLI arg: worker.rollout.dtype=fp16
 
 ### Dataset Path
 ```
-/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/StepCountQA-RL-Traj_0_10_easy_plus_hard/data/
+/data/workspace/hyleochang/work/StepcountModel/dataset/StepCountQA-RL-Traj_0_10_easy_plus_hard/data/
 ├── train-00000-of-00004.parquet
 ├── train-00001-of-00004.parquet
 ├── train-00002-of-00004.parquet

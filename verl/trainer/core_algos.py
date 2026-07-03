@@ -606,9 +606,10 @@ def compute_bok_grpo_advantage(
                     continue
 
         # ---- Difficulty-Aware Advantage Routing (V11 / V25 answer-based) ----
-        # Easy groups (high pass rate) -> DrGRPO-style advantage (2.6x stronger gradient)
+        # Easy groups (high pass rate) -> Dr.GRPO raw centering (score - mean, NO std division)
         # Hard groups (low pass rate) -> BOK softmax (concentrate probability on rare correct trajectories)
         # V25: route by answer correctness, not mixed score (avoids point-inflated routing errors)
+        # V31: Fixed z-score amplification bug — Easy path now uses true Dr.GRPO (raw centering)
         if answer_scores is not None:
             group_answer = torch.stack([answer_scores[j] for j in indices])
             pass_rate = (group_answer >= _allwrong_answer_threshold).float().mean().item()
@@ -617,8 +618,14 @@ def compute_bok_grpo_advantage(
         if pass_rate > _easy_threshold:
             n_easy_drgrpo += K
             for j, global_i in enumerate(indices):
-                adv = (scores[global_i] - group_mean) / (group_std + eps)
-                adv = max(-2.5, min(2.5, adv))  # clip to [-2.5, 2.5] consistent with DrGRPO
+                # V31: Dr.GRPO raw centering — no std division.
+                # When group_std ≈ 0 (homogeneous easy groups), z-normalization
+                # amplifies noise to ±clip.  True Dr.GRPO uses only mean-centering
+                # so that nearly-uniform groups get near-zero advantage (correct
+                # signal: "already mastered, no extra gradient needed"), while
+                # groups with genuine variance retain natural discriminability.
+                adv = (scores[global_i] - group_mean).item()
+                adv = max(-3.0, min(3.0, adv))  # soft clip for safety
                 advantages_1d[global_i] = adv * _easy_scale  # V3: Easy Gradient Dampening
             continue
 
@@ -754,6 +761,39 @@ def compute_bok_grpo_advantage(
                         for j, global_i in enumerate(indices):
                             advantages_1d[global_i] = (scores[global_i] - batch_mean) / (batch_std + eps)
 
+    # ---- VCRL: Variance-based Curriculum RL ----
+    # Per-group reward variance determines learning potential:
+    #   variance in [VCRL_LOW, VCRL_HIGH] → optimal zone → 2x advantage boost
+    #   variance outside range → too easy or too hard → 0.5x advantage reduction
+    # Disabled by default (VCRL_ENABLE=0); env-var gated for backward compatibility.
+    _vcrl_enable = int(os.environ.get("VCRL_ENABLE", "0")) > 0
+    if _vcrl_enable:
+        _vcrl_low = float(os.environ.get("VCRL_LOW", "0.15"))
+        _vcrl_high = float(os.environ.get("VCRL_HIGH", "0.55"))
+        _vcrl_boost = float(os.environ.get("VCRL_BOOST", "2.0"))
+        _vcrl_reduce = float(os.environ.get("VCRL_REDUCE", "0.5"))
+        n_vcrl_boosted = 0
+        n_vcrl_reduced = 0
+        for _vcrl_idx, _vcrl_indices in id2indices.items():
+            _K = len(_vcrl_indices)
+            _g_scores = torch.stack([scores[_j] for _j in _vcrl_indices])
+            _g_var = _g_scores.var().item() if _K > 1 else 0.0
+            if not math.isfinite(_g_var):
+                _g_var = 0.0
+            if _vcrl_low <= _g_var <= _vcrl_high:
+                for _gi in _vcrl_indices:
+                    advantages_1d[_gi] = advantages_1d[_gi] * _vcrl_boost
+                n_vcrl_boosted += _K
+            else:
+                for _gi in _vcrl_indices:
+                    advantages_1d[_gi] = advantages_1d[_gi] * _vcrl_reduce
+                n_vcrl_reduced += _K
+        print(
+            f"[VCRL] step={global_step} enable=1 "
+            f"range=[{_vcrl_low},{_vcrl_high}] boost={_vcrl_boost} reduce={_vcrl_reduce} "
+            f"boosted={n_vcrl_boosted}/{bsz} reduced={n_vcrl_reduced}/{bsz}"
+        )
+
     # ---- Clip advantages ----
     # Asymmetric clip: positive ceiling raised by sqrt(winner_boost) to allow
     # Winner Amplification to take effect for rare correct trajectories.
@@ -850,6 +890,7 @@ def compute_bok_grpo_step_advantage(
     total_steps: int = 1,
     answer_scores: torch.Tensor = None,
     point_step_mask: torch.Tensor = None,
+    point_step_value: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Outcome-primary BoK-GRPO with semantic point-step auxiliary credit.
 
@@ -938,6 +979,15 @@ def compute_bok_grpo_step_advantage(
     for row_idx in range(bsz):
         id2indices[index[row_idx]].append(row_idx)
 
+    # Per-step signal source: when an explicit `point_step_value` is provided
+    # (progress / stoptiming arms), use it as the step signal; otherwise fall
+    # back to the placed token rewards (legacy `pointhit` behaviour).
+    _use_step_value = (
+        point_step_value is not None
+        and tuple(point_step_value.shape) == tuple(token_level_rewards.shape)
+    )
+    step_value_src = point_step_value if _use_step_value else token_level_rewards
+
     step_adv_values = [
         torch.zeros(len(positions), dtype=token_level_rewards.dtype, device=token_level_rewards.device)
         for positions in sample_positions
@@ -952,7 +1002,7 @@ def compute_bok_grpo_step_advantage(
             if len(present) < 2:
                 continue
             rewards = torch.stack([
-                token_level_rewards[row_idx, sample_positions[row_idx][step_idx]]
+                step_value_src[row_idx, sample_positions[row_idx][step_idx]]
                 for row_idx in present
             ])
             rewards = torch.nan_to_num(rewards, nan=0.0, posinf=1.0, neginf=0.0)
@@ -962,7 +1012,7 @@ def compute_bok_grpo_step_advantage(
             else:
                 batch_present = [row_idx for row_idx in range(bsz) if len(sample_positions[row_idx]) > step_idx]
                 batch_rewards = torch.stack([
-                    token_level_rewards[row_idx, sample_positions[row_idx][step_idx]]
+                    step_value_src[row_idx, sample_positions[row_idx][step_idx]]
                     for row_idx in batch_present
                 ]) if len(batch_present) >= 2 else rewards
                 batch_rewards = torch.nan_to_num(batch_rewards, nan=0.0, posinf=1.0, neginf=0.0)
@@ -1003,10 +1053,15 @@ def compute_bok_grpo_step_advantage(
 
     aux_components = []
     n_active_spans = 0
+    # Build the aux contribution into a separate tensor so we can re-center it
+    # per response (bias fix) WITHOUT touching the outcome broadcast base.
+    aux_tensor = torch.zeros_like(token_level_rewards)
+    rows_with_spans = []
     for row_idx, positions in enumerate(sample_positions):
         if not positions:
             continue
         previous_end = 0
+        row_has_span = False
         for step_idx, pos in enumerate(positions):
             start = previous_end
             end = min(pos + 1, seq_len)
@@ -1015,11 +1070,36 @@ def compute_bok_grpo_step_advantage(
                 continue
             aux = step_lambda * gates[row_idx] * step_adv_values[row_idx][step_idx]
             aux = torch.nan_to_num(aux, nan=0.0, posinf=step_clip, neginf=-step_clip)
-            base = outcome_weight * outcome_1d[row_idx]
-            advantages[row_idx, start:end] = (base + aux) * response_mask[row_idx, start:end]
+            aux_tensor[row_idx, start:end] = aux
             aux_components.append(aux.detach())
             n_active_spans += 1
+            row_has_span = True
             previous_end = end
+        if row_has_span:
+            rows_with_spans.append(row_idx)
+
+    # Per-response AUX re-centering (bias fix): subtract the masked mean of the
+    # aux contribution so Sum(aux) over each response == 0. This keeps the
+    # trajectory-broadcast outcome advantage (base) intact while removing the
+    # non-zero-mean bias that gated per-step credit would otherwise inject
+    # (mirrors compute_grpo_step_level_advantage's per-response centering, but
+    # applied to AUX only — NOT to base+aux, which would erase the outcome signal).
+    # Default: re-center only for the new value-based arms (progress/stoptiming),
+    # so the legacy `pointhit` path stays byte-identical. Explicit env overrides.
+    _aux_recenter_env = os.environ.get("BOK_STEP_AUX_RECENTER", "auto").lower()
+    if _aux_recenter_env == "auto":
+        _aux_recenter = bool(_use_step_value)
+    else:
+        _aux_recenter = _aux_recenter_env in ("1", "true", "yes")
+    for row_idx in rows_with_spans:
+        rmask = response_mask[row_idx]
+        n_tok = rmask.sum()
+        if n_tok > 0:
+            if _aux_recenter:
+                aux_mean = (aux_tensor[row_idx] * rmask).sum() / n_tok
+                aux_tensor[row_idx] = (aux_tensor[row_idx] - aux_mean) * rmask
+            base = outcome_weight * outcome_1d[row_idx]
+            advantages[row_idx] = (base + aux_tensor[row_idx]) * rmask
 
     advantages = torch.nan_to_num(advantages, nan=0.0, posinf=total_clip if total_clip > 0 else bok_clip, neginf=-(total_clip if total_clip > 0 else bok_clip))
     advantages = advantages * response_mask
@@ -1030,11 +1110,11 @@ def compute_bok_grpo_step_advantage(
     if global_step != _last_step:
         compute_bok_grpo_step_advantage._last_logged_step = global_step
         if aux_components:
-            aux_tensor = torch.stack(aux_components)
-            aux_mean = aux_tensor.mean().item()
-            aux_std = aux_tensor.std().item() if aux_tensor.numel() > 1 else 0.0
+            _aux_stack = torch.stack(aux_components)
+            aux_log_mean = _aux_stack.mean().item()
+            aux_std = _aux_stack.std().item() if _aux_stack.numel() > 1 else 0.0
         else:
-            aux_mean = 0.0
+            aux_log_mean = 0.0
             aux_std = 0.0
         gate_mean = gates.mean().item() if gates.numel() > 0 else 0.0
         print(
@@ -1043,7 +1123,7 @@ def compute_bok_grpo_step_advantage(
             f"exclude_final={exclude_final} explicit_mask={has_explicit_mask} point_positions={n_point_positions} "
             f"no_point_rows={n_no_point_positions}/{bsz} max_semantic_step={max_observed_steps} "
             f"step_values={n_step_values} low_var_steps={n_low_var_steps} active_spans={n_active_spans} "
-            f"aux_mean={aux_mean:.4f} aux_std={aux_std:.4f} "
+            f"aux_mean={aux_log_mean:.4f} aux_std={aux_std:.4f} "
             f"adv_mean={advantages.mean().item():.4f} adv_std={advantages.std().item():.4f}"
         )
 
@@ -1204,15 +1284,45 @@ def compute_policy_loss(
             a float number indicating the mean KL divergence between the old policy and the new policy
 
     """
-    negative_approx_kl = log_probs - old_log_probs
+    import os
+    negative_approx_kl = log_probs - old_log_probs  # token-level log-ratio (KL metric uses this)
+
+    # ---- Importance-sampling granularity (GSPO / GSPO-token), env-gated ----
+    # POLICY_LOSS_IS_LEVEL: "token" (default; standard GRPO/PPO token-level IS)
+    #   | "sequence"       (GSPO, arXiv 2507.18071): geometric-mean sequence ratio,
+    #                       sequence-level gradient (same ratio on every token).
+    #   | "sequence_token" (GSPO-token): sequence-magnitude ratio but PER-TOKEN
+    #                       gradient via stop-grad trick.
+    # Why for long-horizon 21-turn dense: token-level IS variance grows ~L*v with
+    # length; the geometric-mean sequence ratio is ~v/L -> far lower variance, and
+    # it aligns the IS unit with our TRAJECTORY-level BoK reward/advantage (GSPO's
+    # core "match objective unit to reward unit" principle). "sequence_token" is
+    # preferred for us: it does NOT drop whole trajectories (preserves the gradient
+    # BoK deliberately selected) and stays valid when advantages are PER-TURN (Arm C).
+    # NOTE: pure "sequence" mode expects much smaller clip_ratio (~3e-3); tune before use.
+    _is_level = os.environ.get("POLICY_LOSS_IS_LEVEL", "token").strip().lower()
+    if _is_level in ("sequence", "gspo", "sequence_token", "gspo_token"):
+        # fp32 reduction for numerical stability over long (21-turn, ~2k-token) seqs
+        _seq_tok = response_mask.sum(dim=-1).clamp(min=1.0).float()              # (bs,)
+        _seq_log_ratio = (negative_approx_kl.float() * response_mask.float()).sum(dim=-1) / _seq_tok  # (bs,)
+        if _is_level in ("sequence", "gspo"):
+            effective_log_ratio = _seq_log_ratio.unsqueeze(-1).expand_as(negative_approx_kl)
+        else:  # sequence_token (GSPO-token): seq magnitude + per-token gradient
+            effective_log_ratio = (
+                _seq_log_ratio.detach().unsqueeze(-1)
+                + (negative_approx_kl - negative_approx_kl.detach())
+            )
+    else:
+        effective_log_ratio = negative_approx_kl                                  # token-level (default)
+
     # Clamp log-ratio before exp to avoid inf/NaN.
-    # NOTE: keep KL metrics computed from the unclamped log-ratio.
+    # NOTE: keep KL metrics computed from the unclamped token-level log-ratio.
     # see: https://github.com/pytorch/pytorch/issues/10729
-    safe_log_ratio = torch.clamp(negative_approx_kl, min=-20.0, max=20.0)
+    safe_log_ratio = torch.clamp(effective_log_ratio, min=-20.0, max=20.0)
     # exp in fp32 to avoid bf16/fp16 overflow
     ratio = torch.exp(safe_log_ratio.float())
     clipped_ratio = torch.exp(
-        torch.clamp(negative_approx_kl, np.log(1.0 - clip_ratio_low), np.log(1.0 + clip_ratio_high))
+        torch.clamp(effective_log_ratio, np.log(1.0 - clip_ratio_low), np.log(1.0 + clip_ratio_high))
     )
 
     pg_loss = -advantages * ratio

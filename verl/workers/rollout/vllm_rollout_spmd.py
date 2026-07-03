@@ -13,6 +13,14 @@
 # limitations under the License.
 
 import os
+
+# H20 GPU SIGFPE avoidance: Force TF32 and cublaslt before any CUDA operations.
+# cublasGemmEx on H20 internally calls cublasLtTSTMatmulAlgoGetHeuristic which FPEs.
+# TF32 mode uses different algorithm selection that avoids the buggy TST heuristic.
+# preferred_blas_library("cublaslt") forces direct cublasLtMatmul path instead of cublasGemmEx.
+os.environ.setdefault('NVIDIA_TF32_OVERRIDE', '1')
+os.environ.setdefault('TORCH_ALLOW_TF32_CUBLAS_OVERRIDE', '1')
+
 import re
 import json
 from io import BytesIO
@@ -22,6 +30,15 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import numpy as np
 import torch
 import torch.distributed
+
+# Apply TF32 settings early (before any cuBLAS call)
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+try:
+    torch.backends.cuda.preferred_blas_library("cublaslt")
+except (AttributeError, RuntimeError):
+    pass  # Older PyTorch versions
+
 from tensordict import TensorDict
 from transformers import PreTrainedTokenizer
 from vllm import LLM, RequestOutput, SamplingParams
@@ -511,14 +528,37 @@ class vLLMRollout(BaseRollout):
             disable_log_stats=config.disable_log_stats,
             enforce_eager=config.enforce_eager,
             disable_custom_all_reduce=True,
-            disable_mm_preprocessor_cache=True,
-            enable_sleep_mode=True,
+            # Limit multimodal tokens to prevent profiling SIGFPE
+            # Default reserves 16384 image + 16384 video = 32768 which exceeds max_num_batched_tokens
+            # StepCount training uses 1 image per prompt
+            limit_mm_per_prompt={"image": 1, "video": 0},
+            # Skip KV cache profiling (which causes SIGFPE with multimodal models)
+            # Pre-set a fixed number of GPU blocks (profiling bypassed -> gpu_memory_utilization
+            # does NOT size the KV cache; this override does). Raising it adds KV capacity and
+            # removes RECOMPUTE preemptions on long multi-turn rollouts. ~0.9MB/block on Qwen2-VL-7B
+            # (16 tok x 2(K+V) x 4 kv-heads x 128 dim x 28 layers x 2B); 16384 blocks ~= 14.7GB,
+            # well within the gpu_memory_utilization budget; training offloads vLLM via sleep(level=1).
+            # Env-gated via EASYR1_ prefix so it propagates to Ray actors (see trainer/main.py runtime_env).
+            num_gpu_blocks_override=int(os.environ.get("EASYR1_VLLM_NUM_GPU_BLOCKS", "8192")),
         )
+        # vLLM 0.8.3+ features: add only if supported (0.8.2 compat)
+        try:
+            import inspect
+            _llm_init_params = inspect.signature(LLM.__init__).parameters
+            if "enable_sleep_mode" in _llm_init_params:
+                self._engine_init_args["enable_sleep_mode"] = True
+            if "disable_mm_preprocessor_cache" in _llm_init_params:
+                self._engine_init_args["disable_mm_preprocessor_cache"] = True
+        except Exception:
+            pass
 
         engine = self._create_engine(enable_chunked_prefill=config.enable_chunked_prefill)
         self.inference_engine = _LLMProxy(engine)
-        # Offload vllm model to reduce peak memory usage
-        self.inference_engine.sleep(level=1)
+        # Offload vllm model to reduce peak memory usage (requires enable_sleep_mode)
+        try:
+            self.inference_engine.sleep(level=1)
+        except (TypeError, AttributeError, AssertionError, Exception):
+            pass  # sleep mode not available or not enabled in this vLLM version
 
         self._attn_meta: Optional[Tuple[int, int, int]] = None
 
@@ -658,7 +698,10 @@ class vLLMRollout(BaseRollout):
         torch.cuda.empty_cache()
         new_engine = self._create_engine(enable_chunked_prefill=True)
         self.inference_engine.swap(new_engine)
-        self.inference_engine.sleep(level=1)
+        try:
+            self.inference_engine.sleep(level=1)
+        except (TypeError, AttributeError, AssertionError, Exception):
+            pass
 
     @contextmanager
     def update_sampling_params(self, **kwargs):
@@ -1217,12 +1260,55 @@ class vLLMRollout(BaseRollout):
         if has_multi_modal:
             vllm_inputs = []
             _vfps = float(prompts.meta_info.get("video_fps", 2.0))
+            non_tensor_batch.pop("raw_prompt_text", None)  # Not needed for vLLM input
             for raw_prompt_ids, multi_modal_data in zip(
                 non_tensor_batch.pop("raw_prompt_ids"), non_tensor_batch.pop("multi_modal_data")
             ):
+                prompt_ids_list = list(raw_prompt_ids)
+
+                # Ensure prompt has vision markers for vLLM's input_processor to expand.
+                # vLLM needs at least <|vision_start|><|image_pad|><|vision_end|> per image;
+                # its input_processor then expands the single <|image_pad|> to N tokens.
+                # If the dataset/processor didn't include these, insert them here.
+                _IMAGE_PAD = 151655   # <|image_pad|>
+                _VISION_START = 151652  # <|vision_start|>
+                _VISION_END = 151653  # <|vision_end|>
+                _IM_START = 151644  # <|im_start|>
+                _NEWLINE = self.tokenizer.encode("\n", add_special_tokens=False)[-1] if hasattr(self, 'tokenizer') else 198
+
+                if multi_modal_data is not None and prompt_ids_list.count(_IMAGE_PAD) == 0:
+                    # Count how many images are in multi_modal_data
+                    mm_images = multi_modal_data.get("image", multi_modal_data.get("images", []))
+                    if not isinstance(mm_images, list):
+                        mm_images = [mm_images]
+                    num_images = len(mm_images) if mm_images else 0
+
+                    if num_images > 0 and _VISION_START not in prompt_ids_list:
+                        # Insert vision markers: find <|im_start|>user position and add after it
+                        # Vision block = <|vision_start|><|image_pad|><|vision_end|>
+                        vision_block = [_VISION_START, _IMAGE_PAD, _VISION_END]
+                        inserted = False
+                        for i in range(len(prompt_ids_list) - 1):
+                            # Find pattern: <|im_start|> followed by "user" tokens + newline
+                            if prompt_ids_list[i] == _IM_START:
+                                # Find the newline after "user"
+                                for j in range(i + 1, min(i + 10, len(prompt_ids_list))):
+                                    if prompt_ids_list[j] == _NEWLINE:
+                                        # Insert vision blocks right after the newline
+                                        insert_pos = j + 1
+                                        all_vision = vision_block * num_images
+                                        prompt_ids_list = prompt_ids_list[:insert_pos] + all_vision + prompt_ids_list[insert_pos:]
+                                        inserted = True
+                                        break
+                            if inserted:
+                                break
+                        if not inserted:
+                            # Fallback: prepend vision block at the very start
+                            prompt_ids_list = (vision_block * num_images) + prompt_ids_list
+
                 vllm_inputs.append(
                     {
-                        "prompt_token_ids": list(raw_prompt_ids),
+                        "prompt_token_ids": prompt_ids_list,
                         "multi_modal_data": _process_multi_modal_data(
                             multi_modal_data,
                             prompts.meta_info["min_pixels"],

@@ -18,6 +18,7 @@ import os
 import sys
 from abc import ABC, abstractmethod
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
 from functools import partial
 from typing import Callable, Dict, List, Optional, Tuple, TypedDict
 
@@ -131,20 +132,28 @@ class SequentialFunctionRewardManager(FunctionRewardManager):
         with_images_count = 0
         with_problem_count = 0
         sample_debug_rows = []
-        for i in range(len(data)):
+
+        # --- Parallel reward computation ---
+        # Pre-decode all responses and prepare kwargs (thread-safe prep)
+        num_workers = int(os.environ.get("REWARD_NUM_WORKERS", "4"))
+        batch_size = len(data)
+
+        def _compute_single_reward(i):
+            """Compute reward for a single sample. Thread-safe."""
             valid_response_ids = response_ids[i][: response_length[i]]
             response_str = self.tokenizer.decode(
                 valid_response_ids, skip_special_tokens=self.config.skip_special_tokens
             )
             ground_truth = data.non_tensor_batch["ground_truth"][i]
 
-            # Pass images to reward function if available
             kwargs = {}
+            _has_images = False
+            _has_problem = False
             if "multi_modal_data" in data.non_tensor_batch:
                 multi_modal_data = data.non_tensor_batch["multi_modal_data"][i]
                 if isinstance(multi_modal_data, dict) and "image" in multi_modal_data:
                     kwargs["images"] = multi_modal_data["image"]
-                    with_images_count += 1
+                    _has_images = True
                 image_path = self._extract_first_image_path(multi_modal_data)
                 if image_path is not None:
                     kwargs["image_path"] = image_path
@@ -152,7 +161,7 @@ class SequentialFunctionRewardManager(FunctionRewardManager):
             problem_text = self._extract_problem_text(data.non_tensor_batch, i)
             if problem_text is not None:
                 kwargs["problem"] = problem_text
-                with_problem_count += 1
+                _has_problem = True
 
             if "id" in data.non_tensor_batch:
                 kwargs["sample_id"] = data.non_tensor_batch["id"][i]
@@ -174,35 +183,44 @@ class SequentialFunctionRewardManager(FunctionRewardManager):
                     f"image_path={kwargs.get('image_path')} gt={str(ground_truth)} "
                     f"exc={type(exc).__name__}: {exc} tail='{response_tail}'"
                 )
-                raise
+                score = {"overall": 0.0, "format": 0.0, "content": 0.0, "answer": 0.0, "point": 0.0, "format_fail": 1.0, "stop_violation": 1.0}
 
             if not isinstance(score, dict) or "overall" not in score:
-                print(
-                    "[RewardError] "
-                    f"malformed_reward_output idx={i} sample_id={kwargs.get('sample_id')} "
-                    f"type={type(score).__name__} keys={list(score.keys()) if isinstance(score, dict) else 'na'}; "
-                    "fallback overall=0"
-                )
-                score = {
-                    "overall": 0.0,
-                    "format": 0.0,
-                    "content": 0.0,
-                    "answer": 0.0,
-                    "point": 0.0,
-                    "format_fail": 1.0,
-                    "stop_violation": 1.0,
-                }
+                score = {"overall": 0.0, "format": 0.0, "content": 0.0, "answer": 0.0, "point": 0.0, "format_fail": 1.0, "stop_violation": 1.0}
+
+            return i, score, response_str, _has_images, _has_problem
+
+        # Execute in parallel if num_workers > 1, otherwise sequential
+        if num_workers > 1 and batch_size > 16:
+            with ThreadPoolExecutor(max_workers=num_workers) as executor:
+                results = list(executor.map(_compute_single_reward, range(batch_size)))
+        else:
+            results = [_compute_single_reward(i) for i in range(batch_size)]
+
+        # Gather results (sequential - fast)
+        for i, score, response_str, _has_images, _has_problem in results:
+            if _has_images:
+                with_images_count += 1
+            if _has_problem:
+                with_problem_count += 1
 
             # --- Per-turn process reward placement ---
-            _step_token_positions = []
             # When enabled, distribute per-step point rewards at turn boundary
             # token positions (</point> tags), with the answer+format portion
             # at the last token. This enables step-level GRPO (GSPO).
+            _step_token_positions = []
+            _step_values_at_positions = []  # parallel _point_step_value aligned to positions
+            _step_value_list = score.get("_point_step_value", None)  # optional (progress/stoptiming arms)
             _process_reward_mode = os.environ.get("PROCESS_REWARD_ENABLE", "0") in ("1", "true", "yes")
+            # The explicit per-turn VALUE channel is active ONLY for the new value-based
+            # arms (progress/stoptiming). For legacy `pointhit` (or unset) we must NOT emit
+            # `_point_step_value` at all, otherwise the trainer would build a point_step_value
+            # tensor (from fallback=placed rewards) and trigger AUX re-centering — silently
+            # changing legacy behaviour. Gating on the env keeps the batch list aligned.
+            _value_channel_active = os.environ.get("BOK_STEP_SIGNAL", "pointhit").strip().lower() in ("progress", "stoptiming")
             if _process_reward_mode and "_step_rewards" in score:
                 step_rewards = score["_step_rewards"]  # list of floats (per-turn point scores)
                 # Find </point> token positions in the response
-                import re as _re
                 _point_end_tag = "</point>"
                 _tag_char_positions = []
                 _search_start = 0
@@ -229,6 +247,15 @@ class SequentialFunctionRewardManager(FunctionRewardManager):
                         if _token_pos >= 0 and _token_pos < reward_tensor.shape[1]:
                             reward_tensor[i, _token_pos] = float(step_rewards[_step_idx])
                             _step_token_positions.append(int(_token_pos))
+                            # Record the parallel step VALUE (progress/stoptiming) at the
+                            # SAME position. When the value channel is active but this row
+                            # lacks an explicit value (or has fewer than positions), emit
+                            # 0.0 (NOT the placed pointhit reward) to avoid silently mixing
+                            # pointhit semantics into a progress/stoptiming arm.
+                            if _step_value_list is not None and _step_idx < len(_step_value_list):
+                                _step_values_at_positions.append(float(_step_value_list[_step_idx]))
+                            else:
+                                _step_values_at_positions.append(0.0)
                             _n_placed += 1
 
                     # Place answer portion at the last token
@@ -244,6 +271,8 @@ class SequentialFunctionRewardManager(FunctionRewardManager):
 
             if _process_reward_mode:
                 reward_metrics["_point_step_token_positions"].append(_step_token_positions)
+                if _value_channel_active:
+                    reward_metrics["_point_step_value"].append(_step_values_at_positions)
 
             for key, value in score.items():
                 if not key.startswith("_"):  # skip internal keys
@@ -257,7 +286,7 @@ class SequentialFunctionRewardManager(FunctionRewardManager):
                 sample_debug_rows.append(
                     {
                         "idx": i,
-                        "gt": str(ground_truth),
+                        "gt": str(data.non_tensor_batch["ground_truth"][i]),
                         "overall": float(score.get("overall", 0.0)),
                         "format": float(score.get("format", 0.0)),
                         "point": float(score.get("point", 0.0)),
@@ -297,6 +326,8 @@ class SequentialFunctionRewardManager(FunctionRewardManager):
             stopped_by_answer_mean = self._safe_mean(reward_metrics.get("stopped_by_answer", []))
             turns_exceeded_mean = self._safe_mean(reward_metrics.get("turns_exceeded", []))
             no_point_pred_mean = self._safe_mean(reward_metrics.get("no_point_pred", []))
+            point_key_typo_mean = self._safe_mean(reward_metrics.get("point_key_typo", []))
+            point_key_typo_rate = self._safe_mean(reward_metrics.get("point_key_typo_rate", []))
 
             def _fmt(x: Optional[float]) -> str:
                 return "na" if x is None else f"{x:.4f}"
@@ -307,7 +338,8 @@ class SequentialFunctionRewardManager(FunctionRewardManager):
                 f"overall_mean={_fmt(overall_mean)} answer_mean={_fmt(answer_mean)} point_mean={_fmt(point_mean)} "
                 f"format_fail_rate={_fmt(format_fail_mean)} stop_violation_rate={_fmt(stop_violation_mean)} "
                 f"stopped_by_answer_rate={_fmt(stopped_by_answer_mean)} turns_exceeded_rate={_fmt(turns_exceeded_mean)} "
-                f"no_point_pred_rate={_fmt(no_point_pred_mean)}"
+                f"no_point_pred_rate={_fmt(no_point_pred_mean)} "
+                f"point_key_typo_mean={_fmt(point_key_typo_mean)} point_key_typo_rate={_fmt(point_key_typo_rate)}"
             )
 
             if (

@@ -99,10 +99,13 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         actor_weights = self._rename_weight_keys(actor_weights, self.module._fsdp_wrapped_module)
         print_gpu_memory_usage("After state_dict() in sharding manager")
 
-        if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
-            self.inference_engine.wake_up(tags=["weights"])
-        else:
-            self.inference_engine.wake_up()
+        try:
+            if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
+                self.inference_engine.wake_up(tags=["weights"])
+            else:
+                self.inference_engine.wake_up()
+        except (TypeError, AttributeError, AssertionError, Exception):
+            pass  # wake_up not available without sleep mode
 
         model = self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner.model
         model.load_weights(self._make_weight_iterator(actor_weights))
@@ -111,8 +114,11 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         del actor_weights
         torch.cuda.empty_cache()
 
-        if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
-            self.inference_engine.wake_up(tags=["kv_cache"])
+        try:
+            if "tags" in inspect.signature(self.inference_engine.wake_up).parameters:
+                self.inference_engine.wake_up(tags=["kv_cache"])
+        except (TypeError, AttributeError, AssertionError, Exception):
+            pass
 
         print_gpu_memory_usage("After del state_dict and empty_cache in sharding manager")
         # important: need to manually set the random states of each tp to be identical.
@@ -123,7 +129,10 @@ class FSDPVLLMShardingManager(BaseShardingManager):
     def __exit__(self, exc_type, exc_value, traceback):
         print_gpu_memory_usage("Before vllm offload in sharding manager")
         free_bytes_before_sleep = torch.cuda.mem_get_info()[0]
-        self.inference_engine.sleep(level=1)
+        try:
+            self.inference_engine.sleep(level=1)
+        except (TypeError, AttributeError, AssertionError, Exception):
+            pass  # sleep mode not available in this vLLM version
         free_bytes_after_sleep = torch.cuda.mem_get_info()[0]
         self.freed_bytes = free_bytes_after_sleep - free_bytes_before_sleep
         print_gpu_memory_usage("After vllm offload in sharding manager")

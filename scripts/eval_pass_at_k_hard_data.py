@@ -36,11 +36,11 @@ from collections import Counter
 
 
 # ==================== Defaults ====================
-DEFAULT_MODEL_PATH = '/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/model/StepCount-7B-SFT-30k-high/checkpoint-3537'
-DEFAULT_DATA_DIR = '/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/StepCountQA-RL-Traj_0_10_hard_only/data'
-DEFAULT_OUTPUT_DIR = '/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/eval_pass_at_k_hard_sft_base'
+DEFAULT_MODEL_PATH = '/apdcephfs_hldy2/share_305110755/hunyuan/chenhaoz/models/StepCount-7B-SFT-30k-high/checkpoint-3537'
+DEFAULT_DATA_DIR = '/apdcephfs_hldy2/share_305110755/hunyuan/chenhaoz/datasets/StepCountQA-RL-Traj_0_10_hard_only/data'
+DEFAULT_OUTPUT_DIR = '/apdcephfs_hldy2/share_305110755/hunyuan/chenhaoz/datasets/eval_pass_at_k_hard_sft_base'
 
-PROMPT_DIR = '/mnt/shared-storage-user/zhangchenhao/work/EasyR1-latest/examples/format_prompt'
+PROMPT_DIR = '/data/workspace/hyleochang/EasyR1-latest/examples/format_prompt'
 
 # Eval parameters (match training config)
 HISTORY_MODE = 0

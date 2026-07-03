@@ -751,6 +751,6 @@ s20_stability()
 s21_future()
 s22_pseudocode()
 
-OUT = "/mnt/shared-storage-user/zhangchenhao/work/EasyR1-latest/docs/BOK_GRPO_Presentation.pptx"
+OUT = "/data/workspace/hyleochang/EasyR1-latest/docs/BOK_GRPO_Presentation.pptx"
 prs.save(OUT)
 print(f"Saved {len(prs.slides)} slides -> {OUT}")

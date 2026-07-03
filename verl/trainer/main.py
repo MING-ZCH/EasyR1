@@ -134,8 +134,62 @@ def main():
                 "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS", "8"),
                 "NUMEXPR_NUM_THREADS": os.environ.get("NUMEXPR_NUM_THREADS", "8"),
                 "TORCH_NUM_THREADS": os.environ.get("TORCH_NUM_THREADS", "8"),
+                # vLLM configuration (must be passed to Ray workers)
+                "VLLM_USE_V1": os.environ.get("VLLM_USE_V1", "1"),
+                "VLLM_ATTENTION_BACKEND": os.environ.get("VLLM_ATTENTION_BACKEND", "XFORMERS"),
+                # LD_LIBRARY_PATH for cusparselt
+                "LD_LIBRARY_PATH": os.environ.get("LD_LIBRARY_PATH", ""),
+                # NCCL IB ECE fix (ibv_set_ece Invalid argument on some RDMA drivers)
+                "NCCL_IB_DISABLE_ECE": os.environ.get("NCCL_IB_DISABLE_ECE", "1"),
+                # NCCL multi-node settings (from cluster config)
+                "NCCL_IB_DISABLE": os.environ.get("NCCL_IB_DISABLE", "0"),
+                "NCCL_IB_GID_INDEX": os.environ.get("NCCL_IB_GID_INDEX", "3"),
+                "NCCL_IB_SL": os.environ.get("NCCL_IB_SL", "3"),
+                "NCCL_IB_TC": os.environ.get("NCCL_IB_TC", "160"),
+                "NCCL_IB_QPS_PER_CONNECTION": os.environ.get("NCCL_IB_QPS_PER_CONNECTION", "4"),
+                "NCCL_IB_TIMEOUT": os.environ.get("NCCL_IB_TIMEOUT", "22"),
+                "NCCL_SOCKET_IFNAME": os.environ.get("NCCL_SOCKET_IFNAME", "bond1"),
+                "NCCL_IB_HCA": os.environ.get("NCCL_IB_HCA", ""),
+                "NCCL_NET_GDR_LEVEL": os.environ.get("NCCL_NET_GDR_LEVEL", "2"),
+                "NCCL_P2P_DISABLE": os.environ.get("NCCL_P2P_DISABLE", "0"),
+                "NCCL_PXN_DISABLE": os.environ.get("NCCL_PXN_DISABLE", "1"),
             }
         }
+        # Pass ALL StepCount/trajectory/reward/BoK/grad-safety env vars to Ray workers.
+        # Without this, remote actors (FSDPWorker/reward workers) can't see launch-script
+        # overrides for these knobs and silently fall back to the hardcoded os.getenv(...)
+        # defaults baked into the reading code (dp_actor.py, core_algos.py, reward/function.py)
+        # -- this is NOT a config error on the launch-script side, it's a missing whitelist
+        # entry here. Confirmed bug (2026-07-02): GRAD_SPIKE_*/GRAD_NONFINITE_* were exported
+        # by v35's launch script (skip-bad-update, never-touch-LR spec) but never reached the
+        # actor process, which silently ran on dp_actor.py's built-in defaults instead
+        # (threshold=5.0x, lr_factor=0.1, brake_max=6/3) -- reproducing the exact v34 LR-crush
+        # failure mode (permanent LR halving after repeated spikes/nonfinite events) that the
+        # launch script was explicitly designed to avoid.
+        #   GRAD_SPIKE_ / GRAD_NONFINITE_ : gradient-spike & nonfinite-grad protection knobs
+        #                                   (dp_actor.py DataParallelPPOActor.__init__)
+        #   VCRL_                         : Variance-based Curriculum RL advantage shaping
+        #                                   (core_algos.py, same os.getenv-without-whitelist
+        #                                    bug class as BOK_, found during this audit)
+        for key, val in os.environ.items():
+            if key.startswith(("STEPCOUNT_", "TRAJ_", "EASYR1_", "INTERLEAVED_",
+                               "BOK_", "PROCESS_REWARD_", "POLICY_LOSS_",
+                               "GRAD_SPIKE_", "GRAD_NONFINITE_", "VCRL_")):
+                runtime_env["env_vars"][key] = val
+        # Also pass critical H20 SIGFPE fixes + other os.getenv-only knobs read inside remote
+        # actors (REWARD_NUM_WORKERS: workers/reward/function.py reward-computation thread pool
+        # size; same missing-whitelist bug class found alongside GRAD_SPIKE_/VCRL_ above).
+        for key in ("NVIDIA_TF32_OVERRIDE", "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "DISABLE_ADDMM_CUDA_LT",
+                    "REWARD_NUM_WORKERS"):
+            if key in os.environ:
+                runtime_env["env_vars"][key] = os.environ[key]
+        # Pass proxy + wandb vars to Ray actors (Runner needs proxy for wandb online).
+        # Ray is started WITHOUT proxy (Phase 1: fixes worker registration gRPC hang),
+        # but actors need proxy injected via runtime_env for network-dependent ops.
+        for key in ("http_proxy", "https_proxy", "no_proxy",
+                     "WANDB_API_KEY", "WANDB_MODE", "WANDB_DIR"):
+            if key in os.environ:
+                runtime_env["env_vars"][key] = os.environ[key]
         if ray_address:
             addrs = []
             if ray_address_candidates:

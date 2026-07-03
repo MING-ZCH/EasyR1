@@ -36,7 +36,8 @@ from .config import CriticConfig
 try:
     from flash_attn.bert_padding import index_first_axis, pad_input, rearrange, unpad_input
 except ImportError:
-    pass
+    from ...utils.padding_utils import index_first_axis, pad_input, unpad_input
+    from einops import rearrange
 
 
 __all__ = ["DataParallelPPOCritic"]

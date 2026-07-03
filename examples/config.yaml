@@ -48,8 +48,8 @@ worker:
       enable_cpu_offload: false
       enable_rank0_init: true
     offload:
-      offload_params: true  # true: more CPU memory; false: more GPU memory
-      offload_optimizer: true  # true: more CPU memory; false: more GPU memory
+      offload_params: false  # H20 97GB has enough GPU memory without offload
+      offload_optimizer: false  # Avoid CPU OOM from offload init with 8 workers
 
   rollout:
     n: 16 # grpo experience 5
@@ -90,5 +90,5 @@ trainer:
   val_generations_to_log: 3
   save_freq: 1500  # -1 to disable
   save_limit: 5  # -1 to disable
-  save_checkpoint_path: /weiyang/share/250010212/EasyR1/easy_r1
+  save_checkpoint_path: /apdcephfs_hldy2/share_305110755/hunyuan/chenhaoz/checkpoints/easy_r1_default
   load_checkpoint_path: null

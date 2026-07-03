@@ -166,8 +166,8 @@ Combined with GradSpikeProtect:
 
 ## 6. Data Sources
 
-- Training logs: `/mnt/shared-storage-user/zhangchenhao/work/EasyR1-latest/logs/train/`
-- Monitor logs: `/mnt/shared-storage-user/zhangchenhao/work/EasyR1-latest/logs/monitor/`
+- Training logs: `/data/workspace/hyleochang/EasyR1-latest/logs/train/`
+- Monitor logs: `/data/workspace/hyleochang/EasyR1-latest/logs/monitor/`
 - Analysis scripts: `/tmp/parse_bok_logs.py`
 - Parsed data: `/tmp/bok_steps_v12.json`, `/tmp/bok_steps_v14_mixed.json`, `/tmp/bok_steps_v16.json`
 

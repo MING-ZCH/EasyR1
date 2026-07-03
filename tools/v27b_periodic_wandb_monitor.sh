@@ -5,7 +5,7 @@
 #   bash tools/v27b_periodic_wandb_monitor.sh {once|snapshot|sync}
 
 set -u
-REPO_DIR="${REPO_DIR:-/mnt/shared-storage-user/zhangchenhao/work/EasyR1-latest}"
+REPO_DIR="${REPO_DIR:-/data/workspace/hyleochang/EasyR1-latest}"
 TRAIN_LOG="${TRAIN_LOG:-${REPO_DIR}/logs/train/training_interleaved_traj_v29_bok_grpo_step_easy_20260508_182514.log}"
 REPORT_INTERVAL_SECONDS="${REPORT_INTERVAL_SECONDS:-3600}"
 WANDB_SYNC_INTERVAL_SECONDS="${WANDB_SYNC_INTERVAL_SECONDS:-14400}"

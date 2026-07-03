@@ -89,7 +89,7 @@ New wrong prediction samples **do NOT have corresponding mask metadata**. The re
 - **CountBench eval results**: `StepcountModel/eval/eval_countbench/eval_StepCount-7B-SFT-30k_v12_…_step132.json`
 - **PixmoTest eval results**: `StepcountModel/eval/eval_pixmo_test/eval_StepCount-7B-SFT-30k_v12_…_step132_with_history_1.json`
 - **Original training data**: `StepcountModel/dataset/StepCountQA-RL-Traj_0_10/data/` (11,455 rows, 4 shards)
-- **Mask metadata**: `/mnt/shared-storage-user/zhangchenhao/StepCount-RL_masks_output/masks_metadata.json` (97,099 entries)
+- **Mask metadata**: `/data/workspace/hyleochang/StepCount-RL_masks_output/masks_metadata.json` (97,099 entries)
 
 ## Usage in Training
 

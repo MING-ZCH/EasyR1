@@ -167,7 +167,7 @@ V20 targets V12-level performance (15%+) with improved stability (bf16) and mixe
 ## 6. Launch Command
 
 ```bash
-cd /mnt/shared-storage-user/zhangchenhao/work/EasyR1-latest
+cd /data/workspace/hyleochang/EasyR1-latest
 nohup bash examples/qwen2_5_vl_7b_StepCount_0_10_grpo_interleaved_traj_v20.sh \
   2>&1 | tee logs/train/v20_launch.log &
 ```
