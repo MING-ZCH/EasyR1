@@ -1,0 +1,72 @@
+{
+  "dataset": "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/StepCountQA-RL-Traj_11_50_Combined_maskcomplete_38332/data",
+  "metadata": "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/final_rl_mask_manifest_grouped_progressive12h8_20260704_062627_grouped_progressive_issue_filtered_pointin_quality_upgraded/masks_metadata.easy_r1_compatible.grouped_progressive_issue_filtered.json",
+  "files": [
+    {
+      "file": "train-00000-of-00004.parquet",
+      "rows": 9765
+    },
+    {
+      "file": "train-00001-of-00004.parquet",
+      "rows": 9521
+    },
+    {
+      "file": "train-00002-of-00004.parquet",
+      "rows": 9525
+    },
+    {
+      "file": "train-00003-of-00004.parquet",
+      "rows": 9521
+    }
+  ],
+  "rows": 38332,
+  "complete": 38332,
+  "bad_count": 0,
+  "bad_first": [],
+  "answer_sum": 896691,
+  "answer_min": 11,
+  "answer_max": 50,
+  "answer_distribution": {
+    "11": 2517,
+    "12": 3262,
+    "13": 1831,
+    "14": 2127,
+    "15": 2104,
+    "16": 1976,
+    "17": 1347,
+    "18": 1697,
+    "19": 1205,
+    "20": 1574,
+    "21": 1109,
+    "22": 1044,
+    "23": 942,
+    "24": 1140,
+    "25": 945,
+    "26": 881,
+    "27": 732,
+    "28": 852,
+    "29": 613,
+    "30": 915,
+    "31": 642,
+    "32": 657,
+    "33": 570,
+    "34": 545,
+    "35": 603,
+    "36": 667,
+    "37": 455,
+    "38": 472,
+    "39": 438,
+    "40": 656,
+    "41": 409,
+    "42": 454,
+    "43": 351,
+    "44": 365,
+    "45": 417,
+    "46": 353,
+    "47": 311,
+    "48": 420,
+    "49": 324,
+    "50": 410
+  },
+  "elapsed_sec": 25.45
+}

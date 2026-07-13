@@ -1,0 +1,1555 @@
+{
+  "check_method": "reward_equivalent_directory_index: original_abs dirname+basename first, then STEPCOUNT_MASKS_DIR basename fallback; sequence id/turn parsing copied from StepCount_mask_reward.py",
+  "data_dir": "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/StepCountQA-RL-Traj_11_50_Combined/data",
+  "metadata_path": "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/final_rl_mask_manifest_extra_h20_4h_nonoverlap_20260703_181252_componentclean_pointin_quality_upgraded/masks_metadata.easy_r1_compatible.json",
+  "masks_dir": "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/masks",
+  "dataset": {
+    "files": [
+      [
+        "train-00000-of-00004.parquet",
+        9808
+      ],
+      [
+        "train-00001-of-00004.parquet",
+        9808
+      ],
+      [
+        "train-00002-of-00004.parquet",
+        9808
+      ],
+      [
+        "train-00003-of-00004.parquet",
+        9806
+      ]
+    ],
+    "rows": 39230,
+    "unique_seq": 39230,
+    "dup_seq_count": 0,
+    "missing_path_count": 0,
+    "bad_answer_count": 0,
+    "answer_min": 11,
+    "answer_max": 50,
+    "answer_total_sum": 920888,
+    "answer_distribution": {
+      "11": 2537,
+      "12": 3297,
+      "13": 1863,
+      "14": 2147,
+      "15": 2145,
+      "16": 2011,
+      "17": 1372,
+      "18": 1732,
+      "19": 1235,
+      "20": 1621,
+      "21": 1136,
+      "22": 1072,
+      "23": 967,
+      "24": 1182,
+      "25": 976,
+      "26": 907,
+      "27": 753,
+      "28": 879,
+      "29": 627,
+      "30": 940,
+      "31": 660,
+      "32": 676,
+      "33": 591,
+      "34": 558,
+      "35": 621,
+      "36": 687,
+      "37": 469,
+      "38": 484,
+      "39": 464,
+      "40": 670,
+      "41": 425,
+      "42": 474,
+      "43": 359,
+      "44": 383,
+      "45": 424,
+      "46": 364,
+      "47": 323,
+      "48": 432,
+      "49": 341,
+      "50": 426
+    }
+  },
+  "metadata": {
+    "total_entries": 954765,
+    "total_unique_seq": 49685,
+    "total_alias_base": 49685,
+    "relevant_seq": 38132,
+    "relevant_entries": 894056,
+    "referenced_abs_dirs": {
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/masks": 820934,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/final_rl_mask_manifest_20260620/actual_pointin_fallback_v2/masks": 8752,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/point_recall_masks_point_recall_all_missing_h200_20260620_053826/masks": 3717,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_merged_next12h8_20260629_010140_unseen_11_20_tail147456_4096/masks": 1120,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_max_high_yield12h8_20260630_215813_unv_11_20_tail196608_4096/masks": 1108,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_diversified12h8_20260630_025003_unv_11_20_tail155648_4096/masks": 1083,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_merged_next12h8_20260629_010140_unseen_11_20_tail98304_4096/masks": 1080,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_merged_next12h8_20260629_010140_unseen_11_20_tail102400_4096/masks": 1078,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_max_high_yield12h8_20260630_215813_unv_11_20_tail167936_4096/masks": 1070,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_merged_next12h8_20260629_010140_unseen_11_20_tail81920_4096/masks": 1056,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_merged_next12h8_20260629_010140_unseen_11_20_tail61440_4096/masks": 1053,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_max_high_yield12h8_20260630_215813_unv_11_20_tail188416_4096/masks": 1043,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_diversified12h8_20260630_025003_unv_11_20_tail131072_4096/masks": 1042,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_merged_next12h8_20260629_010140_unseen_11_20_tail114688_4096/masks": 1036,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_merged_next12h8_20260629_010140_unseen_11_20_tail139264_4096/masks": 1033,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_merged_next12h8_20260629_010140_unseen_11_20_tail122880_4096/masks": 1030,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_max_high_yield12h8_20260630_215813_unv_11_20_tail192512_4096/masks": 1028,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_merged_next12h8_20260629_010140_unseen_11_20_tail126976_4096/masks": 1025,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_high_quality_object_masks_final_20260620_v2/masks": 1021,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_diversified12h8_20260630_025003_unv_11_20_tail135168_4096/masks": 1019,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_merged_next12h8_20260629_010140_unseen_11_20_tail155648_4096/masks": 1016,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_merged_next12h8_20260629_010140_unseen_11_20_tail73728_4096/masks": 1012,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_merged_next12h8_20260629_010140_unseen_11_20_tail77824_4096/masks": 1012,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_high_quality_object_masks_parallel_h20_bulk12h8_20260702_210945_post_combined_componentclean/masks": 1009,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_merged_next12h8_20260629_010140_unseen_11_20_tail86016_4096/masks": 1008,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_merged_next12h8_20260629_010140_unseen_11_20_tail131072_4096/masks": 1006,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_max_high_yield12h8_20260630_215813_unv_11_20_tail172032_4096/masks": 996,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_max_high_yield12h8_20260630_215813_unv_11_20_tail176128_4096/masks": 996,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_merged_next12h8_20260629_010140_unseen_11_20_tail135168_4096/masks": 991,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_merged_next12h8_20260629_010140_unseen_11_20_tail143360_4096/masks": 986,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_merged_next12h8_20260629_010140_unseen_11_20_tail65536_4096/masks": 983,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_max_high_yield12h8_20260630_215813_unv_11_20_tail184320_4096/masks": 982,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_merged_next12h8_20260629_010140_unseen_11_20_tail90112_4096/masks": 979,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_diversified12h8_20260630_025003_unv_11_20_tail143360_4096/masks": 976,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_merged_next12h8_20260629_010140_unseen_11_20_tail57344_4096/masks": 974,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_merged_next12h8_20260629_010140_unseen_11_20_tail69632_4096/masks": 972,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_diversified12h8_20260630_025003_unv_11_20_tail159744_4096/masks": 972,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_diversified12h8_20260630_025003_unv_11_20_tail151552_4096/masks": 969,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_diversified12h8_20260630_025003_unv_11_20_tail139264_4096/masks": 967,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_merged_next12h8_20260629_010140_unseen_11_20_tail94208_4096/masks": 946,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_max_high_yield12h8_20260630_215813_unv_11_20_tail180224_4096/masks": 945,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_diversified12h8_20260630_025003_unv_11_20_tail147456_4096/masks": 941,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_max_high_yield12h8_20260630_215813_unv_11_20_tail163840_4096/masks": 937,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_merged_next12h8_20260629_010140_unseen_11_20_tail151552_4096/masks": 931,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_quality_next_h200_20260621_180625_p10_base_unverified_4096_16384_balanced/masks": 926,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_quality_next_p11_resume_h200_20260622_132932/masks": 917,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_merged_next12h8_20260629_010140_unseen_11_20_tail106496_4096/masks": 916,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_merged_next12h8_20260629_010140_unseen_11_20_tail118784_4096/masks": 911,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_merged_next12h8_20260629_010140_unseen_11_20_tail110592_4096/masks": 891,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_merged_next12h8_20260629_010140_unseen_11_20_tail36864_4096/masks": 860,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_next12h8_unv_20260628_185830_unv_11_20_tail28672_4096/masks": 858,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_next12h8_unv_20260628_185830_unv_11_20_tail20480_4096/masks": 856,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_merged_next12h8_20260629_010140_unseen_11_20_tail49152_4096/masks": 839,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_next12h8_unv_20260628_185830_unv_11_20_tail32768_4096/masks": 837,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_merged_next12h8_20260629_010140_unseen_11_20_tail40960_4096/masks": 832,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_after_cleanup12h8_20260629_134759_unseen_11_20_tail32768_4096/masks": 820,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_next12h8_unv_20260628_185830_unv_11_20_tail24576_4096/masks": 815,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_merged_next12h8_20260629_010140_unseen_11_20_tail45056_4096/masks": 811,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_merged_next12h8_20260629_010140_unseen_11_20_tail53248_4096/masks": 811,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_after_cleanup12h8_20260629_134759_unseen_11_20_tail126976_4096/masks": 630,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_max_high_yield12h8_20260630_215813_unv_11_20_tail200704_4096/masks": 500,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_companion4_gpu4567_20260628_055825_unv_11_20_tail16384_4096/masks": 268,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_quality_unverified_next_chunks_h200_20260622_211242_c04_base_unverified_53248_4096_balanced/masks": 248,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_quality_unverified_next_chunks_h200_20260622_211242_c01_base_unverified_40960_4096_balanced/masks": 244,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_quality_unverified_next_chunks_h200_20260622_211242_c03_base_unverified_49152_4096_balanced/masks": 232,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_quality_unverified_next_chunks_h200_20260622_211242_c05_base_unverified_57344_4096_balanced/masks": 230,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_quality_unverified_next_chunks_h200_20260622_211242_c07_base_unverified_65536_4096_balanced/masks": 230,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_after_cleanup12h8_20260629_134759_unseen_11_20_tail28672_4096/masks": 228,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_quality_12h_h200_20260621_082856_p4_base_low_quality_8192_8192_bal_complete/masks": 225,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_quality_unverified_next_chunks_h200_20260622_211242_c00_base_unverified_36864_4096_balanced/masks": 223,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_next12h8_unv_20260628_185830_unv_11_20_retry4096_4096/masks": 220,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_quality_unverified_next_chunks_h200_20260622_211242_c06_base_unverified_61440_4096_balanced/masks": 220,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_quality_next_h200_20260621_180625_p7_base_low_quality_20480_8192_strict/masks": 220,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_next12h8_unv_20260628_185830_unv_11_20_retry0_4096/masks": 215,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_quality_12h_h200_20260621_082856_p6_base_unverified_probe_0_4096_balanced/masks": 212,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_quality_unverified_next_chunks_h200_20260622_211242_c02_base_unverified_45056_4096_balanced/masks": 212,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_next12h8_unv_20260628_185830_unv_11_20_retry8192_4096/masks": 208,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_next12h8_unv_20260628_185830_unv_11_20_retry12288_4096/masks": 207,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_quality_next_h200_20260621_180625_p8_base_low_quality_28672_8192_strict/masks": 203,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_quality_next_h200_20260621_180625_p9_base_low_quality_36864_7544_strict/masks": 185,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_dense_quality_upgrade_h200_20260621_035635/masks": 128,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_four_principles_dense12h8_20260702_002923_dense11_20_p4_p4_11_20_unv_o4096_4096/masks": 115,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_four_principles_dense12h8_20260702_002923_dense11_20_p4_p4_11_20_unv_o0_4096/masks": 108,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_quality_12h_h200_20260621_082856_p5_base_low_quality_16384_4096_strict/masks": 95,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_four_principles_followup12h8_20260702_182223_dense11_20_p4_followup_fp2_11_20_unv_o16384_4096/masks": 87,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_four_principles_dense12h8_20260702_002923_dense11_20_p4_p4_11_20_unv_o8192_4096/masks": 84,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_quality_12h_h200_20260621_082856_p3_base_low_quality_0_8192_bal_complete/masks": 82,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_four_principles_dense12h8_20260702_002923_dense11_20_p4_p4_11_20_unv_o12288_4096/masks": 72,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_high_quality_object_masks_extra_h20_4h_nonoverlap_20260703_181252_post_combined_componentclean/masks": 56,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_four_principles_followup12h8_20260702_182223_dense11_20_p4_followup_fp2_11_20_unv_o12288_4096/masks": 12,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_diversified12h8_20260630_025003_unv_21_50_tail53248_4096/masks": 8,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_diversified12h8_20260630_025003_unv_21_50_tail61440_4096/masks": 8,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_max_high_yield12h8_20260630_215813_unv_21_50_tail65536_relaxed/masks": 8,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_max_high_yield12h8_20260630_215813_unv_21_50_tail69632_relaxed/masks": 8,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_max_high_yield12h8_20260630_215813_unv_21_50_tail73728_relaxed/masks": 8,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_next12h8_unv_20260628_185830_unv_21_50_retry4096_4096/masks": 7,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_four_principles_dense12h8_20260702_002923_dense21_p4_p4_21_50_unv_o8192_4096/masks": 7,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_next12h8_unv_20260628_185830_unv_21_50_tail49152_4096/masks": 7,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_next12h8_unv_20260628_185830_unv_21_50_retry0_4096/masks": 6,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_four_principles_dense12h8_20260702_002923_dense21_p4_p4_21_50_unv_o12288_4096/masks": 6,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_next12h8_unv_20260628_185830_unv_21_50_retry12288_4096/masks": 5,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_companion4_gpu4567_20260628_055825_unv_21_50_tail32768_4096/masks": 5,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_next12h8_unv_20260628_185830_unv_21_50_tail36864_4096/masks": 5,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_next12h8_unv_20260628_185830_unv_21_50_tail40960_4096/masks": 5,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_next12h8_unv_20260628_185830_unv_21_50_retry8192_4096/masks": 4,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_diversified12h8_20260630_025003_unv_21_50_tail57344_4096/masks": 4,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_20260628_053259_unv_21_50_16384_4096/masks": 3,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_20260628_053259_unv_21_50_20480_4096/masks": 3,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_20260628_053259_unv_21_50_28672_4096/masks": 3,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_next12h8_unv_20260628_185830_unv_21_50_tail45056_4096/masks": 3,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_max_high_yield12h8_20260630_215813_unv_21_50_tail77824_relaxed/masks": 3,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_four_principles_dense12h8_20260702_002923_dense21_p4_p4_21_50_unv_o0_4096/masks": 2,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_four_principles_dense12h8_20260702_002923_dense21_p4_p4_21_50_unv_o4096_4096/masks": 2,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_20260628_053259_unv_21_50_24576_4096/masks": 2,
+      "/mnt/shared-storage-user/zhangchenhao/work/StepcountModel/dataset/sam_mask/StepCount-RL_masks_output_merged/curated_quality_upgrade_four_principles_dense12h8_20260702_002923_dense11_20_p4_p4_11_20_lq_o0_2048/masks": 1
+    },
+    "dir_index_errors": {},
+    "stats": {}
+  },
+  "mask_files": {
+    "masks_dir_file_count": 949239,
+    "resolve_mode_counts": {
+      "original_abs": 894056
+    },
+    "missing_relevant_entries_total": 0,
+    "missing_first": []
+  },
+  "row_match": {
+    "summary": {
+      "metadata_count_eq_answer": 38097,
+      "metadata_count_lt_answer": 35,
+      "missing_expected_turns": 35,
+      "no_metadata_sequence": 1098
+    },
+    "total_rows": 39230,
+    "complete_rows_exact_answer_turns_and_masks": 38097,
+    "incomplete_rows": 1133,
+    "seq_len_diff_top": [
+      [
+        0,
+        38097
+      ],
+      [
+        -1,
+        29
+      ],
+      [
+        -2,
+        2
+      ],
+      [
+        -3,
+        1
+      ],
+      [
+        -49,
+        1
+      ],
+      [
+        -12,
+        1
+      ],
+      [
+        -15,
+        1
+      ]
+    ],
+    "turn_missing_total": 112,
+    "turn_extra_total": 0,
+    "turn_duplicate_key_total": 0,
+    "missing_masks_in_seq_total": 0,
+    "anomalies_first": [
+      {
+        "seq": "21e144a7803be685be9855fce7f05edb31b76ffe658a6dfcf10fdd85a3ad1cb2",
+        "path": "21e144a7803be685be9855fce7f05edb31b76ffe658a6dfcf10fdd85a3ad1cb2.jpg",
+        "answer": 38,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 68,
+        "reason": "metadata_count_lt_answer",
+        "metadata_count": 37,
+        "missing_masks": 0
+      },
+      {
+        "seq": "21e144a7803be685be9855fce7f05edb31b76ffe658a6dfcf10fdd85a3ad1cb2",
+        "path": "21e144a7803be685be9855fce7f05edb31b76ffe658a6dfcf10fdd85a3ad1cb2.jpg",
+        "answer": 38,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 68,
+        "reason": "missing_expected_turns",
+        "metadata_count": 37,
+        "missing_turns": [
+          37
+        ],
+        "missing_masks": 0
+      },
+      {
+        "seq": "754024335f80ec68c1a6925e853f033d19d2520849d8d738d57b04eb45b79b9d",
+        "path": "754024335f80ec68c1a6925e853f033d19d2520849d8d738d57b04eb45b79b9d.jpg",
+        "answer": 30,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 305,
+        "reason": "metadata_count_lt_answer",
+        "metadata_count": 29,
+        "missing_masks": 0
+      },
+      {
+        "seq": "754024335f80ec68c1a6925e853f033d19d2520849d8d738d57b04eb45b79b9d",
+        "path": "754024335f80ec68c1a6925e853f033d19d2520849d8d738d57b04eb45b79b9d.jpg",
+        "answer": 30,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 305,
+        "reason": "missing_expected_turns",
+        "metadata_count": 29,
+        "missing_turns": [
+          6
+        ],
+        "missing_masks": 0
+      },
+      {
+        "seq": "0708449385b75ac3ff702fc635a9c7a66ee47a301ce9d67d90c10c3f95c6dbc3",
+        "path": "0708449385b75ac3ff702fc635a9c7a66ee47a301ce9d67d90c10c3f95c6dbc3.jpg",
+        "answer": 31,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 364,
+        "reason": "metadata_count_lt_answer",
+        "metadata_count": 30,
+        "missing_masks": 0
+      },
+      {
+        "seq": "0708449385b75ac3ff702fc635a9c7a66ee47a301ce9d67d90c10c3f95c6dbc3",
+        "path": "0708449385b75ac3ff702fc635a9c7a66ee47a301ce9d67d90c10c3f95c6dbc3.jpg",
+        "answer": 31,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 364,
+        "reason": "missing_expected_turns",
+        "metadata_count": 30,
+        "missing_turns": [
+          0
+        ],
+        "missing_masks": 0
+      },
+      {
+        "seq": "f176f69b0ddff6bb0f677464e45348153740b907215276ee52dc3cebc19d58de",
+        "path": "f176f69b0ddff6bb0f677464e45348153740b907215276ee52dc3cebc19d58de.jpg",
+        "answer": 13,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 1355,
+        "reason": "metadata_count_lt_answer",
+        "metadata_count": 12,
+        "missing_masks": 0
+      },
+      {
+        "seq": "f176f69b0ddff6bb0f677464e45348153740b907215276ee52dc3cebc19d58de",
+        "path": "f176f69b0ddff6bb0f677464e45348153740b907215276ee52dc3cebc19d58de.jpg",
+        "answer": 13,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 1355,
+        "reason": "missing_expected_turns",
+        "metadata_count": 12,
+        "missing_turns": [
+          3
+        ],
+        "missing_masks": 0
+      },
+      {
+        "seq": "8f049cd3aad16022b580d0d44e07234ef7c420a796e10d0f2c5d1a42eabd007e",
+        "path": "8f049cd3aad16022b580d0d44e07234ef7c420a796e10d0f2c5d1a42eabd007e.jpg",
+        "answer": 32,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 1359,
+        "reason": "metadata_count_lt_answer",
+        "metadata_count": 31,
+        "missing_masks": 0
+      },
+      {
+        "seq": "8f049cd3aad16022b580d0d44e07234ef7c420a796e10d0f2c5d1a42eabd007e",
+        "path": "8f049cd3aad16022b580d0d44e07234ef7c420a796e10d0f2c5d1a42eabd007e.jpg",
+        "answer": 32,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 1359,
+        "reason": "missing_expected_turns",
+        "metadata_count": 31,
+        "missing_turns": [
+          29
+        ],
+        "missing_masks": 0
+      },
+      {
+        "seq": "bef3b5b2d9bb4249b970a24a3f39959caf934d94198ff7bc8509cf597c7004a5",
+        "path": "bef3b5b2d9bb4249b970a24a3f39959caf934d94198ff7bc8509cf597c7004a5.jpg",
+        "answer": 44,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 1677,
+        "reason": "metadata_count_lt_answer",
+        "metadata_count": 43,
+        "missing_masks": 0
+      },
+      {
+        "seq": "bef3b5b2d9bb4249b970a24a3f39959caf934d94198ff7bc8509cf597c7004a5",
+        "path": "bef3b5b2d9bb4249b970a24a3f39959caf934d94198ff7bc8509cf597c7004a5.jpg",
+        "answer": 44,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 1677,
+        "reason": "missing_expected_turns",
+        "metadata_count": 43,
+        "missing_turns": [
+          1
+        ],
+        "missing_masks": 0
+      },
+      {
+        "seq": "e96e7734006a31bff04667cb380d7ba283e2254008794f1fbd7e3934ba4f8e22",
+        "path": "e96e7734006a31bff04667cb380d7ba283e2254008794f1fbd7e3934ba4f8e22.jpg",
+        "answer": 29,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 1819,
+        "reason": "metadata_count_lt_answer",
+        "metadata_count": 28,
+        "missing_masks": 0
+      },
+      {
+        "seq": "e96e7734006a31bff04667cb380d7ba283e2254008794f1fbd7e3934ba4f8e22",
+        "path": "e96e7734006a31bff04667cb380d7ba283e2254008794f1fbd7e3934ba4f8e22.jpg",
+        "answer": 29,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 1819,
+        "reason": "missing_expected_turns",
+        "metadata_count": 28,
+        "missing_turns": [
+          27
+        ],
+        "missing_masks": 0
+      },
+      {
+        "seq": "4398287bf26d230a5e91a7c4658cdee3fd095f99f37f1596e77555508dcd5100",
+        "path": "4398287bf26d230a5e91a7c4658cdee3fd095f99f37f1596e77555508dcd5100.jpg",
+        "answer": 37,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 2236,
+        "reason": "metadata_count_lt_answer",
+        "metadata_count": 36,
+        "missing_masks": 0
+      },
+      {
+        "seq": "4398287bf26d230a5e91a7c4658cdee3fd095f99f37f1596e77555508dcd5100",
+        "path": "4398287bf26d230a5e91a7c4658cdee3fd095f99f37f1596e77555508dcd5100.jpg",
+        "answer": 37,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 2236,
+        "reason": "missing_expected_turns",
+        "metadata_count": 36,
+        "missing_turns": [
+          34
+        ],
+        "missing_masks": 0
+      },
+      {
+        "seq": "ccba3cd2979803a370c7a04beeb3557157e17b7ed1afb3700a861906c6d397bb",
+        "path": "ccba3cd2979803a370c7a04beeb3557157e17b7ed1afb3700a861906c6d397bb.jpg",
+        "answer": 33,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 2274,
+        "reason": "metadata_count_lt_answer",
+        "metadata_count": 32,
+        "missing_masks": 0
+      },
+      {
+        "seq": "ccba3cd2979803a370c7a04beeb3557157e17b7ed1afb3700a861906c6d397bb",
+        "path": "ccba3cd2979803a370c7a04beeb3557157e17b7ed1afb3700a861906c6d397bb.jpg",
+        "answer": 33,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 2274,
+        "reason": "missing_expected_turns",
+        "metadata_count": 32,
+        "missing_turns": [
+          28
+        ],
+        "missing_masks": 0
+      },
+      {
+        "seq": "f51b6baba47fd3fad82d22ec3a619498c9590bfd122f0f8c917387398efd282c",
+        "path": "f51b6baba47fd3fad82d22ec3a619498c9590bfd122f0f8c917387398efd282c.jpg",
+        "answer": 26,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 2704,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "c14d29698c06843dd2288ce238540e4808b9c9b486b3de3edd24aab73df12724",
+        "path": "c14d29698c06843dd2288ce238540e4808b9c9b486b3de3edd24aab73df12724.jpg",
+        "answer": 16,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 2735,
+        "reason": "metadata_count_lt_answer",
+        "metadata_count": 15,
+        "missing_masks": 0
+      },
+      {
+        "seq": "c14d29698c06843dd2288ce238540e4808b9c9b486b3de3edd24aab73df12724",
+        "path": "c14d29698c06843dd2288ce238540e4808b9c9b486b3de3edd24aab73df12724.jpg",
+        "answer": 16,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 2735,
+        "reason": "missing_expected_turns",
+        "metadata_count": 15,
+        "missing_turns": [
+          13
+        ],
+        "missing_masks": 0
+      },
+      {
+        "seq": "4ba7a54fabee3970073fbe492dc9d5c9f9ad2423a4cb28e0a817e51996fc103d",
+        "path": "4ba7a54fabee3970073fbe492dc9d5c9f9ad2423a4cb28e0a817e51996fc103d.jpg",
+        "answer": 36,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 3616,
+        "reason": "metadata_count_lt_answer",
+        "metadata_count": 35,
+        "missing_masks": 0
+      },
+      {
+        "seq": "4ba7a54fabee3970073fbe492dc9d5c9f9ad2423a4cb28e0a817e51996fc103d",
+        "path": "4ba7a54fabee3970073fbe492dc9d5c9f9ad2423a4cb28e0a817e51996fc103d.jpg",
+        "answer": 36,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 3616,
+        "reason": "missing_expected_turns",
+        "metadata_count": 35,
+        "missing_turns": [
+          28
+        ],
+        "missing_masks": 0
+      },
+      {
+        "seq": "69d4e279599a2a1561605d2c2f843e95b9527ac6053368a3a7d9a1b637524564",
+        "path": "69d4e279599a2a1561605d2c2f843e95b9527ac6053368a3a7d9a1b637524564.jpg",
+        "answer": 15,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 3850,
+        "reason": "metadata_count_lt_answer",
+        "metadata_count": 14,
+        "missing_masks": 0
+      },
+      {
+        "seq": "69d4e279599a2a1561605d2c2f843e95b9527ac6053368a3a7d9a1b637524564",
+        "path": "69d4e279599a2a1561605d2c2f843e95b9527ac6053368a3a7d9a1b637524564.jpg",
+        "answer": 15,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 3850,
+        "reason": "missing_expected_turns",
+        "metadata_count": 14,
+        "missing_turns": [
+          6
+        ],
+        "missing_masks": 0
+      },
+      {
+        "seq": "a69e2807a848709841d14e18e56fab4836bb2afd9eef66d357e6985f642ed9de",
+        "path": "a69e2807a848709841d14e18e56fab4836bb2afd9eef66d357e6985f642ed9de.jpg",
+        "answer": 14,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 3934,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "764141fb5c64c111d56bc42fae306ddda1d239b6fed7d6e10cdb09f869ae3dde",
+        "path": "764141fb5c64c111d56bc42fae306ddda1d239b6fed7d6e10cdb09f869ae3dde.jpg",
+        "answer": 22,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 3996,
+        "reason": "metadata_count_lt_answer",
+        "metadata_count": 21,
+        "missing_masks": 0
+      },
+      {
+        "seq": "764141fb5c64c111d56bc42fae306ddda1d239b6fed7d6e10cdb09f869ae3dde",
+        "path": "764141fb5c64c111d56bc42fae306ddda1d239b6fed7d6e10cdb09f869ae3dde.jpg",
+        "answer": 22,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 3996,
+        "reason": "missing_expected_turns",
+        "metadata_count": 21,
+        "missing_turns": [
+          7
+        ],
+        "missing_masks": 0
+      },
+      {
+        "seq": "42cc51b5a0795a09b88ad6dc0a29fda655e2b9060b91bd86a616d6b118359dd4",
+        "path": "42cc51b5a0795a09b88ad6dc0a29fda655e2b9060b91bd86a616d6b118359dd4.jpg",
+        "answer": 48,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 4097,
+        "reason": "metadata_count_lt_answer",
+        "metadata_count": 45,
+        "missing_masks": 0
+      },
+      {
+        "seq": "42cc51b5a0795a09b88ad6dc0a29fda655e2b9060b91bd86a616d6b118359dd4",
+        "path": "42cc51b5a0795a09b88ad6dc0a29fda655e2b9060b91bd86a616d6b118359dd4.jpg",
+        "answer": 48,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 4097,
+        "reason": "missing_expected_turns",
+        "metadata_count": 45,
+        "missing_turns": [
+          36,
+          38,
+          40
+        ],
+        "missing_masks": 0
+      },
+      {
+        "seq": "6f184e2171ccd9a6a4667235f8e16d6558228b4e4db023474add716d1194430b",
+        "path": "6f184e2171ccd9a6a4667235f8e16d6558228b4e4db023474add716d1194430b.jpg",
+        "answer": 12,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 4274,
+        "reason": "metadata_count_lt_answer",
+        "metadata_count": 11,
+        "missing_masks": 0
+      },
+      {
+        "seq": "6f184e2171ccd9a6a4667235f8e16d6558228b4e4db023474add716d1194430b",
+        "path": "6f184e2171ccd9a6a4667235f8e16d6558228b4e4db023474add716d1194430b.jpg",
+        "answer": 12,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 4274,
+        "reason": "missing_expected_turns",
+        "metadata_count": 11,
+        "missing_turns": [
+          3
+        ],
+        "missing_masks": 0
+      },
+      {
+        "seq": "adcd560f6b31ffc47075901ae7f0539fa0570430e1df73f4d3f96d99962cb609",
+        "path": "adcd560f6b31ffc47075901ae7f0539fa0570430e1df73f4d3f96d99962cb609.jpg",
+        "answer": 47,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 4317,
+        "reason": "metadata_count_lt_answer",
+        "metadata_count": 45,
+        "missing_masks": 0
+      },
+      {
+        "seq": "adcd560f6b31ffc47075901ae7f0539fa0570430e1df73f4d3f96d99962cb609",
+        "path": "adcd560f6b31ffc47075901ae7f0539fa0570430e1df73f4d3f96d99962cb609.jpg",
+        "answer": 47,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 4317,
+        "reason": "missing_expected_turns",
+        "metadata_count": 45,
+        "missing_turns": [
+          5,
+          34
+        ],
+        "missing_masks": 0
+      },
+      {
+        "seq": "c5cbf7a763824abc1aaeb7a1810f07c654f41bf5f5e1cdb06045f83a1ba57841",
+        "path": "c5cbf7a763824abc1aaeb7a1810f07c654f41bf5f5e1cdb06045f83a1ba57841.jpg",
+        "answer": 17,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 4489,
+        "reason": "metadata_count_lt_answer",
+        "metadata_count": 16,
+        "missing_masks": 0
+      },
+      {
+        "seq": "c5cbf7a763824abc1aaeb7a1810f07c654f41bf5f5e1cdb06045f83a1ba57841",
+        "path": "c5cbf7a763824abc1aaeb7a1810f07c654f41bf5f5e1cdb06045f83a1ba57841.jpg",
+        "answer": 17,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 4489,
+        "reason": "missing_expected_turns",
+        "metadata_count": 16,
+        "missing_turns": [
+          8
+        ],
+        "missing_masks": 0
+      },
+      {
+        "seq": "ef232a4aa420fbb016cbf1504b3a6f7c6c90bacdaa4f65add5de467952de2dbc",
+        "path": "ef232a4aa420fbb016cbf1504b3a6f7c6c90bacdaa4f65add5de467952de2dbc.jpg",
+        "answer": 32,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 4614,
+        "reason": "metadata_count_lt_answer",
+        "metadata_count": 31,
+        "missing_masks": 0
+      },
+      {
+        "seq": "ef232a4aa420fbb016cbf1504b3a6f7c6c90bacdaa4f65add5de467952de2dbc",
+        "path": "ef232a4aa420fbb016cbf1504b3a6f7c6c90bacdaa4f65add5de467952de2dbc.jpg",
+        "answer": 32,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 4614,
+        "reason": "missing_expected_turns",
+        "metadata_count": 31,
+        "missing_turns": [
+          11
+        ],
+        "missing_masks": 0
+      },
+      {
+        "seq": "dd97e77b4defb4958718d6faf08077b03d32f825f49afa98ff0bc476b60f04e7",
+        "path": "dd97e77b4defb4958718d6faf08077b03d32f825f49afa98ff0bc476b60f04e7.jpg",
+        "answer": 42,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 4633,
+        "reason": "metadata_count_lt_answer",
+        "metadata_count": 41,
+        "missing_masks": 0
+      },
+      {
+        "seq": "dd97e77b4defb4958718d6faf08077b03d32f825f49afa98ff0bc476b60f04e7",
+        "path": "dd97e77b4defb4958718d6faf08077b03d32f825f49afa98ff0bc476b60f04e7.jpg",
+        "answer": 42,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 4633,
+        "reason": "missing_expected_turns",
+        "metadata_count": 41,
+        "missing_turns": [
+          3
+        ],
+        "missing_masks": 0
+      },
+      {
+        "seq": "bdf2a223b8c5d127a51e7a5dc65d843c9d09689abc5fdf4ed705fc091664a076",
+        "path": "bdf2a223b8c5d127a51e7a5dc65d843c9d09689abc5fdf4ed705fc091664a076.jpg",
+        "answer": 30,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 4907,
+        "reason": "metadata_count_lt_answer",
+        "metadata_count": 29,
+        "missing_masks": 0
+      },
+      {
+        "seq": "bdf2a223b8c5d127a51e7a5dc65d843c9d09689abc5fdf4ed705fc091664a076",
+        "path": "bdf2a223b8c5d127a51e7a5dc65d843c9d09689abc5fdf4ed705fc091664a076.jpg",
+        "answer": 30,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 4907,
+        "reason": "missing_expected_turns",
+        "metadata_count": 29,
+        "missing_turns": [
+          23
+        ],
+        "missing_masks": 0
+      },
+      {
+        "seq": "9153f3bd112ccf18bcaf42435d67490fb5375131d88c7c833322289856a417fc",
+        "path": "9153f3bd112ccf18bcaf42435d67490fb5375131d88c7c833322289856a417fc.jpg",
+        "answer": 41,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 5026,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "cf2afbaf307e99611740a2931e5be4e0ed7e12dd37c361cc30f8c475db39aa41",
+        "path": "cf2afbaf307e99611740a2931e5be4e0ed7e12dd37c361cc30f8c475db39aa41.jpg",
+        "answer": 32,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 5249,
+        "reason": "metadata_count_lt_answer",
+        "metadata_count": 31,
+        "missing_masks": 0
+      },
+      {
+        "seq": "cf2afbaf307e99611740a2931e5be4e0ed7e12dd37c361cc30f8c475db39aa41",
+        "path": "cf2afbaf307e99611740a2931e5be4e0ed7e12dd37c361cc30f8c475db39aa41.jpg",
+        "answer": 32,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 5249,
+        "reason": "missing_expected_turns",
+        "metadata_count": 31,
+        "missing_turns": [
+          24
+        ],
+        "missing_masks": 0
+      },
+      {
+        "seq": "eb454ab232382bfeec6373bf39bb510bc00b4264911cd018d95109229759ac16",
+        "path": "eb454ab232382bfeec6373bf39bb510bc00b4264911cd018d95109229759ac16.jpg",
+        "answer": 50,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 5508,
+        "reason": "metadata_count_lt_answer",
+        "metadata_count": 49,
+        "missing_masks": 0
+      },
+      {
+        "seq": "eb454ab232382bfeec6373bf39bb510bc00b4264911cd018d95109229759ac16",
+        "path": "eb454ab232382bfeec6373bf39bb510bc00b4264911cd018d95109229759ac16.jpg",
+        "answer": 50,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 5508,
+        "reason": "missing_expected_turns",
+        "metadata_count": 49,
+        "missing_turns": [
+          15
+        ],
+        "missing_masks": 0
+      },
+      {
+        "seq": "7ba44072dc7ef4946022d1e74bdca8ecfaf297d7bc9ac8e0c8b5a84fa142c473",
+        "path": "7ba44072dc7ef4946022d1e74bdca8ecfaf297d7bc9ac8e0c8b5a84fa142c473.jpg",
+        "answer": 20,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 5528,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "9e3bdc93b1f6f7f36a5336dcf7196a9d546625e6265bf94bad8c9053d2ff14cc",
+        "path": "9e3bdc93b1f6f7f36a5336dcf7196a9d546625e6265bf94bad8c9053d2ff14cc.jpg",
+        "answer": 24,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 6272,
+        "reason": "metadata_count_lt_answer",
+        "metadata_count": 23,
+        "missing_masks": 0
+      },
+      {
+        "seq": "9e3bdc93b1f6f7f36a5336dcf7196a9d546625e6265bf94bad8c9053d2ff14cc",
+        "path": "9e3bdc93b1f6f7f36a5336dcf7196a9d546625e6265bf94bad8c9053d2ff14cc.jpg",
+        "answer": 24,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 6272,
+        "reason": "missing_expected_turns",
+        "metadata_count": 23,
+        "missing_turns": [
+          3
+        ],
+        "missing_masks": 0
+      },
+      {
+        "seq": "b2736ba1d566a9ad1a15fd4d925c32a2713cea68e8f675c4dafbb167b3f578be",
+        "path": "b2736ba1d566a9ad1a15fd4d925c32a2713cea68e8f675c4dafbb167b3f578be.jpg",
+        "answer": 22,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 6387,
+        "reason": "metadata_count_lt_answer",
+        "metadata_count": 21,
+        "missing_masks": 0
+      },
+      {
+        "seq": "b2736ba1d566a9ad1a15fd4d925c32a2713cea68e8f675c4dafbb167b3f578be",
+        "path": "b2736ba1d566a9ad1a15fd4d925c32a2713cea68e8f675c4dafbb167b3f578be.jpg",
+        "answer": 22,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 6387,
+        "reason": "missing_expected_turns",
+        "metadata_count": 21,
+        "missing_turns": [
+          15
+        ],
+        "missing_masks": 0
+      },
+      {
+        "seq": "d3deacf23eee37de2e7256c8d70581ac8585f2473179e8ddcdb86106eafeda5c",
+        "path": "d3deacf23eee37de2e7256c8d70581ac8585f2473179e8ddcdb86106eafeda5c.jpg",
+        "answer": 25,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 6648,
+        "reason": "metadata_count_lt_answer",
+        "metadata_count": 24,
+        "missing_masks": 0
+      },
+      {
+        "seq": "d3deacf23eee37de2e7256c8d70581ac8585f2473179e8ddcdb86106eafeda5c",
+        "path": "d3deacf23eee37de2e7256c8d70581ac8585f2473179e8ddcdb86106eafeda5c.jpg",
+        "answer": 25,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 6648,
+        "reason": "missing_expected_turns",
+        "metadata_count": 24,
+        "missing_turns": [
+          3
+        ],
+        "missing_masks": 0
+      },
+      {
+        "seq": "c35466eca40e39e8956ab41069a7c65f4d99a2d38ec10a1d9df112af1f0a9a45",
+        "path": "c35466eca40e39e8956ab41069a7c65f4d99a2d38ec10a1d9df112af1f0a9a45.jpg",
+        "answer": 37,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 6682,
+        "reason": "metadata_count_lt_answer",
+        "metadata_count": 36,
+        "missing_masks": 0
+      },
+      {
+        "seq": "c35466eca40e39e8956ab41069a7c65f4d99a2d38ec10a1d9df112af1f0a9a45",
+        "path": "c35466eca40e39e8956ab41069a7c65f4d99a2d38ec10a1d9df112af1f0a9a45.jpg",
+        "answer": 37,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 6682,
+        "reason": "missing_expected_turns",
+        "metadata_count": 36,
+        "missing_turns": [
+          0
+        ],
+        "missing_masks": 0
+      },
+      {
+        "seq": "1ecc7aafdf86aac4b2abff8919a3b059cbbe7f096df2d005f3fa6cc1b2ff1f61",
+        "path": "1ecc7aafdf86aac4b2abff8919a3b059cbbe7f096df2d005f3fa6cc1b2ff1f61.jpg",
+        "answer": 42,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 6838,
+        "reason": "metadata_count_lt_answer",
+        "metadata_count": 41,
+        "missing_masks": 0
+      },
+      {
+        "seq": "1ecc7aafdf86aac4b2abff8919a3b059cbbe7f096df2d005f3fa6cc1b2ff1f61",
+        "path": "1ecc7aafdf86aac4b2abff8919a3b059cbbe7f096df2d005f3fa6cc1b2ff1f61.jpg",
+        "answer": 42,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 6838,
+        "reason": "missing_expected_turns",
+        "metadata_count": 41,
+        "missing_turns": [
+          7
+        ],
+        "missing_masks": 0
+      },
+      {
+        "seq": "d3c8256d3a3ae55d2b2c1a3ccced3872e0ba3602e216ca1dd916d47b505a4366",
+        "path": "d3c8256d3a3ae55d2b2c1a3ccced3872e0ba3602e216ca1dd916d47b505a4366.jpg",
+        "answer": 35,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 7849,
+        "reason": "metadata_count_lt_answer",
+        "metadata_count": 34,
+        "missing_masks": 0
+      },
+      {
+        "seq": "d3c8256d3a3ae55d2b2c1a3ccced3872e0ba3602e216ca1dd916d47b505a4366",
+        "path": "d3c8256d3a3ae55d2b2c1a3ccced3872e0ba3602e216ca1dd916d47b505a4366.jpg",
+        "answer": 35,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 7849,
+        "reason": "missing_expected_turns",
+        "metadata_count": 34,
+        "missing_turns": [
+          12
+        ],
+        "missing_masks": 0
+      },
+      {
+        "seq": "57a4e752cdcccee1d6f3b4d34bb9b79f3bd1dd210a9007a795416991126ba1c0",
+        "path": "57a4e752cdcccee1d6f3b4d34bb9b79f3bd1dd210a9007a795416991126ba1c0.jpg",
+        "answer": 39,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 7944,
+        "reason": "metadata_count_lt_answer",
+        "metadata_count": 37,
+        "missing_masks": 0
+      },
+      {
+        "seq": "57a4e752cdcccee1d6f3b4d34bb9b79f3bd1dd210a9007a795416991126ba1c0",
+        "path": "57a4e752cdcccee1d6f3b4d34bb9b79f3bd1dd210a9007a795416991126ba1c0.jpg",
+        "answer": 39,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 7944,
+        "reason": "missing_expected_turns",
+        "metadata_count": 37,
+        "missing_turns": [
+          33,
+          34
+        ],
+        "missing_masks": 0
+      },
+      {
+        "seq": "556e481132a4757d200b9321fc6f7496be078ee848b08a3c12cce4eff6ff4695",
+        "path": "556e481132a4757d200b9321fc6f7496be078ee848b08a3c12cce4eff6ff4695.jpg",
+        "answer": 49,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 8575,
+        "reason": "metadata_count_lt_answer",
+        "metadata_count": 48,
+        "missing_masks": 0
+      },
+      {
+        "seq": "556e481132a4757d200b9321fc6f7496be078ee848b08a3c12cce4eff6ff4695",
+        "path": "556e481132a4757d200b9321fc6f7496be078ee848b08a3c12cce4eff6ff4695.jpg",
+        "answer": 49,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 8575,
+        "reason": "missing_expected_turns",
+        "metadata_count": 48,
+        "missing_turns": [
+          11
+        ],
+        "missing_masks": 0
+      },
+      {
+        "seq": "85aa57e46b25d2263a895292fb1c908daefb62ebb6852012a3f32d3456113ff5",
+        "path": "85aa57e46b25d2263a895292fb1c908daefb62ebb6852012a3f32d3456113ff5.jpg",
+        "answer": 28,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 8790,
+        "reason": "metadata_count_lt_answer",
+        "metadata_count": 27,
+        "missing_masks": 0
+      },
+      {
+        "seq": "85aa57e46b25d2263a895292fb1c908daefb62ebb6852012a3f32d3456113ff5",
+        "path": "85aa57e46b25d2263a895292fb1c908daefb62ebb6852012a3f32d3456113ff5.jpg",
+        "answer": 28,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 8790,
+        "reason": "missing_expected_turns",
+        "metadata_count": 27,
+        "missing_turns": [
+          5
+        ],
+        "missing_masks": 0
+      },
+      {
+        "seq": "cb7b71b667e92bb6d2698dfbbef01bc30e1e382aab9a2fe3297f1565b39263ca",
+        "path": "cb7b71b667e92bb6d2698dfbbef01bc30e1e382aab9a2fe3297f1565b39263ca.jpg",
+        "answer": 37,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 9474,
+        "reason": "metadata_count_lt_answer",
+        "metadata_count": 36,
+        "missing_masks": 0
+      },
+      {
+        "seq": "cb7b71b667e92bb6d2698dfbbef01bc30e1e382aab9a2fe3297f1565b39263ca",
+        "path": "cb7b71b667e92bb6d2698dfbbef01bc30e1e382aab9a2fe3297f1565b39263ca.jpg",
+        "answer": 37,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 9474,
+        "reason": "missing_expected_turns",
+        "metadata_count": 36,
+        "missing_turns": [
+          36
+        ],
+        "missing_masks": 0
+      },
+      {
+        "seq": "9b4470590ed8f4269ba399bbe6eddc13cb669f800016a901d8243fadabbf1c0b",
+        "path": "9b4470590ed8f4269ba399bbe6eddc13cb669f800016a901d8243fadabbf1c0b.jpg",
+        "answer": 13,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 9519,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "89e03eafd73f38fb71f6a502fd8bf7984936d1c237c3b0a9c346a3d8900d6166",
+        "path": "89e03eafd73f38fb71f6a502fd8bf7984936d1c237c3b0a9c346a3d8900d6166.jpg",
+        "answer": 23,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 9546,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "e80c20a1c359943298d1ee9991de844b4a502272345ca47f1c55466d2f682c2f",
+        "path": "e80c20a1c359943298d1ee9991de844b4a502272345ca47f1c55466d2f682c2f.jpg",
+        "answer": 50,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 9570,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "412ee6055bd150eb7216f4a4f4dec30ad1b9b370510ddb1663395a5dea6355dc",
+        "path": "412ee6055bd150eb7216f4a4f4dec30ad1b9b370510ddb1663395a5dea6355dc.jpg",
+        "answer": 22,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 9571,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "aeed9115f0f6642fe399476e2dbbf3dd9f8c3d8cfab98f72d41a94cbd15caec1",
+        "path": "aeed9115f0f6642fe399476e2dbbf3dd9f8c3d8cfab98f72d41a94cbd15caec1.jpg",
+        "answer": 50,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 9616,
+        "reason": "metadata_count_lt_answer",
+        "metadata_count": 1,
+        "missing_masks": 0
+      },
+      {
+        "seq": "aeed9115f0f6642fe399476e2dbbf3dd9f8c3d8cfab98f72d41a94cbd15caec1",
+        "path": "aeed9115f0f6642fe399476e2dbbf3dd9f8c3d8cfab98f72d41a94cbd15caec1.jpg",
+        "answer": 50,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 9616,
+        "reason": "missing_expected_turns",
+        "metadata_count": 1,
+        "missing_turns": [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32,
+          33,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39,
+          40,
+          41,
+          42,
+          43,
+          44,
+          45,
+          46,
+          47,
+          48,
+          49
+        ],
+        "missing_masks": 0
+      },
+      {
+        "seq": "c2d43f7d72784fecea8f6e84f29b55880a31c8d1b49b1839fd6587a2e566f0ce",
+        "path": "c2d43f7d72784fecea8f6e84f29b55880a31c8d1b49b1839fd6587a2e566f0ce.jpg",
+        "answer": 44,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 9618,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "3d89df9c309201260291405a0b3eb6f88ca5e92c3b77e6f0f9def69137cb1cd5",
+        "path": "3d89df9c309201260291405a0b3eb6f88ca5e92c3b77e6f0f9def69137cb1cd5.jpg",
+        "answer": 30,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 9643,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "6ca6d39786d9162d52577758373b52f9efcc8c8f22f45023a366ef25c97e1525",
+        "path": "6ca6d39786d9162d52577758373b52f9efcc8c8f22f45023a366ef25c97e1525.jpg",
+        "answer": 17,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 9657,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "c090a8f9cea642339eb146b3adc4ff3adf8fde2da0ea74d4a7d92d0ea5777741",
+        "path": "c090a8f9cea642339eb146b3adc4ff3adf8fde2da0ea74d4a7d92d0ea5777741.jpg",
+        "answer": 39,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 9707,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "ecd3ee356d0aeca5faa1d0ba8f6c26e27146a0f7a03b9616fd75216d34e96468",
+        "path": "ecd3ee356d0aeca5faa1d0ba8f6c26e27146a0f7a03b9616fd75216d34e96468.jpg",
+        "answer": 27,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 9732,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "d56126dcca3109fc796f3ccb3d72dff0043562ed625d9931f9f6bdae21b5e309",
+        "path": "d56126dcca3109fc796f3ccb3d72dff0043562ed625d9931f9f6bdae21b5e309.jpg",
+        "answer": 12,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 9757,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "ecc0d72bcb8a46fe869215d3f4b08c651a8505992f1503c7aec02f1164aefd96",
+        "path": "ecc0d72bcb8a46fe869215d3f4b08c651a8505992f1503c7aec02f1164aefd96.jpg",
+        "answer": 35,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 9782,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "4dd97f849cf2da4d549437992390d0cffebbe84559b71eb27f5f2da62393968b",
+        "path": "4dd97f849cf2da4d549437992390d0cffebbe84559b71eb27f5f2da62393968b.jpg",
+        "answer": 23,
+        "file": "train-00000-of-00004.parquet",
+        "row_in_file": 9790,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "cd480ffc2b9db4c088d49503eb5be5d1143447e5e608b37f6d038a256f3f83dd",
+        "path": "cd480ffc2b9db4c088d49503eb5be5d1143447e5e608b37f6d038a256f3f83dd.jpg",
+        "answer": 21,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 34,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "848e098da32309654766441b64a4032d71880be984534af64cfe9e3f78f45e5e",
+        "path": "848e098da32309654766441b64a4032d71880be984534af64cfe9e3f78f45e5e.jpg",
+        "answer": 29,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 50,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "743b5d6ece817d8d40b90aa35252b7873c61c176e420d1a0b129415033dc5084",
+        "path": "743b5d6ece817d8d40b90aa35252b7873c61c176e420d1a0b129415033dc5084.jpg",
+        "answer": 25,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 51,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "872202f0e7c57d4465bc5088a38016c0fc5f37b0408417cfc1cb38eb68426822",
+        "path": "872202f0e7c57d4465bc5088a38016c0fc5f37b0408417cfc1cb38eb68426822.jpg",
+        "answer": 15,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 68,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "d4b292f6d18b570ee72543eeb15bf320074c02c9a08f0f52528c95bb4e454f86",
+        "path": "d4b292f6d18b570ee72543eeb15bf320074c02c9a08f0f52528c95bb4e454f86.jpg",
+        "answer": 17,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 107,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "44665af54cca4015c6bfdee1614af098cd1d39fa65a59b95c2a68c3020bf4253",
+        "path": "44665af54cca4015c6bfdee1614af098cd1d39fa65a59b95c2a68c3020bf4253.jpg",
+        "answer": 11,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 147,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "2b686f7788df81bcad17b0e3a73f9730be6d1354cc92e17fb9bfb403f46e5b55",
+        "path": "2b686f7788df81bcad17b0e3a73f9730be6d1354cc92e17fb9bfb403f46e5b55.jpg",
+        "answer": 23,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 151,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "6b61d7eea606bf039963bcbe680ae6ec6bf37821becb8d2ffec49768f2009726",
+        "path": "6b61d7eea606bf039963bcbe680ae6ec6bf37821becb8d2ffec49768f2009726.jpg",
+        "answer": 49,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 174,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "321b5a06c5c543e76f7428e872af9729eb29a93b3a3cb34600906edf8f3c89e1",
+        "path": "321b5a06c5c543e76f7428e872af9729eb29a93b3a3cb34600906edf8f3c89e1.jpg",
+        "answer": 25,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 198,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "15880d35d9d50337ce195d94fb65790177aa09434bfa421a0ff3d0dfd5de0d47",
+        "path": "15880d35d9d50337ce195d94fb65790177aa09434bfa421a0ff3d0dfd5de0d47.jpg",
+        "answer": 12,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 222,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "fcda04f014a0234a725fb50120ee826cfc67a036408a1e7d22118702f134e14f",
+        "path": "fcda04f014a0234a725fb50120ee826cfc67a036408a1e7d22118702f134e14f.jpg",
+        "answer": 16,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 240,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "89838fceeabf101dc0b21017d5cb6d048fe751d2443a8731525c67cead909bb4",
+        "path": "89838fceeabf101dc0b21017d5cb6d048fe751d2443a8731525c67cead909bb4.jpg",
+        "answer": 26,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 334,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "c963fbbe0a73807750cd68a4f56d23e4b07d54cb017f023bcd09e2a83eb21da5",
+        "path": "c963fbbe0a73807750cd68a4f56d23e4b07d54cb017f023bcd09e2a83eb21da5.jpg",
+        "answer": 44,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 351,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "a8419b9793d41e77d54a44d2554bc5cb1e77aa01dd586c1814d95f0318ab9ad7",
+        "path": "a8419b9793d41e77d54a44d2554bc5cb1e77aa01dd586c1814d95f0318ab9ad7.jpg",
+        "answer": 11,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 438,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "b2b91ecf6beaffa324db11e54475173f23672571090c8eeafee3daa541852553",
+        "path": "b2b91ecf6beaffa324db11e54475173f23672571090c8eeafee3daa541852553.jpg",
+        "answer": 15,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 439,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "5db270469bf481c6ff05f92d1aeaebad24c96160ce2870ce06ddccd2e56800cd",
+        "path": "5db270469bf481c6ff05f92d1aeaebad24c96160ce2870ce06ddccd2e56800cd.jpg",
+        "answer": 16,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 456,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "d2b8e9e9a88f73928f2bb5eb3ece45209ee705f9de332263d61289e3f2d176c2",
+        "path": "d2b8e9e9a88f73928f2bb5eb3ece45209ee705f9de332263d61289e3f2d176c2.jpg",
+        "answer": 21,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 472,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "7d5415b90dc54b0276661deeb7916bfc7de0ae31903e09c6bbc4b8588f434caa",
+        "path": "7d5415b90dc54b0276661deeb7916bfc7de0ae31903e09c6bbc4b8588f434caa.jpg",
+        "answer": 30,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 475,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "c0a2f7ff7364c576cf40f1106292357f085c02968a31e17d7924b3f019d03caf",
+        "path": "c0a2f7ff7364c576cf40f1106292357f085c02968a31e17d7924b3f019d03caf.jpg",
+        "answer": 14,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 477,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "c4372ac126ea4c5d55e425cbece1cdd71e91874b597ccf22800bce810f7d7bbb",
+        "path": "c4372ac126ea4c5d55e425cbece1cdd71e91874b597ccf22800bce810f7d7bbb.jpg",
+        "answer": 16,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 536,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "4be3518a910fe3050903d1dce144370d3919804ec229e3d48b8afe4e61978626",
+        "path": "4be3518a910fe3050903d1dce144370d3919804ec229e3d48b8afe4e61978626.jpg",
+        "answer": 12,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 549,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "f6be775cc4f0d80d8b118b6ae8a5d1c82a5857b5b1ebbf5bafc6c8fc392b3ad8",
+        "path": "f6be775cc4f0d80d8b118b6ae8a5d1c82a5857b5b1ebbf5bafc6c8fc392b3ad8.jpg",
+        "answer": 16,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 550,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "bb333fc65eccb9fce5494c82791d8dfb0355faac768de3f374cbf06353b1314f",
+        "path": "bb333fc65eccb9fce5494c82791d8dfb0355faac768de3f374cbf06353b1314f.jpg",
+        "answer": 28,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 558,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "d537aeebcbb26fe7252ebde9b673338e1c0ab0131cf5cf42dfc14b170a1f74e9",
+        "path": "d537aeebcbb26fe7252ebde9b673338e1c0ab0131cf5cf42dfc14b170a1f74e9.jpg",
+        "answer": 49,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 576,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "36edec7916b4a140572f2c4a35651725e5c9c21cf2d56a5210ef6dd1b9ec65a3",
+        "path": "36edec7916b4a140572f2c4a35651725e5c9c21cf2d56a5210ef6dd1b9ec65a3.jpg",
+        "answer": 11,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 593,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "dfc5056fad866e80ea0612b627803dff75b5910a8867bf6bb9887ae707d4c0bc",
+        "path": "dfc5056fad866e80ea0612b627803dff75b5910a8867bf6bb9887ae707d4c0bc.jpg",
+        "answer": 20,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 623,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "925bf7fbd432bea509fe7f7de33d2f06528418b8edda42f9c9dc2d2aefe7f3a6",
+        "path": "925bf7fbd432bea509fe7f7de33d2f06528418b8edda42f9c9dc2d2aefe7f3a6.jpg",
+        "answer": 12,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 631,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "c631d73e439948ceb623c5df5ba375076b5a6e5bba46b44a13f573a5aff256d8",
+        "path": "c631d73e439948ceb623c5df5ba375076b5a6e5bba46b44a13f573a5aff256d8.jpg",
+        "answer": 20,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 653,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "60c9d33d127681c27a7cbd6ecbc9ad775bc1356cb954a95dcb1a021eaae43125",
+        "path": "60c9d33d127681c27a7cbd6ecbc9ad775bc1356cb954a95dcb1a021eaae43125.jpg",
+        "answer": 49,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 707,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "f9681ee07bba8f4f7d51bfb7240e6f8828e9f4d5639a98f8610e220d8f16b2f2",
+        "path": "f9681ee07bba8f4f7d51bfb7240e6f8828e9f4d5639a98f8610e220d8f16b2f2.jpg",
+        "answer": 19,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 713,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "13eb7c3d9f4e2b137ff6e80adbfaf29e67f6550d8d4c076bfce1a54789d38de1",
+        "path": "13eb7c3d9f4e2b137ff6e80adbfaf29e67f6550d8d4c076bfce1a54789d38de1.jpg",
+        "answer": 20,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 726,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "0171437fc403b0690721f446121fcbe5cb12b5605ba4b2514596bfeddbc8be3c",
+        "path": "0171437fc403b0690721f446121fcbe5cb12b5605ba4b2514596bfeddbc8be3c.jpg",
+        "answer": 31,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 774,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "0dcc1961f658e7a4f706d6c3ac9df5ab01241d8381936d1ebcc96afad936821c",
+        "path": "0dcc1961f658e7a4f706d6c3ac9df5ab01241d8381936d1ebcc96afad936821c.jpg",
+        "answer": 21,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 777,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "764aeab57c3774c53e4f5901c126978bbd5d9ff162f7dfebdf39319e125589ec",
+        "path": "764aeab57c3774c53e4f5901c126978bbd5d9ff162f7dfebdf39319e125589ec.jpg",
+        "answer": 42,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 827,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "f34b4afa856c4b168e880c0488156ab462cff71a61ed50e7744495325deb44cd",
+        "path": "f34b4afa856c4b168e880c0488156ab462cff71a61ed50e7744495325deb44cd.jpg",
+        "answer": 16,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 855,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "166a3fe4e238bacfeeddf69140977fe290e0e1ded7360b545d7d9e49a561be28",
+        "path": "166a3fe4e238bacfeeddf69140977fe290e0e1ded7360b545d7d9e49a561be28.jpg",
+        "answer": 19,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 864,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "be378f6533549e9942a8fbfdade8ac4142ff7a80107d2eec77eb53ff385e1328",
+        "path": "be378f6533549e9942a8fbfdade8ac4142ff7a80107d2eec77eb53ff385e1328.jpg",
+        "answer": 17,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 873,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      },
+      {
+        "seq": "a1ef4550b1b43c1f72670c7d4d53b408414bcef66435e9d185bf50a8493c8a18",
+        "path": "a1ef4550b1b43c1f72670c7d4d53b408414bcef66435e9d185bf50a8493c8a18.jpg",
+        "answer": 31,
+        "file": "train-00001-of-00004.parquet",
+        "row_in_file": 877,
+        "reason": "no_metadata_sequence",
+        "metadata_count": 0
+      }
+    ]
+  },
+  "elapsed_sec": 35.22
+}
