@@ -1,0 +1,9 @@
+# 固定权威生成栈的关键版本；flash-attn wheel 仍需匹配目标集群 CUDA ABI。
+torch>=2.6,<2.7
+transformers==4.57.3
+accelerate>=1.2,<2
+safetensors>=0.4.5,<1
+Pillow>=10,<13
+tqdm>=4.66,<5
+huggingface_hub>=0.27,<2
+flash-attn==2.7.3
