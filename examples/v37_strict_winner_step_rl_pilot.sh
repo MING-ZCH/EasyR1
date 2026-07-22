@@ -255,6 +255,15 @@ fi
 if [[ "${V37_RUN_CLASS}" != "debug" ]] && _v37_is_true "${V37_ALLOW_BENCHMARK_DEV:-0}"; then
   _v37_error "benchmark development validation is debug-only"
 fi
+case "${V37_ALLOW_INDEPENDENT_VAL_OUTSIDE_TRAIN_RANGE:-0}" in
+  0|1) ;;
+  *) _v37_error "V37_ALLOW_INDEPENDENT_VAL_OUTSIDE_TRAIN_RANGE must be exactly 0 or 1" ;;
+esac
+if [[ "${V37_ALLOW_INDEPENDENT_VAL_OUTSIDE_TRAIN_RANGE:-0}" == "1" ]]; then
+  [[ "${V37_RUN_CLASS}" == "debug" ]] \
+    || _v37_error "V37_ALLOW_INDEPENDENT_VAL_OUTSIDE_TRAIN_RANGE=1 is debug-only; canary/formal refuse it"
+  _v37_mark_nonpromotable "independent_validation_outside_train_range"
+fi
 
 # Core adaptive actor KL currently rejects Ulysses SP; keep CP pluggable but closed.
 export V37_CP_SIZE=${V37_CP_SIZE:-1}
@@ -605,6 +614,69 @@ export HOST_NUM=1
 export HOST_GPU_NUM=8
 export INDEX=0
 
+# Debug/canary diagnostics may tune these V37 names. Formal stays frozen to
+# the conservative H200 profile; update micro-batch 8 is explicitly unsafe.
+export V37_MICRO_BATCH_UPDATE=${V37_MICRO_BATCH_UPDATE:-4}
+export V37_MICRO_BATCH_EXP=${V37_MICRO_BATCH_EXP:-8}
+export V37_VLLM_NUM_GPU_BLOCKS=${V37_VLLM_NUM_GPU_BLOCKS:-20480}
+export V37_GPU_MEM_UTIL=${V37_GPU_MEM_UTIL:-0.50}
+export V37_MAX_NUM_BATCHED_TOKENS=${V37_MAX_NUM_BATCHED_TOKENS:-49152}
+for _v37_resource_spec in \
+  "V37_MICRO_BATCH_UPDATE:${V37_MICRO_BATCH_UPDATE}" \
+  "V37_MICRO_BATCH_EXP:${V37_MICRO_BATCH_EXP}" \
+  "V37_VLLM_NUM_GPU_BLOCKS:${V37_VLLM_NUM_GPU_BLOCKS}" \
+  "V37_MAX_NUM_BATCHED_TOKENS:${V37_MAX_NUM_BATCHED_TOKENS}"; do
+  _v37_resource_name="${_v37_resource_spec%%:*}"
+  _v37_resource_value="${_v37_resource_spec#*:}"
+  [[ "${_v37_resource_value}" =~ ^[1-9][0-9]*$ ]] \
+    || _v37_error "${_v37_resource_name} must be a positive integer, got: ${_v37_resource_value}"
+done
+case "${V37_MICRO_BATCH_UPDATE}" in
+  1|2|4) ;;
+  *) _v37_error "V37_MICRO_BATCH_UPDATE must be 1, 2, or 4; micro8 already OOMed on this workload" ;;
+esac
+"${V37_PREFLIGHT_PYTHON:-python3}" - "${V37_GPU_MEM_UTIL}" <<'PY' \
+  || _v37_error "V37_GPU_MEM_UTIL must be a finite decimal in (0, 1]"
+import math
+import sys
+try:
+    value = float(sys.argv[1])
+except ValueError as exc:
+    raise SystemExit(1) from exc
+raise SystemExit(0 if math.isfinite(value) and 0 < value <= 1 else 1)
+PY
+if [[ "${V37_RUN_CLASS}" == "formal" ]]; then
+  for _v37_formal_resource in \
+    "V37_MICRO_BATCH_UPDATE:4" \
+    "V37_MICRO_BATCH_EXP:8" \
+    "V37_VLLM_NUM_GPU_BLOCKS:20480" \
+    "V37_GPU_MEM_UTIL:0.50" \
+    "V37_MAX_NUM_BATCHED_TOKENS:49152" \
+    "V37_CP_SIZE:1"; do
+    _v37_resource_name="${_v37_formal_resource%%:*}"
+    _v37_resource_expected="${_v37_formal_resource#*:}"
+    [[ "${!_v37_resource_name}" == "${_v37_resource_expected}" ]] \
+      || _v37_error "formal ${_v37_resource_name} is locked to ${_v37_resource_expected}, got: ${!_v37_resource_name}"
+  done
+fi
+for _v37_legacy_resource in \
+  "V31_MICRO_BATCH_UPDATE:V37_MICRO_BATCH_UPDATE" \
+  "V31_MICRO_BATCH_EXP:V37_MICRO_BATCH_EXP" \
+  "EASYR1_VLLM_NUM_GPU_BLOCKS:V37_VLLM_NUM_GPU_BLOCKS" \
+  "V31_GPU_MEM_UTIL:V37_GPU_MEM_UTIL" \
+  "V31_MAX_NUM_BATCHED_TOKENS:V37_MAX_NUM_BATCHED_TOKENS"; do
+  _v37_legacy_name="${_v37_legacy_resource%%:*}"
+  _v37_v37_name="${_v37_legacy_resource#*:}"
+  if [[ -n "${!_v37_legacy_name:-}" && "${!_v37_legacy_name}" != "${!_v37_v37_name}" ]]; then
+    _v37_error "${_v37_legacy_name} conflicts with ${_v37_v37_name}; configure resources through V37_* only"
+  fi
+done
+export V31_MICRO_BATCH_UPDATE="${V37_MICRO_BATCH_UPDATE}"
+export V31_MICRO_BATCH_EXP="${V37_MICRO_BATCH_EXP}"
+export EASYR1_VLLM_NUM_GPU_BLOCKS="${V37_VLLM_NUM_GPU_BLOCKS}"
+export V31_GPU_MEM_UTIL="${V37_GPU_MEM_UTIL}"
+export V31_MAX_NUM_BATCHED_TOKENS="${V37_MAX_NUM_BATCHED_TOKENS}"
+
 # Contract-only mode exercises switch expansion and manifest policy without assets/training.
 if _v37_is_true "${V37_CONTRACT_ONLY:-0}"; then
   printf '%s\n' \
@@ -630,6 +702,7 @@ if _v37_is_true "${V37_CONTRACT_ONLY:-0}"; then
     "kl=${KL_PENALTY}/${KL_COEF}/${KL_TARGET}/${KL_HORIZON}" \
     "kl_horizon_unit=${KL_HORIZON_UNIT}" \
     "cp_size=${V37_CP_SIZE}" \
+    "resources=${V31_MICRO_BATCH_UPDATE}/${V31_MICRO_BATCH_EXP}/${EASYR1_VLLM_NUM_GPU_BLOCKS}/${V31_GPU_MEM_UTIL}/${V31_MAX_NUM_BATCHED_TOKENS}" \
     "fallback_logprob_sign_opt_in=${V37_FALLBACK_LOGPROB_SIGN_OPT_IN}" \
     "torch_logprob_fallback_mode=${TORCH_LOGPROB_FALLBACK_MODE}" \
     "strict_answer_integer_parse=${TRAJ_STRICT_ANSWER_INTEGER_PARSE}" \
@@ -715,11 +788,12 @@ _V37_CANONICAL_REWARD="${REPO_DIR}/examples/reward_function/StepCount_mask_rewar
 [[ -d "${_V37_CANONICAL_MODEL}" ]] \
   || _v37_error "STEPCOUNT_1M_RESUME_CKPT476_MODEL_PATH must name checkpoint-476: ${STEPCOUNT_1M_RESUME_CKPT476_MODEL_PATH}"
 _V37_BENCHMARK_ROOTS=(
-  "${STEPCOUNT_PIXMO_TEST_DATA}"
-  "${STEPCOUNT_STEPCOUNT500_FULL_DATA}"
-  "${STEPCOUNT_STEPCOUNT500_V36_VAL100_DATA}"
+  "${STEPCOUNT_PIXMO_CANONICAL_JSON}"
+  "${STEPCOUNT_STEPCOUNT500_CANONICAL_JSON}"
   "${STEPCOUNT_COUNTQA_DATA}"
   "${STEPCOUNT_BIAS_DATA}"
+  "${STEPCOUNT_DENSE_CANONICAL_JSON}"
+  "${STEPCOUNT_EXTREME_CANONICAL_JSON}"
 )
 _V37_FORBIDDEN_DATA=("${_V37_BENCHMARK_ROOTS[@]}")
 
@@ -834,6 +908,10 @@ for _v37_spec in "${_v37_raw_val_specs[@]}"; do
   _V37_VAL_SPECS+=("${_v37_suite}::${_v37_val_real}")
   _v37_val_idx=$((_v37_val_idx + 1))
 done
+if [[ "${_V37_VAL_HAS_BENCHMARK}" == "1" \
+      && "${V37_ALLOW_INDEPENDENT_VAL_OUTSIDE_TRAIN_RANGE:-0}" == "1" ]]; then
+  _v37_error "independent outside-range validation must remain non-benchmark"
+fi
 if [[ "${_V37_VAL_HAS_BENCHMARK}" == "1" && "${V37_RUN_CLASS}" != "debug" ]]; then
   _v37_error "benchmark development validation is allowed only for non-promotable debug runs"
 fi
@@ -900,8 +978,6 @@ export HF_DATASETS_OFFLINE=1
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export WANDB_MODE=offline
-export V31_MICRO_BATCH_UPDATE=4
-export V31_MICRO_BATCH_EXP=8
 export V31_ROLLOUT_BATCH_SIZE=128
 export V31_GLOBAL_BATCH_SIZE=128
 export V31_VAL_BATCH_SIZE=128
@@ -910,13 +986,10 @@ export EASYR1_FILTER_OVERLONG_NUM_PROC=64
 export V31_MAX_PROMPT_LENGTH=12000
 export V31_MAX_RESPONSE_LENGTH=16384
 export V31_MAX_MODEL_LEN=32768
-export V31_MAX_NUM_BATCHED_TOKENS=49152
 export V31_MAX_PIXELS=12845056
 export V31_MIN_PIXELS=262144
 export V31_ENFORCE_EAGER=false
-export EASYR1_VLLM_NUM_GPU_BLOCKS=20480
 export EASYR1_ALLOW_ZERO_MM_LOGPROB=0
-export V31_GPU_MEM_UTIL=0.50
 if [[ "${V37_RUN_CLASS}" == "formal" ]]; then
   export V37_FINALIZE_HF_CHECKPOINT=1
 else
@@ -1247,7 +1320,9 @@ for _v37_forbidden_data in "${_V37_FORBIDDEN_DATA[@]}"; do
     _V37_PREFLIGHT_ARGS+=(--expected-forbidden-sha256 "$(_v37_sha256_tree "${_v37_forbidden_data}")")
   fi
 done
-if [[ "${_V37_VAL_HAS_BENCHMARK}" == "1" ]]; then
+if [[ "${V37_ALLOW_INDEPENDENT_VAL_OUTSIDE_TRAIN_RANGE:-0}" == "1" ]]; then
+  _V37_PREFLIGHT_ARGS+=(--allow-val-answer-outside-train-range)
+elif [[ "${_V37_VAL_HAS_BENCHMARK}" == "1" ]]; then
   _V37_PREFLIGHT_ARGS+=(--allow-val-without-image-path --allow-val-answer-outside-train-range)
 elif [[ "${V37_RUN_CLASS}" != "debug" ]]; then
   _V37_PREFLIGHT_ARGS+=(--require-val-all-buckets)
