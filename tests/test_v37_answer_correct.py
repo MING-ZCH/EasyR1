@@ -45,6 +45,7 @@ def _clean_bok_environment(monkeypatch):
         "V37_ACTION_PARSER_CONTRACT",
         "V37_RAW_SUCCESS_STRICT_WINNER",
         "V37_STRICT_POINT_PARSER_CONTRACT",
+        "V37_WINNER_MODE",
     ):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("BOK_DAPO_FILTER", "0")

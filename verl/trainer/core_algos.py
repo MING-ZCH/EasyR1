@@ -67,6 +67,10 @@ def _validate_kl_scalar(
 class AdaptiveKLController(KLController):
     """Adaptive KL controller described in: https://arxiv.org/pdf/1909.08593.pdf
 
+    ``beta *= 1 + clip(KL / target - 1, -0.2, 0.2) * n_steps / horizon``.
+    Actor-side V37 passes executed optimizer updates as ``n_steps``; reward-side
+    legacy callers retain their existing unit and checkpoint contract.
+
     Copied from https://github.com/huggingface/trl/blob/v0.11.0/trl/trainer/utils.py#L54"""
 
     def __init__(

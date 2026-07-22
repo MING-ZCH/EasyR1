@@ -620,6 +620,7 @@ def _validate_arm_seed_bindings(
         "STEPCOUNT_MASK_REQUIRE": "1",
         "TRAJ_STRICT_ANSWER_INTEGER_PARSE": "1",
         "V37_RAW_SUCCESS_STRICT_WINNER": "1",
+        "V37_WINNER_MODE": "outcome_success",
         "V37_REWARD_FAIL_CLOSED": "1",
     }
     if progress:
@@ -960,7 +961,8 @@ def _validate_effective_environment(
         "KL_TYPE": "adaptive",
         "KL_COEF": "0.08",
         "KL_TARGET": "0.15",
-        "KL_HORIZON": "10000",
+        "KL_HORIZON": "50",
+        "KL_HORIZON_UNIT": "executed_optimizer_updates",
         "KL_PENALTY": "low_var_kl",
         "BOK_CORRECTNESS_FIRST": "1",
         "BOK_ALLWRONG_TERMINAL_ZERO": "1",
@@ -971,6 +973,7 @@ def _validate_effective_environment(
         "STEPCOUNT_MASK_REQUIRE": "1",
         "TRAJ_STRICT_ANSWER_INTEGER_PARSE": "1",
         "V37_RAW_SUCCESS_STRICT_WINNER": "1",
+        "V37_WINNER_MODE": "outcome_success",
         "V37_STRICT_POINT_PARSER_CONTRACT": "1",
         "V37_REWARD_FAIL_CLOSED": "1",
         "INTERLEAVED_ADAPTIVE_MAX_TURNS": "true",
@@ -1450,7 +1453,7 @@ def _validate_mechanism_config(manifest: Mapping[str, Any], arm: str, run_class:
         "reward_fail_closed", "adaptive_actor_kl",
         "legacy_kl", "cp_size", "fallback_logprob_sign_opt_in",
         "torch_logprob_fallback_mode", "strict_answer_integer_parse",
-        "strict_raw_success_winner", "strict_point_parser_contract",
+        "strict_raw_success_winner", "winner_mode", "strict_point_parser_contract",
     }
     raw = _exact_object(manifest.get("mechanism_config"), keys, label)
     expected_arm = {
@@ -1472,7 +1475,7 @@ def _validate_mechanism_config(manifest: Mapping[str, Any], arm: str, run_class:
         if canonical(raw.get(field)) != canonical(expected):
             raise GateError(f"{label}.{field} must equal {expected!r}")
     shared = {
-        "schema_version": 2,
+        "schema_version": 3,
         "legacy_process_reward_enabled": False,
         "correctness_first": True,
         "allwrong_terminal_zero": True,
@@ -1482,6 +1485,7 @@ def _validate_mechanism_config(manifest: Mapping[str, Any], arm: str, run_class:
         "torch_logprob_fallback_mode": "error",
         "strict_answer_integer_parse": True,
         "strict_raw_success_winner": True,
+        "winner_mode": "outcome_success",
         "strict_point_parser_contract": "strict_point_slots_v2",
     }
     for field, expected in shared.items():
@@ -1506,12 +1510,17 @@ def _validate_mechanism_config(manifest: Mapping[str, Any], arm: str, run_class:
         raise GateError(f"{label}.correctness_secondary is not the frozen contract")
     adaptive = _exact_object(
         raw.get("adaptive_actor_kl"),
-        {"enabled", "type", "penalty", "init_beta", "target", "horizon", "selector_includes_kl"},
+        {
+            "enabled", "type", "penalty", "init_beta", "target", "horizon",
+            "horizon_unit", "loss_reduction", "selector_includes_kl",
+        },
         f"{label}.adaptive_actor_kl",
     )
     expected_adaptive = {
         "enabled": True, "type": "adaptive", "penalty": "low_var_kl",
-        "init_beta": .08, "target": .15, "horizon": 10000, "selector_includes_kl": False,
+        "init_beta": .08, "target": .15, "horizon": 50,
+        "horizon_unit": "executed_optimizer_updates",
+        "loss_reduction": "response_token_mean", "selector_includes_kl": False,
     }
     if canonical(adaptive) != canonical(expected_adaptive):
         raise GateError(f"{label}.adaptive_actor_kl values are not the frozen contract")

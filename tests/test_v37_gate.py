@@ -220,7 +220,7 @@ def metric_rules():
 def mechanism(arm):
     progress = arm == "progress"
     return {
-        "schema_version": 2,
+        "schema_version": 3,
         "arm": arm,
         "estimator": "bok_grpo_step" if progress else "bok_grpo",
         "native_action_enabled": progress,
@@ -242,7 +242,9 @@ def mechanism(arm):
         "reward_fail_closed": True,
         "adaptive_actor_kl": {
             "enabled": True, "type": "adaptive", "penalty": "low_var_kl",
-            "init_beta": .08, "target": .15, "horizon": 10000, "selector_includes_kl": False,
+            "init_beta": .08, "target": .15, "horizon": 50,
+            "horizon_unit": "executed_optimizer_updates",
+            "loss_reduction": "response_token_mean", "selector_includes_kl": False,
         },
         "legacy_kl": {"use_kl_loss": False, "reward_kl_enabled": False},
         "cp_size": 1,
@@ -250,6 +252,7 @@ def mechanism(arm):
         "torch_logprob_fallback_mode": "error",
         "strict_answer_integer_parse": True,
         "strict_raw_success_winner": True,
+        "winner_mode": "outcome_success",
         "strict_point_parser_contract": "strict_point_slots_v2",
     }
 
@@ -430,7 +433,8 @@ def valid_spec():
                 "PROCESS_REWARD_ENABLE": "0", "STEPCOUNT_RL_MODE": mechanism(arm)["estimator"],
                 "STEPCOUNT_MASK_REQUIRE": "1",
                 "TRAJ_STRICT_ANSWER_INTEGER_PARSE": "1",
-                "V37_RAW_SUCCESS_STRICT_WINNER": "1", "V37_STRICT_POINT_PARSER_CONTRACT": "1",
+                "V37_RAW_SUCCESS_STRICT_WINNER": "1", "V37_WINNER_MODE": "outcome_success",
+                "V37_STRICT_POINT_PARSER_CONTRACT": "1",
                 "V37_REWARD_FAIL_CLOSED": "1",
             }
             if arm == "progress":
@@ -925,7 +929,8 @@ def materialize_formal(tmp_path: Path, value):
             "KL_TYPE": "adaptive",
             "KL_COEF": "0.08",
             "KL_TARGET": "0.15",
-            "KL_HORIZON": "10000",
+            "KL_HORIZON": "50",
+            "KL_HORIZON_UNIT": "executed_optimizer_updates",
             "KL_PENALTY": "low_var_kl",
             "BOK_CORRECTNESS_FIRST": "1",
             "BOK_ALLWRONG_TERMINAL_ZERO": "1",

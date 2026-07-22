@@ -195,6 +195,19 @@ def _v37_reward_fail_closed_enabled() -> bool:
     return os.environ.get("V37_REWARD_FAIL_CLOSED", "0").lower() in ("1", "true", "yes")
 
 
+def _v37_winner_mode(strict_winner: bool) -> str:
+    """Resolve the opt-in V37 winner contract without changing V36 defaults."""
+    if not strict_winner:
+        return "legacy_all_hit"
+    mode = os.environ.get("V37_WINNER_MODE", "legacy_all_hit").strip().lower()
+    if mode not in {"legacy_all_hit", "outcome_success"}:
+        raise ValueError(
+            "V37_WINNER_MODE must be legacy_all_hit or outcome_success, "
+            f"got {mode!r}."
+        )
+    return mode
+
+
 def _get_mask_helper():
     """获取或初始化 MaskRewardHelper（懒加载）"""
     global _MASK_HELPER
@@ -1260,6 +1273,14 @@ def _has_single_terminal_answer(predict: str) -> bool:
     if predict.count("<answer>") != 1 or predict.count("</answer>") != 1:
         return False
     return re.search(r"<answer>.*?</answer>\s*\Z", predict, re.DOTALL) is not None
+
+
+def _extract_single_terminal_integer_answer(predict: str) -> Optional[int]:
+    """Return one closed terminal integer answer, independent of legacy parsing."""
+    if not _has_single_terminal_answer(predict):
+        return None
+    match = re.search(r"<answer>\s*([+-]?\d+)\s*</answer>\s*\Z", predict, re.DOTALL)
+    return int(match.group(1)) if match is not None else None
 
 
 def _strict_integer_value(value: Any) -> Optional[int]:
@@ -2543,6 +2564,7 @@ def compute_score(
             strict_raw_success_winner = str(
                 os.environ.get("V37_RAW_SUCCESS_STRICT_WINNER", "0")
             ).lower() in ("1", "true", "yes")
+            winner_mode = _v37_winner_mode(strict_raw_success_winner)
             effective_max_turns = compute_adaptive_max_turns_from_gt(
                 gt_data,
                 max_turns=max_turns,
@@ -2769,7 +2791,7 @@ def compute_score(
                 len(step_hit_any) != expected_steps
                 or any(float(value) < 0.5 for value in step_hit_any)
             )
-            raw_success = float(
+            legacy_all_hit_success = (
                 answer_exact == 1.0
                 and unique_closed_answer
                 and not turns_exceeded
@@ -2786,6 +2808,43 @@ def compute_score(
                         and not strict_winner_format_violation
                     )
                 )
+            )
+            strict_terminal_answer = _extract_single_terminal_integer_answer(predict)
+            outcome_success = (
+                strict_raw_success_winner
+                and strict_terminal_answer is not None
+                and gt_answer is not None
+                and int(strict_terminal_answer) == int(gt_answer)
+                and unique_closed_answer
+                and not turns_exceeded
+                and not ledger_abort
+                and len(pred_point_slots) > 0
+                and strict_structure["complete"]
+                and not tag_balance_violation
+                and not trajectory_integrity_violation
+                and not trajectory_hard_reject
+            )
+            raw_success = float(
+                outcome_success
+                if winner_mode == "outcome_success"
+                else legacy_all_hit_success
+            )
+            # This remains a process-quality diagnostic in both winner modes.
+            # outcome_success deliberately does not route mask misses or object
+            # duplicates into the answer-outcome winner channel.
+            trusted_trajectory = float(
+                strict_raw_success_winner
+                and outcome_success
+                and len(pred_point_slots) > 0
+                and strict_structure["complete"]
+                and not turns_exceeded
+                and not ledger_abort
+                and not tag_balance_violation
+                and not trajectory_integrity_violation
+                and not trajectory_hard_reject
+                and not duplicate_violation
+                and not duplicate_evidence_violation
+                and not strict_winner_miss_violation
             )
             trajectory_quality = clamp_reward(
                 0.6 * float(point_dense_score)
@@ -3040,6 +3099,7 @@ def compute_score(
             score["answer_exact"] = answer_exact
             score["raw_success"] = raw_success
             if strict_raw_success_winner:
+                score["trusted_trajectory"] = trusted_trajectory
                 score["raw_success_duplicate_violation"] = 1.0 if duplicate_violation else 0.0
                 score["raw_success_duplicate_evidence_missing"] = 1.0 if duplicate_evidence_violation else 0.0
                 score["raw_success_miss_violation"] = 1.0 if strict_winner_miss_violation else 0.0
@@ -3333,6 +3393,8 @@ def compute_score(
             score.setdefault("answer_correct", 0.0)
             score.setdefault("answer_exact", score["answer_correct"])
             score.setdefault("raw_success", 0.0)
+            if os.environ.get("V37_RAW_SUCCESS_STRICT_WINNER", "0").lower() in ("1", "true", "yes"):
+                score.setdefault("trusted_trajectory", 0.0)
             score.setdefault("trajectory_quality", 0.0)
         score.setdefault("point", 0.0)
         score.setdefault("is_point_task", is_point_task)

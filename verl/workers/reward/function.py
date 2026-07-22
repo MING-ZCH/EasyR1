@@ -248,7 +248,8 @@ class SequentialFunctionRewardManager(FunctionRewardManager):
             score = dict(score)
             if reward_fail_closed:
                 required_fields = (
-                    "overall", "answer", "answer_correct", "raw_success", "trajectory_quality"
+                    "overall", "answer", "answer_correct", "raw_success",
+                    "trusted_trajectory", "trajectory_quality",
                 )
                 missing_fields = [field for field in required_fields if field not in score]
                 if missing_fields:
@@ -266,7 +267,7 @@ class SequentialFunctionRewardManager(FunctionRewardManager):
                         raise RuntimeError(
                             f"V37 reward field {field!r} is non-finite at row {i}."
                         )
-                for field in ("answer_correct", "raw_success"):
+                for field in ("answer_correct", "raw_success", "trusted_trajectory"):
                     if float(score[field]) not in (0.0, 1.0):
                         raise RuntimeError(
                             f"V37 reward field {field!r} must be binary at row {i}."
@@ -304,6 +305,7 @@ class SequentialFunctionRewardManager(FunctionRewardManager):
                             "answer_correct": 0.0,
                             "answer_exact": 0.0,
                             "raw_success": 0.0,
+                            "trusted_trajectory": 0.0,
                             "trajectory_quality": 0.0,
                             "point": 0.0,
                             "invalid_generation": 1.0,

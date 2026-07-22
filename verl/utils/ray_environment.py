@@ -180,6 +180,7 @@ def validate_v37_remote_environment(role: str) -> dict[str, str] | None:
         "STEPCOUNT_MASK_REQUIRE": "1",
         "TRAJ_STRICT_ANSWER_INTEGER_PARSE": "1",
         "V37_RAW_SUCCESS_STRICT_WINNER": "1",
+        "V37_WINNER_MODE": "outcome_success",
         "V37_REWARD_FAIL_CLOSED": "1",
         "V37_STRICT_POINT_PARSER_CONTRACT": "1",
         "ACTION_EVENT_REWARD_ENABLE": "1" if arm == "progress" else "0",

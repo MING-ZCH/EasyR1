@@ -21,6 +21,7 @@ def _strict_reward_env(monkeypatch):
         "V37_RAW_SUCCESS_STRICT_WINNER",
         "V37_REWARD_FAIL_CLOSED",
         "V37_STRICT_POINT_PARSER_CONTRACT",
+        "V37_WINNER_MODE",
     )
     for name in names:
         monkeypatch.delenv(name, raising=False)
@@ -97,6 +98,7 @@ def test_valid_strict_structure_is_eligible_with_complete_duplicate_evidence(mon
     score = _score(monkeypatch, prediction, 1)
     assert score["answer_correct"] == 1.0
     assert score["raw_success"] == 1.0
+    assert score["trusted_trajectory"] == 1.0
 
 
 def test_missing_duplicate_evidence_fails_closed_but_keeps_answer_credit(monkeypatch):
@@ -115,6 +117,63 @@ def test_mask_miss_is_not_a_strict_winner_but_keeps_answer_credit(monkeypatch):
     assert score["answer"] > 0.0
     assert score["raw_success"] == 0.0
     assert score["raw_success_miss_violation"] == 1.0
+
+
+def test_outcome_success_keeps_mask_miss_out_of_winner_but_not_trust(monkeypatch):
+    monkeypatch.setenv("V37_WINNER_MODE", "outcome_success")
+    prediction = '<point>{"point_2d":[10,10],"count_number":"1"}</point><answer>1</answer>'
+    score = _score(monkeypatch, prediction, 1, hits=[0.0])
+    assert score["answer_correct"] == 1.0
+    assert score["raw_success"] == 1.0
+    assert score["trusted_trajectory"] == 0.0
+    assert score["raw_success_miss_violation"] == 1.0
+
+
+def test_outcome_success_keeps_duplicate_out_of_winner_but_not_trust(monkeypatch):
+    monkeypatch.setenv("V37_WINNER_MODE", "outcome_success")
+    prediction = (
+        '<point>{"point_2d":[10,10],"count_number":"1"}</point>'
+        '<point>{"point_2d":[10.00001,10],"count_number":"2"}</point>'
+        '<answer>2</answer>'
+    )
+    score = _score(monkeypatch, prediction, 2, duplicates=[0.0, 1.0], hits=[1.0, 0.0])
+    assert score["answer_correct"] == 1.0
+    assert score["raw_success"] == 1.0
+    assert score["trusted_trajectory"] == 0.0
+    assert score["raw_success_duplicate_violation"] == 1.0
+
+
+@pytest.mark.parametrize(
+    "prediction,violation",
+    [
+        (
+            '<point>{"point_22d":[10,10],"count_number":"1"}</point><answer>1</answer>',
+            "raw_success_point_payload_violation",
+        ),
+        (
+            '<point>{"point_2d":[10,10],"count_number":"2"}</point><answer>1</answer>',
+            "point_count_number_violation",
+        ),
+    ],
+)
+def test_outcome_success_still_rejects_point_and_count_number_format(
+    monkeypatch, prediction, violation,
+):
+    monkeypatch.setenv("V37_WINNER_MODE", "outcome_success")
+    score = _score(monkeypatch, prediction, 1)
+    assert score["answer_correct"] == 1.0
+    assert score["raw_success"] == 0.0
+    assert score[violation] == 1.0
+
+
+def test_legacy_all_hit_mode_remains_default_and_explicit(monkeypatch):
+    prediction = '<point>{"point_2d":[10,10],"count_number":"1"}</point><answer>1</answer>'
+    default_score = _score(monkeypatch, prediction, 1, hits=[0.0])
+    monkeypatch.setenv("V37_WINNER_MODE", "legacy_all_hit")
+    explicit_score = _score(monkeypatch, prediction, 1, hits=[0.0])
+    assert default_score["raw_success"] == 0.0
+    assert explicit_score["raw_success"] == 0.0
+    assert default_score["raw_success"] == explicit_score["raw_success"]
 
 
 def test_object_duplicate_with_coordinate_jitter_is_not_a_strict_winner(monkeypatch):
@@ -250,3 +309,4 @@ def test_v36_feature_off_keeps_malformed_slot_filtering(monkeypatch):
     # Legacy count-number integrity may still reject this trajectory; the
     # compatibility contract here is that the malformed slot remains filtered.
     assert "raw_success_point_payload_violation" not in score
+    assert "trusted_trajectory" not in score

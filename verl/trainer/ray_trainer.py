@@ -75,7 +75,8 @@ from .metrics import compute_data_metrics, compute_throughout_metrics, compute_t
 
 
 TRAINER_RUNTIME_STATE_FILE = "trainer_runtime.pt"
-TRAINER_RUNTIME_STATE_VERSION = 1
+TRAINER_RUNTIME_STATE_VERSION = 2
+ADAPTIVE_ACTOR_KL_HORIZON_UNIT = "executed_optimizer_updates"
 logger = logging.getLogger(__name__)
 
 
@@ -1230,6 +1231,7 @@ class RayPPOTrainer:
                 trainer_runtime_state = {
                     "version": TRAINER_RUNTIME_STATE_VERSION,
                     "controller": self.kl_ctrl.state_dict(),
+                    "horizon_unit": ADAPTIVE_ACTOR_KL_HORIZON_UNIT,
                     "effective_updates": int(self.effective_actor_updates),
                     "ref_identity": self._adaptive_ref_identity,
                     "global_step": int(self.global_step),
@@ -1307,6 +1309,10 @@ class RayPPOTrainer:
                 or trainer_runtime_state.get("version") != TRAINER_RUNTIME_STATE_VERSION
             ):
                 raise RuntimeError("adaptive_actor_kl trainer runtime artifact has an unsupported contract.")
+            if trainer_runtime_state.get("horizon_unit") != ADAPTIVE_ACTOR_KL_HORIZON_UNIT:
+                raise RuntimeError(
+                    "adaptive_actor_kl horizon_unit must be executed_optimizer_updates."
+                )
             if (
                 trainer_runtime_state.get("global_step") != self.global_step
                 or trainer_runtime_state.get("step_complete") is not True

@@ -316,7 +316,14 @@ export ADAPTIVE_ACTOR_KL=true
 export KL_TYPE=adaptive
 export KL_COEF=0.08
 export KL_TARGET=0.15
-export KL_HORIZON=10000
+if [[ -n "${KL_HORIZON:-}" && "${KL_HORIZON}" != "50" ]]; then
+  _v37_error "V37 adaptive actor KL horizon is locked to 50 executed optimizer updates"
+fi
+if [[ -n "${KL_HORIZON_UNIT:-}" && "${KL_HORIZON_UNIT}" != "executed_optimizer_updates" ]]; then
+  _v37_error "V37 KL_HORIZON_UNIT is locked to executed_optimizer_updates"
+fi
+export KL_HORIZON=50
+export KL_HORIZON_UNIT=executed_optimizer_updates
 export KL_PENALTY=low_var_kl
 if [[ -n "${V37_FALLBACK_LOGPROB_SIGN_OPT_IN:-}" && "${V37_FALLBACK_LOGPROB_SIGN_OPT_IN}" != "0" ]]; then
   _v37_error "fallback logprob sign opt-in is forbidden for V37 A/B and continuation"
@@ -339,6 +346,10 @@ if [[ -n "${V37_RAW_SUCCESS_STRICT_WINNER:-}" && "${V37_RAW_SUCCESS_STRICT_WINNE
   _v37_error "V37 requires V37_RAW_SUCCESS_STRICT_WINNER=1"
 fi
 export V37_RAW_SUCCESS_STRICT_WINNER=1
+if [[ -n "${V37_WINNER_MODE:-}" && "${V37_WINNER_MODE}" != "outcome_success" ]]; then
+  _v37_error "V37 requires V37_WINNER_MODE=outcome_success"
+fi
+export V37_WINNER_MODE=outcome_success
 if [[ -n "${V37_REWARD_FAIL_CLOSED:-}" && "${V37_REWARD_FAIL_CLOSED}" != "1" ]]; then
   _v37_error "V37 requires V37_REWARD_FAIL_CLOSED=1"
 fi
@@ -617,11 +628,13 @@ if _v37_is_true "${V37_CONTRACT_ONLY:-0}"; then
     "adaptive_actor_kl=${ADAPTIVE_ACTOR_KL}" \
     "use_kl_loss=${USE_KL_LOSS}" \
     "kl=${KL_PENALTY}/${KL_COEF}/${KL_TARGET}/${KL_HORIZON}" \
+    "kl_horizon_unit=${KL_HORIZON_UNIT}" \
     "cp_size=${V37_CP_SIZE}" \
     "fallback_logprob_sign_opt_in=${V37_FALLBACK_LOGPROB_SIGN_OPT_IN}" \
     "torch_logprob_fallback_mode=${TORCH_LOGPROB_FALLBACK_MODE}" \
     "strict_answer_integer_parse=${TRAJ_STRICT_ANSWER_INTEGER_PARSE}" \
     "strict_raw_success_winner=${V37_RAW_SUCCESS_STRICT_WINNER}" \
+    "winner_mode=${V37_WINNER_MODE}" \
     "strict_point_parser_contract=${V37_STRICT_POINT_PARSER_CONTRACT}" \
     "topology=${V31_NNODES}x${V31_N_GPUS_PER_NODE}" \
     "ray_exact=${V37_REQUIRE_EXACT_RAY_GPUS}" \
@@ -1686,6 +1699,8 @@ config = {
         "init_beta": os.environ["KL_COEF"],
         "target": os.environ["KL_TARGET"],
         "horizon": os.environ["KL_HORIZON"],
+        "horizon_unit": os.environ["KL_HORIZON_UNIT"],
+        "loss_reduction": "response_token_mean",
         "selector_includes_kl": False,
     },
     "correctness_first": os.environ["BOK_CORRECTNESS_FIRST"],
@@ -1833,11 +1848,12 @@ manifest = {
         "correctness_first": os.environ["BOK_CORRECTNESS_FIRST"],
         "allwrong_terminal_zero": os.environ["BOK_ALLWRONG_TERMINAL_ZERO"],
         "reward_fail_closed": os.environ["V37_REWARD_FAIL_CLOSED"],
+        "winner_mode": os.environ["V37_WINNER_MODE"],
         "winner_boost": os.environ["BOK_WINNER_BOOST"],
         "cp_size": int(os.environ["V37_CP_SIZE"]),
     },
     "mechanism_config": {
-        "schema_version": 2,
+        "schema_version": 3,
         "arm": os.environ["V37_ARM"],
         "estimator": os.environ["ADV_ESTIMATOR"],
         "native_action_enabled": os.environ["ACTION_EVENT_REWARD_ENABLE"] == "1",
@@ -1868,7 +1884,9 @@ manifest = {
             "enabled": os.environ["ADAPTIVE_ACTOR_KL"].lower() == "true",
             "type": os.environ["KL_TYPE"], "penalty": os.environ["KL_PENALTY"],
             "init_beta": float(os.environ["KL_COEF"]), "target": float(os.environ["KL_TARGET"]),
-            "horizon": int(os.environ["KL_HORIZON"]), "selector_includes_kl": False,
+            "horizon": int(os.environ["KL_HORIZON"]),
+            "horizon_unit": os.environ["KL_HORIZON_UNIT"],
+            "loss_reduction": "response_token_mean", "selector_includes_kl": False,
         },
         "legacy_kl": {
             "use_kl_loss": os.environ["USE_KL_LOSS"].lower() == "true",
@@ -1879,6 +1897,7 @@ manifest = {
         "torch_logprob_fallback_mode": os.environ["TORCH_LOGPROB_FALLBACK_MODE"],
         "strict_answer_integer_parse": os.environ["TRAJ_STRICT_ANSWER_INTEGER_PARSE"] == "1",
         "strict_raw_success_winner": os.environ["V37_RAW_SUCCESS_STRICT_WINNER"] == "1",
+        "winner_mode": os.environ["V37_WINNER_MODE"],
         "strict_point_parser_contract": "strict_point_slots_v2",
     },
     "mining_contract": {
@@ -2026,7 +2045,7 @@ echo "[V37-strict-winner] promotable_candidate=${_V37_PROMOTABLE} reasons=${_V37
 echo "[V37-strict-winner] masks_meta=${STEPCOUNT_MASKS_METADATA} masks_dir=${STEPCOUNT_MASKS_DIR}"
 echo "[V37-strict-winner] image_roots=${_V37_IMAGE_ROOTS[*]:-<dataset-relative-only>}"
 echo "[V37-strict-winner] topology=${V31_NNODES}x${V31_N_GPUS_PER_NODE} profile=${STEPCOUNT_HARDWARE_PROFILE} micro=${V31_MICRO_BATCH_UPDATE}/${V31_MICRO_BATCH_EXP} blocks=${EASYR1_VLLM_NUM_GPU_BLOCKS} gpu_mem=${V31_GPU_MEM_UTIL} ulysses_sp=${V31_ULYSSES_SEQUENCE_PARALLEL_SIZE}"
-echo "[V37-strict-winner] seed=${V37_SEED} rollout_n=${ROLLOUT_N} lr=${ACTOR_LR} actor_kl=${ADAPTIVE_ACTOR_KL} use_kl_loss=${USE_KL_LOSS} kl=${KL_TYPE}/${KL_PENALTY}/${KL_COEF} target=${KL_TARGET} horizon=${KL_HORIZON} tau=${BOK_TAU_INIT}->${BOK_TAU_FINAL} winner_boost=${BOK_WINNER_BOOST}"
+echo "[V37-strict-winner] seed=${V37_SEED} rollout_n=${ROLLOUT_N} lr=${ACTOR_LR} actor_kl=${ADAPTIVE_ACTOR_KL} use_kl_loss=${USE_KL_LOSS} kl=${KL_TYPE}/${KL_PENALTY}/${KL_COEF} target=${KL_TARGET} horizon=${KL_HORIZON}/${KL_HORIZON_UNIT} tau=${BOK_TAU_INIT}->${BOK_TAU_FINAL} winner_boost=${BOK_WINNER_BOOST}"
 echo "[V37-strict-winner] pilot_steps=${V36_MAX_STEPS} bok_total_steps=${BOK_TOTAL_STEPS} adaptive_turns=GT+3 val_freq=${TRAIN_VAL_FREQ} save_freq=${TRAIN_SAVE_FREQ} save_limit=${TRAIN_SAVE_LIMIT}"
 echo "[V37-strict-winner] experiment=${V31_EXPERIMENT_NAME} save=${V31_SAVE_CHECKPOINT_PATH}"
 echo "[V37-strict-winner] preflight=${_V37_PREFLIGHT_JSON} manifest=${V37_RUN_MANIFEST}"

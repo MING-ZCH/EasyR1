@@ -32,6 +32,8 @@ def run_launcher(tmp_path: Path, **overrides: str) -> subprocess.CompletedProces
             "BOK_CORRECTNESS_TASK_WEIGHT",
             "BOK_STEP_WEIGHT",
             "BOK_WINNER_BOOST",
+            "KL_HORIZON",
+            "KL_HORIZON_UNIT",
             "PROCESS_REWARD_ENABLE",
             "TRAJ_STRICT_ANSWER_INTEGER_PARSE",
             "USE_KL_LOSS",
@@ -251,6 +253,9 @@ def test_arm_switch_expansion(tmp_path, arm, expected):
     assert expanded["torch_logprob_fallback_mode"] == "error"
     assert expanded["strict_answer_integer_parse"] == "1"
     assert expanded["strict_raw_success_winner"] == "1"
+    assert expanded["winner_mode"] == "outcome_success"
+    assert expanded["kl_horizon_unit"] == "executed_optimizer_updates"
+    assert expanded["kl"].endswith("/50")
     assert expanded["strict_point_parser_contract"] == "1"
     assert expanded["resume_mode"] == "clean_start"
 
@@ -263,6 +268,14 @@ def test_v37_strict_answer_parse_cannot_be_disabled(tmp_path):
     result = run_launcher(tmp_path, V37_RAW_SUCCESS_STRICT_WINNER="0")
     assert result.returncode != 0
     assert "V37_RAW_SUCCESS_STRICT_WINNER=1" in result.stderr
+
+    result = run_launcher(tmp_path, V37_WINNER_MODE="legacy_all_hit")
+    assert result.returncode != 0
+    assert "V37_WINNER_MODE=outcome_success" in result.stderr
+
+    result = run_launcher(tmp_path, KL_HORIZON="10000")
+    assert result.returncode != 0
+    assert "locked to 50 executed optimizer updates" in result.stderr
 
     result = run_launcher(tmp_path, V37_STRICT_POINT_PARSER_CONTRACT="0")
     assert result.returncode != 0

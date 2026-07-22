@@ -90,6 +90,23 @@ def test_adaptive_kl_controller_state_roundtrip_and_validation():
         AdaptiveKLController(0.1, 0.0, 10)
 
 
+def test_v37_horizon_50_bounds_each_executed_update_to_point_four_percent():
+    high = AdaptiveKLController(1.0, 0.15, 50, strict_nonnegative_kl=True)
+    high.update(0.30, 1)
+    low = AdaptiveKLController(1.0, 0.15, 50, strict_nonnegative_kl=True)
+    low.update(0.0, 1)
+
+    assert high.kl_coef == pytest.approx(1.004)
+    assert low.kl_coef == pytest.approx(0.996)
+
+
+def test_legacy_controller_checkpoint_contract_does_not_require_actor_horizon_unit():
+    legacy = AdaptiveKLController(0.08, 0.15, 10000, strict_nonnegative_kl=False)
+    state = legacy.state_dict()
+    assert "horizon_unit" not in state
+    AdaptiveKLController(0.01, 0.2, 5, strict_nonnegative_kl=False).load_state_dict(state)
+
+
 def test_legacy_reward_side_controller_accepts_signed_kl_but_actor_is_strict():
     legacy = AdaptiveKLController(0.1, 0.2, 100, strict_nonnegative_kl=False)
     legacy.update(-0.05, 1)
