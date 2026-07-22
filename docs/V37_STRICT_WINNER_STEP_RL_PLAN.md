@@ -102,7 +102,7 @@ BOK_ALLWRONG_TERMINAL_ZERO=1
 BOK_WINNER_BOOST=0
 ```
 
-mixed group 中 `raw_success=1` 的正确 winner 必须为正 advantage，错误轨迹必须为负；all-correct/all-wrong homogeneous group terminal advantage 为零。V37 的 strict `raw_success` 同时要求 exact answer、正常闭合、未超自适应 cap、无 duplicate 且完整通过 strict format。精确答案但 capped、duplicate、format 不完整或 invalid 的轨迹仍保留 `answer_correct=1` 和 shaped answer partial credit，但 `raw_success=0`，因此不会污染 correctness-first winner 集合。
+mixed group 中 `raw_success=1` 的正确 winner 必须为正 advantage，错误轨迹必须为负；all-correct/all-wrong homogeneous group terminal advantage 为零。V37 的 `outcome_success` strict winner 同时要求 exact terminal integer answer、正常闭合、未超自适应 cap、point/count_number 结构完整且无 trajectory hard reject。mask miss 或 duplicate 不再抹掉正确 answer outcome；它们进入独立的 `trusted_trajectory`/process diagnostics 和局部 credit。精确答案但 capped、format/count_number 不完整或 invalid 的轨迹仍保留 `answer_correct=1` 和 shaped answer partial credit，但不能进入 correctness-first winner 集合。`V37_WINNER_MODE=legacy_all_hit` 保留旧行为，仅用于 feature-off 回归；V37 pilot 锁定 `outcome_success`。
 
 V37 的 exact answer 只接受完整 signed integer，例如 `5`、`+5`、`005`；`5 or 6`、`5.0`、`5 objects` 不进入 `answer_correct/raw_success`。这是 winner 路由的严格化，不会把“答案确实正确但 point 较差”的 partial answer reward 清零。未经过 V37 wrapper 时仍使用 V36 的宽松 parser。
 
@@ -119,12 +119,13 @@ algorithm.kl_type=adaptive
 algorithm.kl_penalty=low_var_kl
 algorithm.kl_coef=0.08
 algorithm.kl_target=0.15
-algorithm.kl_horizon=10000
+algorithm.kl_horizon=50
+KL_HORIZON_UNIT=executed_optimizer_updates
 ```
 
 launcher 在每个 run 目录生成只属于 V37 的 `v37_config.yaml`，并显式打开 `algorithm.adaptive_actor_kl`；`USE_KL_LOSS=false` 仍通过 V32 命令下传。共享 `examples/config.yaml` 与 core 已修改，V36 兼容状态必须通过冻结 checkpoint/seed/data/environment 的差分回归确认，不能由默认值关闭推导为“行为不变”。
 
-这里不能按字面同时设置 `use_kl_loss=true`：当前 `ray_trainer.py` 明确拒绝 `adaptive_actor_kl && use_kl_loss`，因为前者已经在 actor loss 中加入由 adaptive controller 驱动的全局 response-token mean `low_var_kl`；后者是旧固定 actor KL 分支。adaptive 模式下 selector 只使用 task score，reward-side KL 不参与 winner 选择，beta 和 actor LR scheduler 都仅在至少一个 `optimizer.step()` 实际执行后推进；全跳过的 RPC 不会消耗 warmup/decay step，非法或缺失 update counter 会 fail closed。adaptive controller state 由 checkpoint 保存/恢复。若未来要把 `use_kl_loss=true` 作为同义选择器，必须先修改并验证核心契约，本 wrapper 不绕过校验。
+这里不能按字面同时设置 `use_kl_loss=true`：当前 `ray_trainer.py` 明确拒绝 `adaptive_actor_kl && use_kl_loss`，因为前者已经在 actor loss 中加入由 adaptive controller 驱动的全局 response-token mean `low_var_kl`；后者是旧固定 actor KL 分支。adaptive 模式下 selector 只使用 task score，reward-side KL 不参与 winner 选择，beta 和 actor LR scheduler 都仅在至少一个 `optimizer.step()` 实际执行后推进；全跳过的 RPC 不会消耗 warmup/decay step，非法或缺失 update counter 会 fail closed。controller 公式为 `beta *= 1 + clip(KL/target - 1, -0.2, 0.2) * executed_updates / horizon`；`horizon=50` 时每个实际 optimizer update 的 beta 最大变化为 0.4%，12-update formal A/B 的单向累计上界约 4.9%。adaptive controller state、`horizon_unit` 与 effective-update counter 由 checkpoint 保存/恢复。若未来要把 `use_kl_loss=true` 作为同义选择器，必须先修改并验证核心契约，本 wrapper 不绕过校验。
 
 核心目前也对 Ulysses sequence parallel `>1` fail closed。`V37_CP_SIZE` 保留为可插拔接口，但本轮只允许 1。默认是单机 8×H200、micro update/experience 4/8、rollout/global/val batch 128、vLLM blocks 20480、GPU memory utilization 0.50。CP>1 的精确 token 全局均值与多模态路径是下一轮验证项，不宣称已经支持。
 
