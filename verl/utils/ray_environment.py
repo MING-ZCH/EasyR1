@@ -15,6 +15,7 @@ RAY_WORKER_ENV_PREFIXES = (
 
 RAY_WORKER_ENV_KEYS = {
     "DISABLE_ADDMM_CUDA_LT",
+    "ACTION_EVENT_LEDGER_ENABLE",
     "ACTION_EVENT_REWARD_ENABLE",
     "GLOO_SOCKET_IFNAME",
     "HF_DATASETS_OFFLINE",
@@ -71,7 +72,7 @@ _V37_V36_SAFE_KEYS = {
     # and remains intentionally usable by V36 launchers.
     "V37_REQUIRE_EXACT_RAY_GPUS",
 }
-_V37_SEMANTIC_KEYS = {"ACTION_EVENT_REWARD_ENABLE"}
+_V37_SEMANTIC_KEYS = {"ACTION_EVENT_LEDGER_ENABLE", "ACTION_EVENT_REWARD_ENABLE"}
 
 
 def _has_v37_marker(values: Mapping[str, str]) -> bool:
@@ -183,6 +184,7 @@ def validate_v37_remote_environment(role: str) -> dict[str, str] | None:
         "V37_WINNER_MODE": "outcome_success",
         "V37_REWARD_FAIL_CLOSED": "1",
         "V37_STRICT_POINT_PARSER_CONTRACT": "1",
+        "ACTION_EVENT_LEDGER_ENABLE": "1",
         "ACTION_EVENT_REWARD_ENABLE": "1" if arm == "progress" else "0",
     }
     if run_class == "formal":
@@ -206,13 +208,10 @@ def validate_v37_remote_environment(role: str) -> dict[str, str] | None:
     for key, expected in required.items():
         if os.environ.get(key) != expected:
             raise RuntimeError(f"V37 {role} requires {key}={expected}.")
-    progress_contracts = ("V37_ACTION_PARSER_CONTRACT", "V37_ACTION_LEDGER_CONTRACT")
-    if arm == "progress":
-        for key in progress_contracts:
-            if os.environ.get(key) != "1":
-                raise RuntimeError(f"V37 progress {role} requires {key}=1.")
-    elif any(key in os.environ for key in progress_contracts):
-        raise RuntimeError(f"V37 baseline {role} must not inherit progress action contracts.")
+    shared_ledger_contracts = ("V37_ACTION_PARSER_CONTRACT", "V37_ACTION_LEDGER_CONTRACT")
+    for key in shared_ledger_contracts:
+        if os.environ.get(key) != "1":
+            raise RuntimeError(f"V37 {role} requires shared read-only ledger contract {key}=1.")
     if run_class == "formal" and os.environ.get("V37_AB_CELL_ID") != f"seed{seed}-{arm}":
         raise RuntimeError(f"V37 formal {role} A/B cell identity mismatch.")
     resume_mode = os.environ.get("V37_RESUME_MODE")

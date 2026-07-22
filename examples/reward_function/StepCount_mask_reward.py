@@ -2561,6 +2561,11 @@ def compute_score(
             action_event_mode = str(os.environ.get("ACTION_EVENT_REWARD_ENABLE", "0")).lower() in (
                 "1", "true", "yes"
             )
+            action_ledger_mode = str(os.environ.get("ACTION_EVENT_LEDGER_ENABLE", "0")).lower() in (
+                "1", "true", "yes"
+            )
+            if action_event_mode and not action_ledger_mode:
+                raise ValueError("ACTION_EVENT_REWARD_ENABLE requires ACTION_EVENT_LEDGER_ENABLE=1")
             strict_raw_success_winner = str(
                 os.environ.get("V37_RAW_SUCCESS_STRICT_WINNER", "0")
             ).lower() in ("1", "true", "yes")
@@ -2608,7 +2613,7 @@ def compute_score(
                 "1",
                 "true",
                 "yes",
-            ) or action_event_mode or strict_raw_success_winner
+            ) or action_ledger_mode or strict_raw_success_winner
 
             # For W&B/verl compatibility we only emit scalar floats.
             # `step_scores` are per-step contributions that (approximately) sum to `point_dense_score`.
@@ -2619,7 +2624,7 @@ def compute_score(
             point_eval_steps: float = 0.0
 
             point_dense_score = 0.0
-            if not turns_exceeded or action_event_mode:
+            if not turns_exceeded or action_ledger_mode:
                 # Special-case: GT expects zero points (answer==0). We should not force <point>.
                 # Give full point score iff the model also predicts zero points; otherwise 0.
                 if expected_steps == 0:
@@ -2665,7 +2670,7 @@ def compute_score(
                         )
 
             if (return_step_scores or strict_raw_success_winner) and (
-                not turns_exceeded or action_event_mode
+                not turns_exceeded or action_ledger_mode
             ) and expected_steps > 0:
                 if gt_data.get("point_sequence"):
                     try:
@@ -2770,7 +2775,7 @@ def compute_score(
                 or (hard_reject_count_number and point_count_number_violation)
                 or (strict_answer_point_consistency and (not answer_point_count_consistent))
             )
-            if action_event_mode:
+            if action_ledger_mode:
                 answer_events = [event for event in (action_events or []) if event.get("type") == "answer"]
                 unique_closed_answer = (
                     len(answer_events) == 1
@@ -3073,12 +3078,16 @@ def compute_score(
                     answer_score = 0.0
                     point_dense_score = 0.0
                 if turns_exceeded:
-                    if action_event_mode and answer_exact == 1.0:
+                    if answer_exact == 1.0:
                         partial_answer = clamp_reward(
                             float(os.environ.get("TRAJ_EXACT_ANSWER_PARTIAL_REWARD", "0.25"))
                         )
-                        answer_score = max(float(answer_score), partial_answer)
-                        overall_score = max(float(overall_score), answer_weight * partial_answer)
+                        # A correct terminal answer still receives limited answer
+                        # credit at the cap, but never keeps the pre-cap full score.
+                        # This rule is shared by bok_grpo and bok_grpo_step so the
+                        # A/B comparison changes only local action credit.
+                        answer_score = partial_answer
+                        overall_score = answer_weight * partial_answer
                     else:
                         overall_score = 0.0
                         answer_score = 0.0

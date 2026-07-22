@@ -19,6 +19,8 @@ def test_fixed_500_quota_contract():
     }
     assert sum(builder.QUOTAS.values()) == 500
     assert 1 <= builder.PARQUET_BATCH_SIZE <= 16
+    assert builder.MAX_JSON_BYTES <= 64 * 1024 * 1024
+    assert builder.MAX_SOURCE_ROWS == 1_000_000
 
 
 def test_large_row_groups_are_never_materialized_by_builder():
@@ -69,15 +71,41 @@ def test_write_selected_streams_and_normalizes_cross_source_schema_metadata(tmp_
     assert result.schema.metadata is None
 
 
-def test_focused_manifest_exclusion_uses_source_file_and_local_idx(tmp_path: Path):
+def test_focused_manifest_exclusion_binds_source_row_and_content_identity(tmp_path: Path):
+    source = tmp_path / "source"
+    data = source / "data"
+    data.mkdir(parents=True)
+    files = []
+    sequence_ids = []
+    for index, name in enumerate(("part-1.parquet", "part-2.parquet")):
+        payload = f"focused-{index}".encode()
+        sequence_id = hashlib.sha256(payload).hexdigest()
+        sequence_ids.append(sequence_id)
+        path = data / name
+        pq.write_table(pa.table({"answer": [11], "images": [[{"bytes": payload, "path": f"{sequence_id}.jpg"}]]}), path)
+        files.append(path.resolve())
     manifest = tmp_path / "selection_manifest.json"
-    manifest.write_text(json.dumps({"selected_indices": [
-        {"source_file": "nested/part-1.parquet", "local_idx": 7},
-        {"source_file": "part-2.parquet", "local_idx": 11},
+    manifest.write_text(json.dumps({
+        "source_dir": str(source),
+        "source_rows": 2,
+        "selected_indices": [
+        {"source_file": "part-1.parquet", "local_idx": 0, "sequence_id": sequence_ids[0]},
+        {"source_file": "part-2.parquet", "local_idx": 0, "sequence_id": sequence_ids[1]},
     ]}), encoding="utf-8")
-    assert builder.focused_exclusions(manifest) == {
-        ("part-1.parquet", 7), ("part-2.parquet", 11),
+    assert builder.focused_exclusions(manifest, source, files) == {
+        ("part-1.parquet", 0): sequence_ids[0],
+        ("part-2.parquet", 0): sequence_ids[1],
     }
+    assert builder.bind_focused_content(
+        builder.focused_exclusions(manifest, source, files), files,
+    ) == {
+        ("part-1.parquet", 0): sequence_ids[0],
+        ("part-2.parquet", 0): sequence_ids[1],
+    }
+    shas, stems = builder.focused_image_identity(
+        [{"bytes": b"focused-0", "path": f"{sequence_ids[0]}.jpg"}]
+    )
+    assert shas == stems == {sequence_ids[0]}
 
 
 def test_builder_rejects_existing_output(tmp_path: Path):

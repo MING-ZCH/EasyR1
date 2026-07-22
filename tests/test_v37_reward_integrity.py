@@ -9,6 +9,7 @@ from examples.reward_function import StepCount_mask_reward as reward
 @pytest.fixture(autouse=True)
 def _strict_reward_env(monkeypatch):
     names = (
+        "ACTION_EVENT_LEDGER_ENABLE",
         "ACTION_EVENT_REWARD_ENABLE",
         "STEPCOUNT_MASK_REQUIRE",
         "TRAJ_FORMAT_GRADED",
@@ -18,6 +19,7 @@ def _strict_reward_env(monkeypatch):
         "TRAJ_RETURN_POINT_STEP_SCORES",
         "TRAJ_STRICT_ANSWER_INTEGER_PARSE",
         "V37_ACTION_PARSER_CONTRACT",
+        "V37_ACTION_LEDGER_CONTRACT",
         "V37_RAW_SUCCESS_STRICT_WINNER",
         "V37_REWARD_FAIL_CLOSED",
         "V37_STRICT_POINT_PARSER_CONTRACT",
@@ -65,8 +67,10 @@ def _score(
         ),
     )
     if action_mode:
+        monkeypatch.setenv("ACTION_EVENT_LEDGER_ENABLE", "1")
         monkeypatch.setenv("ACTION_EVENT_REWARD_ENABLE", "1")
         monkeypatch.setenv("V37_ACTION_PARSER_CONTRACT", "1")
+        monkeypatch.setenv("V37_ACTION_LEDGER_CONTRACT", "1")
     return reward.compute_score(
         prediction,
         _gt(count),
@@ -164,6 +168,33 @@ def test_outcome_success_still_rejects_point_and_count_number_format(
     assert score["answer_correct"] == 1.0
     assert score["raw_success"] == 0.0
     assert score[violation] == 1.0
+
+
+def test_exact_answer_at_turn_cap_gets_same_limited_credit_in_both_arms(monkeypatch):
+    monkeypatch.setenv("V37_WINNER_MODE", "outcome_success")
+    monkeypatch.setenv("TRAJ_EXACT_ANSWER_PARTIAL_REWARD", "0.25")
+    monkeypatch.setenv("ACTION_EVENT_LEDGER_ENABLE", "1")
+    monkeypatch.setenv("V37_ACTION_PARSER_CONTRACT", "1")
+    monkeypatch.setenv("V37_ACTION_LEDGER_CONTRACT", "1")
+    prediction = '<point>{"point_2d":[10,10],"count_number":"1"}</point><answer>1</answer>'
+    monkeypatch.setattr(
+        reward,
+        "_strict_duplicate_evidence",
+        lambda **_: ([0.0], [1.0], True),
+    )
+    baseline = reward.compute_score(prediction, _gt(1), max_turns=1, action_events=_events(1))
+    monkeypatch.setenv("ACTION_EVENT_REWARD_ENABLE", "1")
+    progress = reward.compute_score(
+        prediction,
+        _gt(1),
+        max_turns=1,
+        action_events=_events(1),
+    )
+
+    assert baseline["turns_exceeded"] == progress["turns_exceeded"] == 1.0
+    assert baseline["raw_success"] == progress["raw_success"] == 0.0
+    assert baseline["answer"] == progress["answer"] == pytest.approx(0.25)
+    assert baseline["overall"] == progress["overall"] == pytest.approx(0.15)
 
 
 def test_legacy_all_hit_mode_remains_default_and_explicit(monkeypatch):

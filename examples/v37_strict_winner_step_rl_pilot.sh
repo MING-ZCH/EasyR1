@@ -287,6 +287,9 @@ if [[ -n "${V37_STRICT_POINT_PARSER_CONTRACT:-}" && "${V37_STRICT_POINT_PARSER_C
   _v37_error "V37 requires V37_STRICT_POINT_PARSER_CONTRACT=1 in both A/B arms"
 fi
 export V37_STRICT_POINT_PARSER_CONTRACT=1
+export ACTION_EVENT_LEDGER_ENABLE=1
+export V37_ACTION_PARSER_CONTRACT=1
+export V37_ACTION_LEDGER_CONTRACT=1
 case "${V37_ARM}" in
   baseline)
     export STEPCOUNT_RL_MODE=bok_grpo
@@ -294,14 +297,11 @@ case "${V37_ARM}" in
     export ACTION_EVENT_REWARD_ENABLE=0
     export BOK_STEP_WEIGHT=0
     unset BOK_STEP_SIGNAL BOK_STEP_GATE BOK_STEP_MIN_GATE
-    unset V37_ACTION_PARSER_CONTRACT V37_ACTION_LEDGER_CONTRACT
     ;;
   progress)
     export STEPCOUNT_RL_MODE=bok_grpo_step
     export ADV_ESTIMATOR=bok_grpo_step
     export ACTION_EVENT_REWARD_ENABLE=1
-    export V37_ACTION_PARSER_CONTRACT=1
-    export V37_ACTION_LEDGER_CONTRACT=1
     export BOK_STEP_SIGNAL=native_action_event
     export BOK_STEP_WEIGHT=${V37_STEP_WEIGHT:-0.1}
     export BOK_STEP_GATE=${V37_STEP_GATE:-answer_soft}
@@ -309,6 +309,10 @@ case "${V37_ARM}" in
     ;;
   *) _v37_error "V37_ARM must be explicit: baseline or progress" ;;
 esac
+[[ "${ACTION_EVENT_LEDGER_ENABLE}" == "1" \
+    && "${V37_ACTION_PARSER_CONTRACT}" == "1" \
+    && "${V37_ACTION_LEDGER_CONTRACT}" == "1" ]] \
+  || _v37_error "both arms require the shared read-only native action ledger"
 if _v37_is_true "${ACTION_EVENT_REWARD_ENABLE}"; then
   [[ "${ADV_ESTIMATOR}" == "bok_grpo_step" \
       && "${BOK_STEP_SIGNAL}" == "native_action_event" \
@@ -684,6 +688,7 @@ if _v37_is_true "${V37_CONTRACT_ONLY:-0}"; then
     "data_mode=${V37_DATA_MODE}" \
     "arm=${V37_ARM}" \
     "adv_estimator=${ADV_ESTIMATOR}" \
+    "action_event_ledger_enable=${ACTION_EVENT_LEDGER_ENABLE}" \
     "action_event_reward_enable=${ACTION_EVENT_REWARD_ENABLE}" \
     "action_parser_contract=${V37_ACTION_PARSER_CONTRACT:-0}" \
     "action_ledger_contract=${V37_ACTION_LEDGER_CONTRACT:-0}" \
@@ -1104,6 +1109,7 @@ export TRAJ_ANSWER_DECAY_ALPHA=8.0
 export TRAJ_ANSWER_DECAY_CAP=0.4
 export TRAJ_UNDER_ALPHA_GT_SCALE=0.5
 export TRAJ_UNDER_ALPHA_GT_THRESHOLD=5
+export TRAJ_EXACT_ANSWER_PARTIAL_REWARD=0.25
 
 export CLIP_RATIO_LOW=0.2
 export CLIP_RATIO_HIGH=0.28
@@ -1914,6 +1920,7 @@ manifest = {
     },
     "mechanisms": {
         "adv_estimator": os.environ["ADV_ESTIMATOR"],
+        "action_event_ledger_enable": os.environ["ACTION_EVENT_LEDGER_ENABLE"],
         "action_event_reward_enable": os.environ["ACTION_EVENT_REWARD_ENABLE"],
         "action_parser_contract": os.environ.get("V37_ACTION_PARSER_CONTRACT", "0"),
         "action_ledger_contract": os.environ.get("V37_ACTION_LEDGER_CONTRACT", "0"),
@@ -1932,12 +1939,8 @@ manifest = {
         "arm": os.environ["V37_ARM"],
         "estimator": os.environ["ADV_ESTIMATOR"],
         "native_action_enabled": os.environ["ACTION_EVENT_REWARD_ENABLE"] == "1",
-        "native_action_parser_contract": (
-            "native_action_parser_v1" if os.environ["ACTION_EVENT_REWARD_ENABLE"] == "1" else "disabled"
-        ),
-        "native_action_ledger_contract": (
-            "native_action_ledger_v2" if os.environ["ACTION_EVENT_REWARD_ENABLE"] == "1" else "disabled"
-        ),
+        "native_action_parser_contract": "native_action_parser_v1",
+        "native_action_ledger_contract": "native_action_ledger_v2",
         "legacy_process_reward_enabled": os.environ["PROCESS_REWARD_ENABLE"] == "1",
         "step_signal": os.environ.get("BOK_STEP_SIGNAL"),
         "step_weight": float(os.environ["BOK_STEP_WEIGHT"]),
@@ -2112,7 +2115,7 @@ temporary.replace(target)
 PY
 
 echo "================================================================"
-echo "[V37-strict-winner] class=${V37_RUN_CLASS} mode=${V37_DATA_MODE} arm=${V37_ARM} adv=${ADV_ESTIMATOR} native_action=${ACTION_EVENT_REWARD_ENABLE} legacy_process=${PROCESS_REWARD_ENABLE} step_weight=${BOK_STEP_WEIGHT}"
+echo "[V37-strict-winner] class=${V37_RUN_CLASS} mode=${V37_DATA_MODE} arm=${V37_ARM} adv=${ADV_ESTIMATOR} action_ledger=${ACTION_EVENT_LEDGER_ENABLE} native_action_reward=${ACTION_EVENT_REWARD_ENABLE} legacy_process=${PROCESS_REWARD_ENABLE} step_weight=${BOK_STEP_WEIGHT}"
 echo "[V37-strict-winner] resume_mode=${V37_RESUME_MODE} model=${MODEL_PATH} resume=${_V37_RESUME_CHECKPOINT:-<none>}"
 echo "[V37-strict-winner] data=${STEPCOUNT_TRAIN_DATA} focused10k_pilot=${_V37_FOCUSED_PILOT}"
 echo "[V37-strict-winner] val=${STEPCOUNT_VAL_DATA} benchmark_dev=${_V37_VAL_HAS_BENCHMARK}"

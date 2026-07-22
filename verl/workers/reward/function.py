@@ -145,9 +145,12 @@ class SequentialFunctionRewardManager(FunctionRewardManager):
         num_workers = int(os.environ.get("REWARD_NUM_WORKERS", "4"))
         batch_size = len(data)
         action_event_mode = os.environ.get("ACTION_EVENT_REWARD_ENABLE", "0").lower() in ("1", "true", "yes")
+        action_ledger_mode = os.environ.get("ACTION_EVENT_LEDGER_ENABLE", "0").lower() in ("1", "true", "yes")
+        if action_event_mode and not action_ledger_mode:
+            raise RuntimeError("ACTION_EVENT_REWARD_ENABLE requires ACTION_EVENT_LEDGER_ENABLE=1.")
         reward_fail_closed = os.environ.get("V37_REWARD_FAIL_CLOSED", "0").lower() in ("1", "true", "yes")
         action_ledger_rows = data.non_tensor_batch.get("action_event_ledger")
-        if action_event_mode and (action_ledger_rows is None or len(action_ledger_rows) != batch_size):
+        if action_ledger_mode and (action_ledger_rows is None or len(action_ledger_rows) != batch_size):
             if reward_fail_closed:
                 raise RuntimeError(
                     "V37 reward contract requires one action_event_ledger row per response."
@@ -188,7 +191,7 @@ class SequentialFunctionRewardManager(FunctionRewardManager):
             kwargs["is_eval"] = bool(getattr(data, "meta_info", {}).get("is_validation", False))
 
             validated_action_events = None
-            if action_event_mode:
+            if action_ledger_mode:
                 try:
                     validated_action_events = validate_action_event_row(
                         action_ledger_rows[i],
@@ -313,7 +316,7 @@ class SequentialFunctionRewardManager(FunctionRewardManager):
                         }
                     )
 
-            ledger_contract = action_ledger_rows[i] if action_event_mode else None
+            ledger_contract = action_ledger_rows[i] if action_ledger_mode else None
             return i, score, response_str, _has_images, _has_problem, validated_action_events, ledger_contract
 
         # Execute in parallel if num_workers > 1, otherwise sequential
@@ -406,6 +409,16 @@ class SequentialFunctionRewardManager(FunctionRewardManager):
                 if _value_channel_active:
                     reward_metrics["_point_step_value"].append(_step_values_at_positions)
 
+            if action_ledger_mode:
+                reward_metrics["action_ledger_invalid"].append(
+                    1.0 if score.get("_action_ledger_invalid", 0.0) else 0.0
+                )
+                reward_metrics["action_event_count"].append(float(len(action_events)))
+                for event_type in ("point", "answer", "cap", "abort"):
+                    reward_metrics[f"action_{event_type}_count"].append(
+                        float(sum(event.get("type") == event_type for event in action_events))
+                    )
+
             if action_event_mode:
                 action_values = score.get("_action_event_values", [])
                 try:
@@ -424,18 +437,11 @@ class SequentialFunctionRewardManager(FunctionRewardManager):
                 if score.get("_action_ledger_invalid", 0.0) or invalid_action_values:
                     if reward_fail_closed:
                         raise RuntimeError(f"Invalid V37 action ledger/value contract at row {i}.")
-                    reward_metrics["action_ledger_invalid"].append(1.0)
                     reward_metrics["_action_events"].append([])
                     reward_metrics["_action_event_values"].append([])
                 else:
                     reward_metrics["_action_events"].append(ledger_contract)
                     reward_metrics["_action_event_values"].append(normalized_action_values)
-                    reward_metrics["action_ledger_invalid"].append(0.0)
-                reward_metrics["action_event_count"].append(float(len(action_events)))
-                for event_type in ("point", "answer", "cap", "abort"):
-                    reward_metrics[f"action_{event_type}_count"].append(
-                        float(sum(event.get("type") == event_type for event in action_events))
-                    )
 
             reward_metrics["_selector_task_scores"].append(float(score["overall"]))
 
@@ -538,8 +544,11 @@ class BatchFunctionRewardManager(FunctionRewardManager):
     reward_fn: BatchRewardFunction
 
     def compute_reward(self, data: DataProto) -> Tuple[torch.Tensor, Dict[str, List[float]]]:
-        if os.environ.get("ACTION_EVENT_REWARD_ENABLE", "0").lower() in ("1", "true", "yes"):
-            raise RuntimeError("ACTION_EVENT_REWARD_ENABLE requires the sequential reward manager.")
+        if any(
+            os.environ.get(key, "0").lower() in ("1", "true", "yes")
+            for key in ("ACTION_EVENT_LEDGER_ENABLE", "ACTION_EVENT_REWARD_ENABLE")
+        ):
+            raise RuntimeError("ACTION_EVENT_LEDGER_ENABLE requires the sequential reward manager.")
         response_str, ground_truth = [], []
         response_ids = data.batch["responses"]
         response_length = data.batch["response_mask"].sum(dim=-1)

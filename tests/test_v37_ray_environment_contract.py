@@ -28,6 +28,7 @@ def test_v37_action_contract_is_forwarded_and_checked_in_remote_runner():
     source = SOURCE.read_text(encoding="utf-8")
     assert "ACTION_" not in RAY_WORKER_ENV_PREFIXES and "V37_" in RAY_WORKER_ENV_PREFIXES
     assert "ACTION_EVENT_REWARD_ENABLE" in RAY_WORKER_ENV_KEYS
+    assert "ACTION_EVENT_LEDGER_ENABLE" in RAY_WORKER_ENV_KEYS
     assert "collect_ray_worker_environment()" in source
     assert "_validate_v37_remote_environment()" in source
 
@@ -43,6 +44,9 @@ def test_v37_action_contract_is_forwarded_and_checked_in_remote_runner():
         "V37_WINNER_MODE": "outcome_success",
         "V37_REWARD_FAIL_CLOSED": "1",
         "V37_STRICT_POINT_PARSER_CONTRACT": "1",
+        "ACTION_EVENT_LEDGER_ENABLE": "1",
+        "V37_ACTION_PARSER_CONTRACT": "1",
+        "V37_ACTION_LEDGER_CONTRACT": "1",
         "HF_DATASETS_OFFLINE": "1",
         "HF_HUB_OFFLINE": "1",
         "TRANSFORMERS_OFFLINE": "1",
@@ -66,14 +70,14 @@ def test_v37_action_contract_is_forwarded_and_checked_in_remote_runner():
         "V37_SEED": "11",
         "V37_AB_CELL_ID": "seed11-progress",
         "ACTION_EVENT_REWARD_ENABLE": "1",
-        "V37_ACTION_PARSER_CONTRACT": "1",
-        "V37_ACTION_LEDGER_CONTRACT": "1",
     }
     with patch.dict(os.environ, baseline, clear=True):
         validate_v37_remote_environment("test")
         forwarded = collect_ray_worker_environment()
         assert forwarded["ACTION_EVENT_REWARD_ENABLE"] == "0"
-        assert "V37_ACTION_LEDGER_CONTRACT" not in forwarded
+        assert forwarded["ACTION_EVENT_LEDGER_ENABLE"] == "1"
+        assert forwarded["V37_ACTION_PARSER_CONTRACT"] == "1"
+        assert forwarded["V37_ACTION_LEDGER_CONTRACT"] == "1"
     with patch.dict(os.environ, progress, clear=True):
         validate_v37_remote_environment("test")
         forwarded = collect_ray_worker_environment()
@@ -95,6 +99,9 @@ def test_v37_remote_runner_rejects_cross_arm_environment_leakage():
         "V37_WINNER_MODE": "outcome_success",
         "V37_REWARD_FAIL_CLOSED": "1",
         "V37_STRICT_POINT_PARSER_CONTRACT": "1",
+        "ACTION_EVENT_LEDGER_ENABLE": "1",
+        "V37_ACTION_PARSER_CONTRACT": "1",
+        "V37_ACTION_LEDGER_CONTRACT": "1",
         "HF_DATASETS_OFFLINE": "1",
         "HF_HUB_OFFLINE": "1",
         "TRANSFORMERS_OFFLINE": "1",
@@ -116,20 +123,20 @@ def test_v37_remote_runner_rejects_cross_arm_environment_leakage():
         with pytest.raises(RuntimeError, match="ACTION_EVENT_REWARD_ENABLE=1"):
             validate_v37_remote_environment("test")
 
-    leaked_baseline = shared | {
+    valid_baseline = shared | {
         "V37_RUN_CLASS": "formal",
         "V37_ARM": "baseline",
         "V37_SEED": "22",
         "V37_AB_CELL_ID": "seed22-baseline",
         "ACTION_EVENT_REWARD_ENABLE": "0",
-        "V37_ACTION_PARSER_CONTRACT": "1",
     }
-    with patch.dict(os.environ, leaked_baseline, clear=True):
-        with pytest.raises(RuntimeError, match="must not inherit progress"):
+    missing_shared_ledger = dict(valid_baseline)
+    missing_shared_ledger.pop("V37_ACTION_LEDGER_CONTRACT")
+    with patch.dict(os.environ, missing_shared_ledger, clear=True):
+        with pytest.raises(RuntimeError, match="shared read-only ledger contract"):
             validate_v37_remote_environment("test")
 
-    missing_strict_parser = dict(leaked_baseline)
-    missing_strict_parser.pop("V37_ACTION_PARSER_CONTRACT")
+    missing_strict_parser = dict(valid_baseline)
     missing_strict_parser.pop("V37_STRICT_POINT_PARSER_CONTRACT")
     with patch.dict(os.environ, missing_strict_parser, clear=True):
         with pytest.raises(RuntimeError, match="V37_STRICT_POINT_PARSER_CONTRACT=1"):
@@ -142,6 +149,9 @@ def test_v37_controlled_continuation_binding_is_forwarded_and_fail_closed():
         "V37_ARM": "baseline",
         "V37_SEED": "11",
         "ACTION_EVENT_REWARD_ENABLE": "0",
+        "ACTION_EVENT_LEDGER_ENABLE": "1",
+        "V37_ACTION_PARSER_CONTRACT": "1",
+        "V37_ACTION_LEDGER_CONTRACT": "1",
         "BOK_CORRECTNESS_FIRST": "1",
         "BOK_ALLWRONG_TERMINAL_ZERO": "1",
         "BOK_CORRECTNESS_TASK_WEIGHT": "0.25",
@@ -210,6 +220,9 @@ def test_formal_offline_flags_and_sensitive_values_fail_closed():
         "V37_SEED": "11",
         "V37_AB_CELL_ID": "seed11-baseline",
         "ACTION_EVENT_REWARD_ENABLE": "0",
+        "ACTION_EVENT_LEDGER_ENABLE": "1",
+        "V37_ACTION_PARSER_CONTRACT": "1",
+        "V37_ACTION_LEDGER_CONTRACT": "1",
         "BOK_CORRECTNESS_FIRST": "1",
         "BOK_ALLWRONG_TERMINAL_ZERO": "1",
         "BOK_CORRECTNESS_TASK_WEIGHT": "0.25",
@@ -287,8 +300,9 @@ def test_v36_exact_ray_resource_flag_is_not_a_v37_identity_marker():
         assert validate_v37_remote_environment("test") is None
 
 
-def test_v36_rejects_stray_action_event_semantics():
-    source = {"ACTION_EVENT_REWARD_ENABLE": "1"}
+@pytest.mark.parametrize("key", ["ACTION_EVENT_LEDGER_ENABLE", "ACTION_EVENT_REWARD_ENABLE"])
+def test_v36_rejects_stray_action_event_semantics(key):
+    source = {key: "1"}
     with pytest.raises(RuntimeError, match="explicit valid V37_RUN_CLASS"):
         collect_ray_worker_environment(source)
     with patch.dict(os.environ, source, clear=True):

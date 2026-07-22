@@ -21,13 +21,15 @@ python3 tools/build_v37_diagnostic_heldout.py \
   --output-dir "$STEPCOUNT_V37_DIAGNOSTIC_VAL_DATA"
 ```
 
-builder 使用固定 `batch_size=8` 流式扫描 parquet，不会物化 0--10 数据中约 1.07GB 的单个 row-group；内存中只保留五个有界候选堆。它按 `2-10/11-20/21-30/31-40/41-50 = 200/50/100/100/50` 选 500 条，排除 focused selection manifest 中的 `(source_file, local_idx)`，并按可解析文件或 parquet 内嵌 image bytes 的 SHA256 排除 PixMo、StepCount-500、CountQA、bias、Dense、Extreme 六套 canonical benchmark。最终目录通过同一文件系统内的 rename 原子发布，已有输出一律失败。
+builder 使用固定 `batch_size=8` 流式扫描 parquet，不会物化 0--10 数据中约 1.07GB 的单个 row-group。它按 `2-10/11-20/21-30/31-40/41-50 = 200/50/100/100/50` 选 500 条，并同时执行两层 focused 隔离：先把 manifest 的 `(source_file, local_idx, sequence_id)` 绑定到源行声明路径，再从该权威行计算 image bytes SHA256；所有 source candidate 都按实际 bytes SHA256 排除。PixMo、StepCount-500、CountQA、bias、Dense、Extreme 六套 canonical benchmark 也按可解析文件或内嵌 image bytes SHA256 排除。JSON、source rows、benchmark rows、exact-key 集均有硬上限，最终目录通过同一文件系统内 rename 原子发布，已有输出一律失败。
 
 若既没有内嵌 image bytes 也无法解析图像路径、任一桶不足、benchmark 没有可核验图像、规范化后的源 schema 不一致或输出已存在，builder 会 fail closed。
 
+2026-07-23 本机已发布并独立流式复核 schema v2 实例：parquet SHA256 为 `0ddd211d4998c6188e3fb882c23bdc2b91c4bda7a574804dfd760ec49b4684fd`；500 条五桶分布与配额完全一致。focused 10,000 个 source/path identity 绑定到 9,999 个唯一 image bytes（1 个内容重复），另有 8 条跨 source 内容重复被排除；六套 benchmark 共核验 6,212 行、17,579 个 exact keys。最终 selected 与 focused image bytes、六套 benchmark 的交集均为 0。该 SHA 只绑定当前开发机发布物；同步到其他集群后仍必须由 launcher 现场重哈希，不能手工抄写后跳过 preflight。
+
 ## 2. 启动前检查
 
-必须独占 8 张 H200：每卡 `memory.total >= 139000 MiB`、`memory.used <= 5120 MiB`、MIG 为 Disabled，且没有 compute process。launcher 会自动执行这些检查；不满足时不要绕过。
+必须独占 8 张 H200：每卡 `memory.total >= 139000 MiB`、`memory.used <= 5120 MiB`、MIG 为 Disabled，且没有 compute process。launcher 持有 host-wide GPU 0--7 `flock`，并在每个 cell 前重查；不满足时不要绕过。
 
 确认使用 GNU coreutils `timeout`，并选择一个全新的输出目录：
 
@@ -55,20 +57,21 @@ echo $! | tee "${LOG}.pid"
 printf 'PID=%s\nLOG=%s\nROOT=%s\n' "$!" "$LOG" "$RUN_ROOT"
 ```
 
-heldout 缺失时 launcher 会停止并打印完整 builder 命令。launcher 还会复核 manifest、parquet SHA256、固定五桶分布以及六套 benchmark hash universe。不要把 `STEPCOUNT_V37_DIAGNOSTIC_VAL_DATA` 指向任何 benchmark，也不要复用 `STEPCOUNT_VAL_DATA`。
+heldout 缺失时 launcher 会停止并打印完整 builder 命令。launcher 会现场重哈希 heldout parquet、两套 source parquet、focused manifest 和六套 benchmark，并复核 schema v2、固定五桶、10,000 个 focused source/path 绑定，以及去重后的 bytes SHA 数与重复数守恒。任一输入在构建后变化都会在占用 run 目录前失败。不要把 `STEPCOUNT_V37_DIAGNOSTIC_VAL_DATA` 指向任何 benchmark，也不要复用 `STEPCOUNT_VAL_DATA`。
 
 ## 3. 固定资源和时间预算
 
 - 资源：micro update 4、micro experience 8、vLLM blocks 20480、GPU memory utilization 0.50、max batched tokens 49152、CP 1。
 - update micro 8 被明确拒绝。pilot 的可插拔入口是 `V37_MICRO_BATCH_UPDATE`、`V37_MICRO_BATCH_EXP`、`V37_VLLM_NUM_GPU_BLOCKS`、`V37_GPU_MEM_UTIL`、`V37_MAX_NUM_BATCHED_TOKENS`；旧 `V31_*` 与它们冲突时直接失败。
 - formal 始终锁定上述保守值；`V37_ALLOW_INDEPENDENT_VAL_OUTSIDE_TRAIN_RANGE=1` 只允许 debug，canary/formal 拒绝。
-- 全局 deadline 使用 monotonic clock，固定 55,800 秒（15.5 小时）。baseline cell 的 P90/timeout 为 12,600 秒，progress 为 13,500 秒。开始下一个 cell 前，若余额小于该 cell 的完整 P90，立即停止。
+- 全局 deadline 使用 monotonic clock 和独立 watchdog，固定 55,800 秒（15.5 小时）。baseline cell 的 P90/timeout 为 12,600 秒，progress 为 13,500 秒；另保留 300 秒 finalization reserve。开始下一个 cell 前，若余额小于 `cell P90 + reserve`，立即停止。
+- 每个 cell 使用 `env -i` 最小 allowlist；ambient `ACTOR_LR`、`ROLLOUT_N`、batch/reward/GradSpike、Ray、resume 和 dry-run 控制不会穿透。两臂均启用同一个 read-only native action ledger，只有 progress 把 action values 映射为 step reward。
 
 ## 4. 停止规则和清理
 
 任一 cell 出现以下情况都会停止剩余序列：OOM、nonfinite/NaN/Inf、Python Traceback、任何 `GradSpike ... skip`、GNU timeout/非零退出、缺少 `global_step_3`，或 `ray stop --force` 后 900 秒内 GPU 仍未回到空闲阈值。
 
-每个 cell 后以及 EXIT/INT/TERM trap 都执行 `ray stop --force`。清理逻辑不会删除任何 checkpoint；需要人工清理时先保存 `status.json`、日志和路径记录。
+每个 cell 在独立 process group 中运行；日志由 FIFO/`tee` 捕获。EXIT/INT/TERM 会按 TERM→短等待→KILL 回收整个 group 和 `tee`，`ray stop --force` 与 `nvidia-smi` 自身也有 timeout。清理逻辑不会删除任何 checkpoint；需要人工清理时先保存 `status.json`、日志和路径记录。
 
 ## 5. 产物解释
 

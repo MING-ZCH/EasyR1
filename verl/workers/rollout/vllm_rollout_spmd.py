@@ -989,13 +989,20 @@ class vLLMRollout(BaseRollout):
         point_close_token_ids = self.tokenizer.encode(point_close_tag, add_special_tokens=False)
         answer_close_token_ids = self.tokenizer.encode(stop_tag, add_special_tokens=False) if stop_tag else []
         answer_open_token_ids = self.tokenizer.encode(answer_open_tag, add_special_tokens=False)
-        action_event_mode = os.environ.get("ACTION_EVENT_REWARD_ENABLE", "0").lower() in ("1", "true", "yes")
+        action_event_reward_mode = os.environ.get("ACTION_EVENT_REWARD_ENABLE", "0").lower() in (
+            "1", "true", "yes"
+        )
+        action_event_ledger_mode = os.environ.get("ACTION_EVENT_LEDGER_ENABLE", "0").lower() in (
+            "1", "true", "yes"
+        )
+        if action_event_reward_mode and not action_event_ledger_mode:
+            raise ValueError("ACTION_EVENT_REWARD_ENABLE requires ACTION_EVENT_LEDGER_ENABLE=1.")
         strict_action_scheduler = os.environ.get(
             "V37_STRICT_POINT_PARSER_CONTRACT", "0"
         ).lower() in ("1", "true", "yes")
-        if action_event_mode and not strict_action_scheduler:
+        if action_event_ledger_mode and not strict_action_scheduler:
             raise ValueError(
-                "ACTION_EVENT_REWARD_ENABLE requires V37_STRICT_POINT_PARSER_CONTRACT=1."
+                "ACTION_EVENT_LEDGER_ENABLE requires V37_STRICT_POINT_PARSER_CONTRACT=1."
             )
         canonical_action_stops = list(canonical_interleaved_stop_sequences())
         if strict_action_scheduler:
@@ -1709,7 +1716,7 @@ class vLLMRollout(BaseRollout):
                     step_info=step_info,
                 )
                 response_ids = response_ids.to(input_ids.device)
-                if os.environ.get("ACTION_EVENT_REWARD_ENABLE", "0").lower() in ("1", "true", "yes"):
+                if os.environ.get("ACTION_EVENT_LEDGER_ENABLE", "0").lower() in ("1", "true", "yes"):
                     non_tensor_batch["action_event_ledger"] = action_event_ledger
             else:
                 completions: List[RequestOutput] = []

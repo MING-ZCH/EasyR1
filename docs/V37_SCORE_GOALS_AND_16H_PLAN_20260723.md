@@ -67,7 +67,7 @@ Dense/Extreme leaderboard 混合了不同模型、prompt 和推理协议，因�
 ### 3.2 V37 必须修复的机制
 
 1. `outcome_success` 只回答“最终答案与轨迹结构是否可作为正确 winner”；mask miss/duplicate 进入 `trusted_trajectory` 和 process credit，不抹掉正确 answer reward。
-2. baseline/progress 只改变 native action-level credit：baseline=`bok_grpo`，progress=`bok_grpo_step`；两臂共享数据、seed、outcome、KL、LR 和 scheduler。
+2. baseline/progress 只改变 native action-level credit：两臂共享严格 action parser、token-bound read-only ledger、`cap/abort/answer` 终止观测、数据、seed、outcome、KL、LR 和 scheduler；baseline=`bok_grpo` 且不导出 action values，progress=`bok_grpo_step` 并消费局部 action credit。
 3. adaptive actor KL 使用 valid response token 的全局均值，只进入 actor loss，不进入 BoK selector。
 4. GT+3、首 action tag stop、strict integer answer 和 count_number 连续性必须保持 fail-closed。
 5. OOM、nonfinite 或 skipped optimizer update 都使当前 cell 无效，不能把 attempted step 当 effective update。
@@ -131,7 +131,7 @@ rollout_n=16
 
 - 四个 cell 全部完成预注册 effective updates；
 - OOM、validation fallback、nonfinite、GradSpike skip 均为 0；
-- baseline/progress 的唯一差异是 native action-level credit；
+- 两臂 parser/ledger/终止诊断逐项一致，唯一训练差异是 progress 的 native action-level credit；
 - 两个 seed 中 progress 的 exact-answer/五桶 macro 均不低于 baseline；
 - progress 的 unique valid hit 提高，duplicate、format fail、cap/early-stop 不恶化；
 - selector KL contribution=0，adaptive beta 有限、可恢复且变化方向正确；

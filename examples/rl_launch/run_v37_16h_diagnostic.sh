@@ -19,13 +19,15 @@ NVIDIA_SMI_BIN="${V37_DIAGNOSTIC_NVIDIA_SMI:-nvidia-smi}"
 RAY_BIN="${V37_DIAGNOSTIC_RAY_BIN:-ray}"
 TIMEOUT_BIN="${V37_DIAGNOSTIC_TIMEOUT_BIN:-timeout}"
 WRAPPER="${V37_DIAGNOSTIC_SINGLE_RUN_WRAPPER:-${REPO_DIR}/examples/v37_strict_winner_step_rl_pilot.sh}"
-for _diag_command in "${PYTHON_BIN}" "${TIMEOUT_BIN}"; do
+for _diag_command in "${PYTHON_BIN}" "${TIMEOUT_BIN}" flock setsid; do
   command -v "${_diag_command}" >/dev/null 2>&1 || _diag_error "缺少命令: ${_diag_command}"
 done
 "${TIMEOUT_BIN}" --version 2>/dev/null | head -n 1 | grep -q 'GNU coreutils' \
   || _diag_error "每 cell 必须使用 GNU coreutils timeout"
 [[ -f "${WRAPPER}" && -x "${WRAPPER}" && ! -L "${WRAPPER}" ]] \
   || _diag_error "单 cell wrapper 必须是可执行非软链接文件: ${WRAPPER}"
+exec 9>"${V37_DIAGNOSTIC_GPU_LOCK:-/tmp/easyr1-v37-h200-gpu0-7.lock}"
+flock -n 9 || _diag_error "GPU 0-7 已被另一个 V37 diagnostic launcher 占用"
 
 [[ -n "${V37_DIAGNOSTIC_ROOT:-}" ]] || _diag_error "必须设置 V37_DIAGNOSTIC_ROOT"
 DIAGNOSTIC_ROOT="$(${PYTHON_BIN} - "${V37_DIAGNOSTIC_ROOT}" <<'PY'
@@ -33,6 +35,8 @@ import os, sys
 print(os.path.abspath(os.path.expanduser(sys.argv[1])))
 PY
 )"
+[[ "${DIAGNOSTIC_ROOT}" =~ ^/[A-Za-z0-9_./-]+$ ]] \
+  || _diag_error "V37_DIAGNOSTIC_ROOT 仅允许绝对 ASCII 路径字符 [A-Za-z0-9_./-]"
 [[ ! -e "${DIAGNOSTIC_ROOT}" && ! -L "${DIAGNOSTIC_ROOT}" ]] \
   || _diag_error "拒绝覆盖已有诊断目录: ${DIAGNOSTIC_ROOT}"
 
@@ -61,6 +65,9 @@ fi
 VAL_REAL="$(readlink -f -- "${VAL_DATA}")"
 VAL_PARQUET="${VAL_REAL}/diagnostic_heldout.parquet"
 VAL_MANIFEST="${VAL_REAL}/selection_manifest.json"
+FOCUSED_MANIFEST="${STEPCOUNT_DENSE_11_30_FOCUSED10K_DATA}/selection_manifest.json"
+SOURCE_0_10="${STEPCOUNT_REPLAY_DATA}"
+SOURCE_11_50="${STEPCOUNT_DENSE_11_50_MASKCOMPLETE_DATA}"
 [[ -f "${VAL_PARQUET}" && ! -L "${VAL_PARQUET}" ]] \
   || _diag_error "diagnostic heldout 缺少 regular diagnostic_heldout.parquet"
 [[ -f "${VAL_MANIFEST}" && ! -L "${VAL_MANIFEST}" ]] \
@@ -79,7 +86,9 @@ for _diag_benchmark in "${BENCHMARKS[@]}"; do
       || _diag_error "diagnostic val 与 benchmark 路径重叠: ${_diag_benchmark}"
   fi
 done
-"${PYTHON_BIN}" - "${VAL_MANIFEST}" "${VAL_PARQUET}" "${BENCHMARKS[@]}" <<'PY' \
+"${TIMEOUT_BIN}" --signal=TERM --kill-after=30 600 "${PYTHON_BIN}" - \
+  "${VAL_MANIFEST}" "${VAL_PARQUET}" "${FOCUSED_MANIFEST}" \
+  "${SOURCE_0_10}" "${SOURCE_11_50}" "${BENCHMARKS[@]}" <<'PY' \
   || _diag_error "diagnostic heldout manifest 完整性或六套 benchmark 隔离绑定失败"
 import hashlib
 import json
@@ -88,13 +97,42 @@ import re
 import sys
 from pathlib import Path
 
-manifest_path, parquet_path = map(Path, sys.argv[1:3])
-expected_benchmarks = {str(Path(item).resolve()) for item in sys.argv[3:]}
-if len(sys.argv[3:]) != 6 or len(expected_benchmarks) != 6:
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def sha256_path(path):
+    if path.is_file():
+        return sha256_file(path)
+    if not path.is_dir():
+        raise SystemExit(f"benchmark input is missing: {path}")
+    files = sorted(item for item in path.rglob("*") if item.is_file())
+    if not files:
+        raise SystemExit(f"benchmark input is empty: {path}")
+    entries = [
+        {
+            "path": item.relative_to(path).as_posix(),
+            "size": item.stat().st_size,
+            "sha256": sha256_file(item),
+        }
+        for item in files
+    ]
+    encoded = json.dumps(entries, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+manifest_path, parquet_path, focused_path = map(Path, sys.argv[1:4])
+source_paths = [Path(item).resolve() for item in sys.argv[4:6]]
+expected_benchmarks = {str(Path(item).resolve()) for item in sys.argv[6:]}
+if len(sys.argv[6:]) != 6 or len(expected_benchmarks) != 6:
     raise SystemExit("launcher requires six distinct canonical benchmarks")
 payload = json.loads(manifest_path.read_text(encoding="utf-8"))
 expected_quotas = {"2-10": 200, "11-20": 50, "21-30": 100, "31-40": 100, "41-50": 50}
-if payload.get("schema_version") != 1 or payload.get("dataset_kind") != "v37_nonbenchmark_diagnostic_heldout":
+if payload.get("schema_version") != 2 or payload.get("dataset_kind") != "v37_nonbenchmark_diagnostic_heldout":
     raise SystemExit("wrong heldout schema/kind")
 if payload.get("promotable") is not False or payload.get("benchmark_overlap_selected") != 0:
     raise SystemExit("heldout promotion/overlap contract is invalid")
@@ -113,8 +151,52 @@ if not isinstance(hashes, dict) or set(hashes) != expected_benchmarks:
     raise SystemExit("heldout benchmark hash universe differs")
 if any(not isinstance(value, str) or re.fullmatch(r"[0-9a-f]{64}", value) is None for value in hashes.values()):
     raise SystemExit("heldout benchmark hash is invalid")
-if re.fullmatch(r"[0-9a-f]{64}", str(payload.get("benchmark_exact_keys_sha256", ""))) is None:
-    raise SystemExit("heldout benchmark exact-key digest is invalid")
+current_hashes = {str(Path(item).resolve()): sha256_path(Path(item).resolve()) for item in sys.argv[6:]}
+if hashes != current_hashes:
+    raise SystemExit("canonical benchmark content changed after heldout construction")
+if payload.get("focused_selection_manifest") != str(focused_path.resolve()):
+    raise SystemExit("heldout focused manifest path binding differs")
+if payload.get("focused_selection_manifest_sha256") != sha256_file(focused_path.resolve()):
+    raise SystemExit("focused selection manifest changed after heldout construction")
+if payload.get("source_paths") != [str(path) for path in source_paths]:
+    raise SystemExit("heldout source path binding differs")
+
+
+def source_parquet_files(path):
+    if path.is_file() and path.suffix == ".parquet":
+        return [path]
+    files = sorted((path / "data").glob("*.parquet")) if path.is_dir() else []
+    if not files and path.is_dir():
+        files = sorted(path.glob("*.parquet"))
+    if not files:
+        raise SystemExit(f"heldout source parquet is missing: {path}")
+    return files
+
+
+current_source_hashes = {
+    str(item.resolve()): sha256_file(item.resolve())
+    for source in source_paths
+    for item in source_parquet_files(source)
+}
+if payload.get("source_parquet_sha256") != current_source_hashes:
+    raise SystemExit("heldout source parquet changed after heldout construction")
+for field in (
+    "focused_sequence_keys_sha256", "focused_exact_keys_sha256", "benchmark_exact_keys_sha256",
+):
+    if re.fullmatch(r"[0-9a-f]{64}", str(payload.get(field, ""))) is None:
+        raise SystemExit(f"heldout {field} is invalid")
+focused_exact_count = payload.get("focused_exact_key_count")
+focused_duplicate_count = payload.get("focused_exact_duplicate_count")
+if (
+    payload.get("focused_sequence_key_count") != 10_000
+    or isinstance(focused_exact_count, bool)
+    or not isinstance(focused_exact_count, int)
+    or not 0 < focused_exact_count <= 10_000
+    or isinstance(focused_duplicate_count, bool)
+    or not isinstance(focused_duplicate_count, int)
+    or focused_duplicate_count != 10_000 - focused_exact_count
+):
+    raise SystemExit("heldout focused exclusion key count is invalid")
 digest = hashlib.sha256()
 with parquet_path.open("rb") as handle:
     for chunk in iter(lambda: handle.read(1024 * 1024), b""):
@@ -135,10 +217,14 @@ mkdir -- "${DIAGNOSTIC_ROOT}" || _diag_error "无法原子占用诊断目录"
 mkdir -- "${DIAGNOSTIC_ROOT}/logs"
 
 readonly GLOBAL_BUDGET_SECONDS=55800  # 15.5h
+readonly GLOBAL_FINALIZE_RESERVE_SECONDS=300
 readonly BASELINE_P90_SECONDS=12600
 readonly PROGRESS_P90_SECONDS=13500
 readonly GPU_IDLE_WAIT_SECONDS=900
 readonly GPU_IDLE_POLL_SECONDS=10
+readonly NVIDIA_SMI_TIMEOUT_SECONDS=20
+readonly RAY_STOP_TIMEOUT_SECONDS=30
+readonly LOG_DRAIN_TIMEOUT_SECONDS=30
 CELL_IDS=(seed11-baseline seed11-progress seed22-progress seed22-baseline)
 CELL_SEEDS=(11 11 22 22)
 CELL_ARMS=(baseline progress progress baseline)
@@ -237,10 +323,14 @@ fixed = {"V37_RUN_CLASS": "debug", "V37_DATA_MODE": "frontier_rl",
          "V37_RUN_PURPOSE": "debug_mechanism", "V37_CONTINUATION_MODE": "0",
          "V37_ALLOW_FOCUSED10K_PILOT": "1", "V37_ALLOW_BENCHMARK_DEV": "0",
          "V37_ALLOW_INDEPENDENT_VAL_OUTSIDE_TRAIN_RANGE": "1",
-         "V37_PILOT_STEPS": "3", "V37_MICRO_BATCH_UPDATE": "4",
+         "V37_PILOT_STEPS": "3", "V37_STEP_WEIGHT": "0.1",
+         "V37_STEP_GATE": "answer_soft", "V37_STEP_MIN_GATE": "0.2",
+         "V37_MICRO_BATCH_UPDATE": "4",
          "V37_MICRO_BATCH_EXP": "8", "V37_VLLM_NUM_GPU_BLOCKS": "20480",
          "V37_GPU_MEM_UTIL": "0.50", "V37_MAX_NUM_BATCHED_TOKENS": "49152",
-         "V37_CP_SIZE": "1", "WANDB_MODE": "offline",
+         "V37_CP_SIZE": "1", "V31_NNODES": "1", "V31_N_GPUS_PER_NODE": "8",
+         "HOST_NUM": "1", "HOST_GPU_NUM": "8", "INDEX": "0",
+         "CUDA_VISIBLE_DEVICES": "0,1,2,3,4,5,6,7", "WANDB_MODE": "offline",
          "STEPCOUNT_V37_VAL_DATA": os.environ["_V37_DIAG_VAL"]}
 payload = {"schema_version": 1, "kind": "v37_16h_diagnostic_commands",
            "promotable": False, "global_deadline_seconds": 55800,
@@ -266,11 +356,13 @@ _diag_gpu_idle() {
   local gpu_csv process_csv
   gpu_csv="$(mktemp "${TMPDIR:-/tmp}/v37-diag-gpu.XXXXXX")"
   process_csv="$(mktemp "${TMPDIR:-/tmp}/v37-diag-proc.XXXXXX")"
-  if ! "${NVIDIA_SMI_BIN}" --query-gpu=index,name,memory.total,memory.used,mig.mode.current \
+  if ! "${TIMEOUT_BIN}" --signal=KILL "${NVIDIA_SMI_TIMEOUT_SECONDS}" \
+      "${NVIDIA_SMI_BIN}" --query-gpu=index,name,memory.total,memory.used,mig.mode.current \
       --format=csv,noheader,nounits >"${gpu_csv}"; then
     rm -f -- "${gpu_csv}" "${process_csv}"; return 1
   fi
-  if ! "${NVIDIA_SMI_BIN}" --query-compute-apps=pid --format=csv,noheader,nounits >"${process_csv}"; then
+  if ! "${TIMEOUT_BIN}" --signal=KILL "${NVIDIA_SMI_TIMEOUT_SECONDS}" \
+      "${NVIDIA_SMI_BIN}" --query-compute-apps=pid --format=csv,noheader,nounits >"${process_csv}"; then
     rm -f -- "${gpu_csv}" "${process_csv}"; return 1
   fi
   "${PYTHON_BIN}" - "${gpu_csv}" "${process_csv}" <<'PY'
@@ -299,9 +391,19 @@ PY
   return "${rc}"
 }
 
+_diag_ray_stop_bounded() {
+  "${TIMEOUT_BIN}" --signal=TERM --kill-after=5 "${RAY_STOP_TIMEOUT_SECONDS}" \
+    "${RAY_BIN}" stop --force >/dev/null 2>&1 || true
+}
+
 _diag_ray_stop_and_wait() {
-  "${RAY_BIN}" stop --force >/dev/null 2>&1 || true
-  local stop_deadline=$(($(_diag_monotonic) + GPU_IDLE_WAIT_SECONDS))
+  _diag_ray_stop_bounded
+  local now stop_deadline
+  now="$(_diag_monotonic)"
+  stop_deadline=$((now + GPU_IDLE_WAIT_SECONDS))
+  if (( stop_deadline > DEADLINE_MONOTONIC - GLOBAL_FINALIZE_RESERVE_SECONDS )); then
+    stop_deadline=$((DEADLINE_MONOTONIC - GLOBAL_FINALIZE_RESERVE_SECONDS))
+  fi
   while (( $(_diag_monotonic) <= stop_deadline )); do
     if _diag_gpu_idle >/dev/null 2>&1; then return 0; fi
     sleep "${GPU_IDLE_POLL_SECONDS}"
@@ -309,13 +411,61 @@ _diag_ray_stop_and_wait() {
   return 1
 }
 
+_diag_log_has_nonfinite() {
+  "${PYTHON_BIN}" - "$1" <<'PY'
+import re
+import sys
+
+metric = re.compile(
+    r"(?:actor/)?non[-_ ]?finite(?:_grad)?_count\s*[:=]\s*([-+]?\d+(?:\.\d+)?)",
+    re.IGNORECASE,
+)
+agreement = re.compile(
+    r"(?:actor/)?non[-_ ]?finite_counter_agreement\s*[:=]\s*[-+]?\d+(?:\.\d+)?",
+    re.IGNORECASE,
+)
+scalar = re.compile(r"(?<![A-Za-z0-9_])(?:nan|[-+]?inf(?:inity)?)(?![A-Za-z0-9_])", re.IGNORECASE)
+with open(sys.argv[1], "r", encoding="utf-8", errors="replace") as handle:
+    for line in handle:
+        counts = [float(value) for value in metric.findall(line)]
+        if any(value > 0 for value in counts):
+            raise SystemExit(0)
+        scrubbed = agreement.sub("", metric.sub("", line))
+        if re.search(r"non[-_ ]?finite", scrubbed, re.IGNORECASE) or scalar.search(scrubbed):
+            raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
 ACTIVE_LOG_TMP=""
 ACTIVE_LOG_FINAL=""
+ACTIVE_FIFO=""
+ACTIVE_CHILD_PID=""
+ACTIVE_TEE_PID=""
+WATCHDOG_PID=""
 FINISHED=0
 _diag_on_exit() {
   local rc=$?
   trap - EXIT
-  "${RAY_BIN}" stop --force >/dev/null 2>&1 || true
+  if [[ -n "${WATCHDOG_PID:-}" ]]; then
+    kill "${WATCHDOG_PID}" 2>/dev/null || true
+    wait "${WATCHDOG_PID}" 2>/dev/null || true
+  fi
+  if [[ -n "${ACTIVE_CHILD_PID:-}" ]]; then
+    kill -TERM -- "-${ACTIVE_CHILD_PID}" 2>/dev/null || true
+    for _diag_wait in 1 2 3 4 5; do
+      kill -0 -- "-${ACTIVE_CHILD_PID}" 2>/dev/null || break
+      sleep 1
+    done
+    kill -KILL -- "-${ACTIVE_CHILD_PID}" 2>/dev/null || true
+    wait "${ACTIVE_CHILD_PID}" 2>/dev/null || true
+  fi
+  if [[ -n "${ACTIVE_TEE_PID:-}" ]]; then
+    kill "${ACTIVE_TEE_PID}" 2>/dev/null || true
+    wait "${ACTIVE_TEE_PID}" 2>/dev/null || true
+  fi
+  [[ -z "${ACTIVE_FIFO:-}" ]] || rm -f -- "${ACTIVE_FIFO}"
+  _diag_ray_stop_bounded
   if [[ -n "${ACTIVE_LOG_TMP}" && -f "${ACTIVE_LOG_TMP}" ]]; then
     mv -f -- "${ACTIVE_LOG_TMP}" "${ACTIVE_LOG_FINAL}.interrupted"
   fi
@@ -329,6 +479,23 @@ trap _diag_on_exit EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
+MAIN_PID="${BASHPID}"
+WATCHDOG_SECONDS=$((DEADLINE_MONOTONIC - $(_diag_monotonic)))
+(( WATCHDOG_SECONDS > 0 )) || _diag_error "preflight 已耗尽全局 15.5h budget"
+"${PYTHON_BIN}" - "${WATCHDOG_SECONDS}" "${MAIN_PID}" <<'PY' >/dev/null 2>&1 &
+import os
+import signal
+import sys
+import time
+
+time.sleep(int(sys.argv[1]))
+try:
+    os.kill(int(sys.argv[2]), signal.SIGTERM)
+except ProcessLookupError:
+    pass
+PY
+WATCHDOG_PID=$!
+
 _diag_gpu_idle || _diag_error "启动前 8×H200/MIG/显存/compute-process 检查失败"
 
 FINAL_STATE=completed
@@ -340,9 +507,10 @@ for _diag_index in 0 1 2 3; do
   if [[ "${arm}" == baseline ]]; then cell_budget="${BASELINE_P90_SECONDS}"; else cell_budget="${PROGRESS_P90_SECONDS}"; fi
   cell_start="$(_diag_monotonic)"
   remaining=$((DEADLINE_MONOTONIC - cell_start))
-  if (( remaining < cell_budget )); then
+  required=$((cell_budget + GLOBAL_FINALIZE_RESERVE_SECONDS))
+  if (( remaining < required )); then
     FINAL_STATE=stopped
-    FINAL_REASON="remaining_${remaining}s_below_${cell_id}_p90_${cell_budget}s"
+    FINAL_REASON="remaining_${remaining}s_below_${cell_id}_required_${required}s"
     break
   fi
   target_dir="${DIAGNOSTIC_ROOT}/${cell_id}"
@@ -350,28 +518,65 @@ for _diag_index in 0 1 2 3; do
   log_final="${DIAGNOSTIC_ROOT}/logs/${cell_id}.log"
   log_tmp="${DIAGNOSTIC_ROOT}/logs/.${cell_id}.log.tmp.$$"
   ACTIVE_LOG_TMP="${log_tmp}"; ACTIVE_LOG_FINAL="${log_final}"
+  ACTIVE_FIFO="${DIAGNOSTIC_ROOT}/logs/.${cell_id}.fifo.$$"
+  mkfifo -- "${ACTIVE_FIFO}"
   _diag_status cell "${cell_id}" running "" "" "${checkpoint}" "${log_final}" "${cell_start}" ""
   child=(
-    env -u BASH_ENV -u ENV -u WANDB_API_KEY -u HF_TOKEN -u HUGGING_FACE_HUB_TOKEN
-      -u V37_FRONTIER_DATA -u STEPCOUNT_V37_BALANCED_DATA
-      -u V31_MICRO_BATCH_UPDATE -u V31_MICRO_BATCH_EXP -u EASYR1_VLLM_NUM_GPU_BLOCKS
-      -u V31_GPU_MEM_UTIL -u V31_MAX_NUM_BATCHED_TOKENS
-      -u V36_LOAD_CHECKPOINT_PATH -u V32_LOAD_CHECKPOINT_PATH
-      -u V37_RESUME_CHECKPOINT -u V37_RESUME_SEAL
+    env -i PATH="${PATH}" HOME="${HOME:-/nonexistent}" USER="${USER:-}"
+      LOGNAME="${LOGNAME:-}" SHELL="${SHELL:-/bin/bash}" LANG="${LANG:-C.UTF-8}"
+      LC_ALL=C.UTF-8 TZ="${TZ:-Asia/Hong_Kong}" TMPDIR="${TMPDIR:-/tmp}"
+      CONDA_PREFIX="${CONDA_PREFIX:-}" VIRTUAL_ENV="${VIRTUAL_ENV:-}"
+      PYTHONPATH="${PYTHONPATH:-}" LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}"
+      CUDA_HOME="${CUDA_HOME:-}" HF_HOME="${HF_HOME:-}" XDG_CACHE_HOME="${XDG_CACHE_HOME:-}"
+      PYTHONNOUSERSITE=1 PYTHONUNBUFFERED=1 PYTHONHASHSEED=0
       V37_RUN_CLASS=debug V37_DATA_MODE=frontier_rl V37_RUN_PURPOSE=debug_mechanism
       V37_CONTINUATION_MODE=0 V37_ALLOW_FOCUSED10K_PILOT=1 V37_ALLOW_BENCHMARK_DEV=0
       V37_ALLOW_INDEPENDENT_VAL_OUTSIDE_TRAIN_RANGE=1 STEPCOUNT_V37_VAL_DATA="${VAL_REAL}"
       V37_PILOT_STEPS=3 V37_ARM="${arm}" V37_SEED="${seed}"
+      V37_STEP_WEIGHT=0.1 V37_STEP_GATE=answer_soft V37_STEP_MIN_GATE=0.2
       V37_MICRO_BATCH_UPDATE=4 V37_MICRO_BATCH_EXP=8 V37_VLLM_NUM_GPU_BLOCKS=20480
       V37_GPU_MEM_UTIL=0.50 V37_MAX_NUM_BATCHED_TOKENS=49152 V37_CP_SIZE=1
       V31_NNODES=1 V31_N_GPUS_PER_NODE=8 HOST_NUM=1 HOST_GPU_NUM=8 INDEX=0
+      CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
       WANDB_MODE=offline V31_SAVE_CHECKPOINT_PATH="${target_dir}" "${WRAPPER}"
   )
+  _diag_gpu_idle || _diag_error "${cell_id} 启动前 GPU lease/空闲状态发生变化"
   echo "[V37-16h诊断] 开始 ${cell_id}，P90 timeout=${cell_budget}s"
   set +e
-  "${TIMEOUT_BIN}" --signal=TERM --kill-after=120 "${cell_budget}s" "${child[@]}" 2>&1 | tee "${log_tmp}"
-  cell_rc=${PIPESTATUS[0]}
+  tee "${log_tmp}" <"${ACTIVE_FIFO}" &
+  ACTIVE_TEE_PID=$!
+  setsid "${TIMEOUT_BIN}" --signal=TERM --kill-after=120 "${cell_budget}s" \
+    "${child[@]}" >"${ACTIVE_FIFO}" 2>&1 &
+  ACTIVE_CHILD_PID=$!
+  wait "${ACTIVE_CHILD_PID}"
+  cell_rc=$?
+  # The wrapper can exit while a descendant still owns the FIFO. Keep the
+  # process-group identity until every residual writer is terminated, then
+  # stop detached Ray daemons before waiting for tee to drain.
+  kill -TERM -- "-${ACTIVE_CHILD_PID}" 2>/dev/null || true
+  for _diag_wait in 1 2 3 4 5; do
+    kill -0 -- "-${ACTIVE_CHILD_PID}" 2>/dev/null || break
+    sleep 1
+  done
+  kill -KILL -- "-${ACTIVE_CHILD_PID}" 2>/dev/null || true
+  _diag_ray_stop_bounded
+  ACTIVE_CHILD_PID=""
+  for ((_diag_wait = 0; _diag_wait < LOG_DRAIN_TIMEOUT_SECONDS; _diag_wait++)); do
+    kill -0 "${ACTIVE_TEE_PID}" 2>/dev/null || break
+    sleep 1
+  done
+  if kill -0 "${ACTIVE_TEE_PID}" 2>/dev/null; then
+    kill -TERM "${ACTIVE_TEE_PID}" 2>/dev/null || true
+    wait "${ACTIVE_TEE_PID}" 2>/dev/null || true
+    tee_rc=124
+  else
+    wait "${ACTIVE_TEE_PID}"
+    tee_rc=$?
+  fi
+  ACTIVE_TEE_PID=""
   set -e
+  rm -f -- "${ACTIVE_FIFO}"
+  ACTIVE_FIFO=""
   "${PYTHON_BIN}" - "${log_tmp}" <<'PY'
 import os, sys
 with open(sys.argv[1], "rb") as handle: os.fsync(handle.fileno())
@@ -384,9 +589,11 @@ PY
   failure_reason=""
   if (( cleanup_ok == 0 )); then
     failure_reason="gpu_not_idle_after_ray_stop"
+  elif (( tee_rc != 0 )); then
+    failure_reason="log_capture_exit_${tee_rc}"
   elif grep -Eiq 'CUDA([^[:alnum:]]+)?out of memory|OutOfMemoryError|(^|[^[:alnum:]_])OOM([^[:alnum:]_]|$)' "${log_final}"; then
     failure_reason="oom_detected"
-  elif grep -Eiq 'non[-_ ]?finite|(^|[^[:alnum:]_])(nan|inf)([^[:alnum:]_]|$)' "${log_final}"; then
+  elif _diag_log_has_nonfinite "${log_final}"; then
     failure_reason="nonfinite_detected"
   elif grep -q 'Traceback' "${log_final}"; then
     failure_reason="traceback_detected"
@@ -405,8 +612,16 @@ PY
   _diag_status cell "${cell_id}" completed "" "${cell_rc}" "${checkpoint}" "${log_final}" "${cell_start}" "${cell_finish}"
 done
 
-_diag_status final "${FINAL_STATE}" "${FINAL_REASON}" "$(_diag_monotonic)"
+final_now="$(_diag_monotonic)"
+if (( final_now > DEADLINE_MONOTONIC )); then
+  FINAL_STATE=stopped
+  FINAL_REASON="global_deadline_exceeded"
+fi
+_diag_status final "${FINAL_STATE}" "${FINAL_REASON}" "${final_now}"
 _diag_summary
 FINISHED=1
+kill "${WATCHDOG_PID}" 2>/dev/null || true
+wait "${WATCHDOG_PID}" 2>/dev/null || true
+WATCHDOG_PID=""
 echo "[V37-16h诊断] 状态=${FINAL_STATE}；status=${STATUS_PATH}；中文总结=${SUMMARY_PATH}"
 [[ "${FINAL_STATE}" == completed ]]

@@ -22,6 +22,7 @@ def run_launcher(tmp_path: Path, **overrides: str) -> subprocess.CompletedProces
     env = os.environ.copy()
     for key in list(env):
         if key.startswith("V37_") or key in {
+            "ACTION_EVENT_LEDGER_ENABLE",
             "ACTION_EVENT_REWARD_ENABLE",
             "ADAPTIVE_ACTOR_KL",
             "ADV_ESTIMATOR",
@@ -217,6 +218,7 @@ def seal_publication(manifest: Path) -> None:
             "baseline",
             {
                 "adv_estimator": "bok_grpo",
+                "action_event_ledger_enable": "1",
                 "action_event_reward_enable": "0",
                 "legacy_process_reward_enable": "0",
                 "step_weight": "0",
@@ -226,6 +228,7 @@ def seal_publication(manifest: Path) -> None:
             "progress",
             {
                 "adv_estimator": "bok_grpo_step",
+                "action_event_ledger_enable": "1",
                 "action_event_reward_enable": "1",
                 "legacy_process_reward_enable": "0",
                 "step_weight": "0.1",
@@ -244,6 +247,8 @@ def test_arm_switch_expansion(tmp_path, arm, expected):
     assert expanded["correctness_quality_weight"] == "0.1"
     assert expanded["correctness_partial_scale"] == "0.25"
     assert expanded["reward_fail_closed"] == "1"
+    assert expanded["action_parser_contract"] == "1"
+    assert expanded["action_ledger_contract"] == "1"
     assert expanded["winner_boost"] == "0"
     assert expanded["adaptive_actor_kl"] == "true"
     # Core rejects legacy use_kl_loss together with the adaptive actor controller.

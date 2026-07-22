@@ -26,6 +26,7 @@ from verl.workers.reward.function import SequentialFunctionRewardManager
 
 @pytest.fixture(autouse=True)
 def _action_env(monkeypatch):
+    monkeypatch.setenv("ACTION_EVENT_LEDGER_ENABLE", "1")
     monkeypatch.setenv("ACTION_EVENT_REWARD_ENABLE", "1")
     monkeypatch.setenv("V37_ACTION_PARSER_CONTRACT", "1")
     monkeypatch.setenv("V37_ACTION_LEDGER_CONTRACT", "1")
@@ -213,6 +214,50 @@ def test_single_bad_ledger_row_aborts_v37_batch(monkeypatch):
 
     with pytest.raises(RuntimeError, match="Invalid V37 action ledger"):
         manager.compute_reward(data)
+
+
+def test_baseline_validates_shared_ledger_without_emitting_action_credit(monkeypatch):
+    monkeypatch.setenv("ACTION_EVENT_REWARD_ENABLE", "0")
+    manager = SequentialFunctionRewardManager.__new__(SequentialFunctionRewardManager)
+    manager.reward_fn = lambda *_args, **kwargs: {
+        "overall": 1.0, "answer": 1.0, "answer_correct": 1.0,
+        "raw_success": 1.0, "trusted_trajectory": 1.0,
+        "trajectory_quality": 1.0,
+        "seen_action_events": float(len(kwargs["action_events"])),
+    }
+    manager.config = SimpleNamespace(skip_special_tokens=False)
+    manager.tokenizer = SimpleNamespace(decode=lambda *_args, **_kwargs: "response")
+    manager._reward_debug_calls = 0
+    manager._reward_debug_every = 100
+    manager._reward_sample_debug = False
+    manager._reward_sample_debug_max = 1
+    manager._reward_health_debug = False
+    manager._reward_health_every = 100
+    ledger = np.empty(1, dtype=object)
+    tokens = [
+        *ACTION_TAG_TOKEN_IDS["point_open"], *ACTION_TAG_TOKEN_IDS["point_close"],
+        *ACTION_TAG_TOKEN_IDS["answer_open"], *ACTION_TAG_TOKEN_IDS["answer_close"],
+    ]
+    ledger[0] = build_native_action_event_row(
+        tokens,
+        point_open_ids=ACTION_TAG_TOKEN_IDS["point_open"],
+        point_close_ids=ACTION_TAG_TOKEN_IDS["point_close"],
+        answer_open_ids=ACTION_TAG_TOKEN_IDS["answer_open"],
+        answer_close_ids=ACTION_TAG_TOKEN_IDS["answer_close"],
+        turn_spans=[(0, 2, 0), (2, 4, 1)],
+        termination_type=None, termination_reason=None, return_envelope=True,
+    )
+    data = DataProto.from_dict(
+        tensors={"responses": torch.tensor([tokens]), "response_mask": torch.ones((1, 4), dtype=torch.long)},
+        non_tensors={"ground_truth": np.asarray(["1"], dtype=object), "action_event_ledger": ledger},
+    )
+
+    _reward_tensor, metrics = manager.compute_reward(data)
+
+    assert metrics["action_ledger_invalid"] == [0.0]
+    assert metrics["seen_action_events"] == [2.0]
+    assert "_action_events" not in metrics
+    assert "_action_event_values" not in metrics
 
 
 def test_native_action_credit_does_not_leak_point_signal_into_answer_tail():
@@ -429,8 +474,10 @@ def test_compact_action_storage_contract_at_representative_shape():
 
 
 def test_v36_default_malformed_first_reward_is_exactly_legacy(monkeypatch):
+    monkeypatch.delenv("ACTION_EVENT_LEDGER_ENABLE", raising=False)
     monkeypatch.delenv("ACTION_EVENT_REWARD_ENABLE", raising=False)
     monkeypatch.delenv("V37_ACTION_PARSER_CONTRACT", raising=False)
+    monkeypatch.delenv("V37_ACTION_LEDGER_CONTRACT", raising=False)
     monkeypatch.setenv("TRAJ_ANSWER_GATE_MODE", "off")
     prediction = (
         '<point>{not-json}</point>'

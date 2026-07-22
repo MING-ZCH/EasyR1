@@ -594,21 +594,27 @@ class RayPPOTrainer:
         action_event_reward = os.environ.get("ACTION_EVENT_REWARD_ENABLE", "0").lower() in (
             "1", "true", "yes"
         )
-        if action_event_reward:
+        action_event_ledger = os.environ.get("ACTION_EVENT_LEDGER_ENABLE", "0").lower() in (
+            "1", "true", "yes"
+        )
+        if action_event_reward and not action_event_ledger:
+            raise ValueError("ACTION_EVENT_REWARD_ENABLE requires ACTION_EVENT_LEDGER_ENABLE=1.")
+        if action_event_ledger:
             if config.worker.reward.reward_type != "sequential":
-                raise ValueError("ACTION_EVENT_REWARD_ENABLE requires worker.reward.reward_type=sequential.")
+                raise ValueError("ACTION_EVENT_LEDGER_ENABLE requires worker.reward.reward_type=sequential.")
             if not config.worker.rollout.interleaved_point_to_count:
-                raise ValueError("ACTION_EVENT_REWARD_ENABLE requires interleaved_point_to_count rollout.")
+                raise ValueError("ACTION_EVENT_LEDGER_ENABLE requires interleaved_point_to_count rollout.")
+            if os.environ.get("V37_ACTION_PARSER_CONTRACT", "0").lower() not in ("1", "true", "yes"):
+                raise ValueError("ACTION_EVENT_LEDGER_ENABLE requires V37_ACTION_PARSER_CONTRACT=1.")
+            if os.environ.get("V37_ACTION_LEDGER_CONTRACT", "0").lower() not in ("1", "true", "yes"):
+                raise ValueError("ACTION_EVENT_LEDGER_ENABLE requires V37_ACTION_LEDGER_CONTRACT=1.")
+        if action_event_reward:
             if config.algorithm.adv_estimator != AdvantageEstimator.BOK_GRPO_STEP:
                 raise ValueError("ACTION_EVENT_REWARD_ENABLE requires algorithm.adv_estimator=bok_grpo_step.")
             if int(os.environ.get("BOK_CORRECTNESS_FIRST", "0")) != 1:
                 raise ValueError("ACTION_EVENT_REWARD_ENABLE requires BOK_CORRECTNESS_FIRST=1.")
             if os.environ.get("BOK_STEP_SIGNAL", "").strip().lower() != "native_action_event":
                 raise ValueError("ACTION_EVENT_REWARD_ENABLE requires BOK_STEP_SIGNAL=native_action_event.")
-            if os.environ.get("V37_ACTION_PARSER_CONTRACT", "0").lower() not in ("1", "true", "yes"):
-                raise ValueError("ACTION_EVENT_REWARD_ENABLE requires V37_ACTION_PARSER_CONTRACT=1.")
-            if os.environ.get("V37_ACTION_LEDGER_CONTRACT", "0").lower() not in ("1", "true", "yes"):
-                raise ValueError("ACTION_EVENT_REWARD_ENABLE requires V37_ACTION_LEDGER_CONTRACT=1.")
 
         if config.algorithm.adv_estimator == AdvantageEstimator.GAE:
             self.use_critic = True
@@ -1710,7 +1716,7 @@ class RayPPOTrainer:
                                     batch.batch["point_step_mask"] = point_step_mask
                                     if _has_step_values:
                                         batch.batch["point_step_value"] = point_step_value
-                                if _raw_action_events is not None:
+                                if os.environ.get("ACTION_EVENT_REWARD_ENABLE", "0") == "1" and _raw_action_events is not None:
                                     action_spans, action_values, action_types = build_action_step_tensors(
                                         _raw_action_events,
                                         _raw_action_values,

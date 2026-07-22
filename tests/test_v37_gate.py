@@ -224,8 +224,8 @@ def mechanism(arm):
         "arm": arm,
         "estimator": "bok_grpo_step" if progress else "bok_grpo",
         "native_action_enabled": progress,
-        "native_action_parser_contract": "native_action_parser_v1" if progress else "disabled",
-        "native_action_ledger_contract": "native_action_ledger_v2" if progress else "disabled",
+        "native_action_parser_contract": "native_action_parser_v1",
+        "native_action_ledger_contract": "native_action_ledger_v2",
         "legacy_process_reward_enabled": False,
         "step_signal": "native_action_event" if progress else None,
         "step_weight": .1 if progress else 0.0,
@@ -417,6 +417,7 @@ def valid_spec():
             }
             environment = {
                 "ACTOR_LR": "2e-7", "ADV_ESTIMATOR": mechanism(arm)["estimator"],
+                "ACTION_EVENT_LEDGER_ENABLE": "1",
                 "ACTION_EVENT_REWARD_ENABLE": "1" if arm == "progress" else "0",
                 "CONFIG_PATH": f"/fixture/{arm}-{seed}/v37_config.yaml",
                 "PYTHONHASHSEED": str(seed), "V31_DATA_SEED": str(seed),
@@ -436,12 +437,13 @@ def valid_spec():
                 "V37_RAW_SUCCESS_STRICT_WINNER": "1", "V37_WINNER_MODE": "outcome_success",
                 "V37_STRICT_POINT_PARSER_CONTRACT": "1",
                 "V37_REWARD_FAIL_CLOSED": "1",
+                "V37_ACTION_PARSER_CONTRACT": "1",
+                "V37_ACTION_LEDGER_CONTRACT": "1",
             }
             if arm == "progress":
                 environment.update({
                     "BOK_STEP_SIGNAL": "native_action_event", "BOK_STEP_GATE": "answer_soft",
-                    "BOK_STEP_MIN_GATE": "0.2", "V37_ACTION_PARSER_CONTRACT": "1",
-                    "V37_ACTION_LEDGER_CONTRACT": "1",
+                    "BOK_STEP_MIN_GATE": "0.2",
                 })
             runtime_environment = {
                 "python_executable": str(Path(sys.executable).resolve()),

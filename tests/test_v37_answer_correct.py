@@ -34,6 +34,7 @@ def _clean_bok_environment(monkeypatch):
         "BOK_TAU_ADAPTIVE",
         "BOK_WINNER_BOOST",
         "VCRL_ENABLE",
+        "ACTION_EVENT_LEDGER_ENABLE",
         "ACTION_EVENT_REWARD_ENABLE",
         "TRAJ_STRICT_ANSWER_INTEGER_PARSE",
         "TRAJ_FORMAT_GRADED",
@@ -43,6 +44,7 @@ def _clean_bok_environment(monkeypatch):
         "TRAJ_RETURN_POINT_STEP_SCORES",
         "STEPCOUNT_MASK_REQUIRE",
         "V37_ACTION_PARSER_CONTRACT",
+        "V37_ACTION_LEDGER_CONTRACT",
         "V37_RAW_SUCCESS_STRICT_WINNER",
         "V37_STRICT_POINT_PARSER_CONTRACT",
         "V37_WINNER_MODE",
@@ -428,8 +430,10 @@ def test_allwrong_terminal_zero_is_independent_opt_in(monkeypatch):
 
 
 def test_exact_but_capped_is_not_raw_success(monkeypatch):
+    monkeypatch.setenv("ACTION_EVENT_LEDGER_ENABLE", "1")
     monkeypatch.setenv("ACTION_EVENT_REWARD_ENABLE", "1")
     monkeypatch.setenv("V37_ACTION_PARSER_CONTRACT", "1")
+    monkeypatch.setenv("V37_ACTION_LEDGER_CONTRACT", "1")
     monkeypatch.setattr(
         stepcount_reward,
         "_trajectory_point_dense_reward_without_gt_points_details",

@@ -70,14 +70,13 @@ BUCKET_RANGES = {
 BUCKETS = ("2-10", "11-20", "21-30", "31-40", "41-50")
 ARMS = ("baseline", "progress")
 ARM_ALLOWLIST = {
-    "arm", "estimator", "native_action_enabled", "native_action_parser_contract",
-    "native_action_ledger_contract", "process_reward", "step_signal", "step_weight", "answer_gate",
+    "arm", "estimator", "native_action_enabled", "process_reward",
+    "step_signal", "step_weight", "answer_gate",
 }
 ARM_ENV_ALLOWLIST = {
     "ACTION_EVENT_REWARD_ENABLE", "ADV_ESTIMATOR", "BOK_STEP_GATE",
     "BOK_STEP_MIN_GATE", "BOK_STEP_SIGNAL", "BOK_STEP_WEIGHT",
-    "STEPCOUNT_RL_MODE", "V37_ACTION_LEDGER_CONTRACT",
-    "V37_ACTION_PARSER_CONTRACT", "V37_ARM",
+    "STEPCOUNT_RL_MODE", "V37_ARM",
 }
 RUN_ENV_ALLOWLIST = {
     "CONFIG_PATH", "V31_EXPERIMENT_NAME", "V31_SAVE_CHECKPOINT_PATH", "V37_RUN_MANIFEST",
@@ -622,14 +621,15 @@ def _validate_arm_seed_bindings(
         "V37_RAW_SUCCESS_STRICT_WINNER": "1",
         "V37_WINNER_MODE": "outcome_success",
         "V37_REWARD_FAIL_CLOSED": "1",
+        "ACTION_EVENT_LEDGER_ENABLE": "1",
+        "V37_ACTION_PARSER_CONTRACT": "1",
+        "V37_ACTION_LEDGER_CONTRACT": "1",
     }
     if progress:
         expected_environment.update({
             "BOK_STEP_SIGNAL": "native_action_event",
             "BOK_STEP_GATE": "answer_soft",
             "BOK_STEP_MIN_GATE": "0.2",
-            "V37_ACTION_PARSER_CONTRACT": "1",
-            "V37_ACTION_LEDGER_CONTRACT": "1",
         })
     for field, expected in expected_environment.items():
         actual = environment.get(field)
@@ -641,7 +641,6 @@ def _validate_arm_seed_bindings(
     if not progress:
         for field in (
             "BOK_STEP_SIGNAL", "BOK_STEP_GATE", "BOK_STEP_MIN_GATE",
-            "V37_ACTION_PARSER_CONTRACT", "V37_ACTION_LEDGER_CONTRACT",
         ):
             if field in environment:
                 raise GateError(f"{label}: baseline audited_environment must omit {field}")
@@ -980,7 +979,10 @@ def _validate_effective_environment(
         "INTERLEAVED_ADAPTIVE_MAX_TURNS_MARGIN": "2",
         "INTERLEAVED_MAX_TURNS": "53",
         "ADV_ESTIMATOR": "bok_grpo_step" if arm == "progress" else "bok_grpo",
+        "ACTION_EVENT_LEDGER_ENABLE": "1",
         "ACTION_EVENT_REWARD_ENABLE": "1" if arm == "progress" else "0",
+        "V37_ACTION_PARSER_CONTRACT": "1",
+        "V37_ACTION_LEDGER_CONTRACT": "1",
     }
     for key, value in expected.items():
         if environment.get(key) != value:
@@ -994,14 +996,9 @@ def _validate_effective_environment(
     remap_key = "STEPCOUNT_IMAGE_PATH_REMAP_JSON"
     if audited.get(remap_key) != environment.get(remap_key):
         raise GateError(f"{label}: image path remap changed before trainer startup")
-    if arm == "progress":
-        for key in ("V37_ACTION_PARSER_CONTRACT", "V37_ACTION_LEDGER_CONTRACT"):
-            if audited.get(key) != "1" or environment.get(key) != "1":
-                raise GateError(f"{label}: progress effective environment lost {key}")
-    elif any(
-        key in environment for key in ("V37_ACTION_PARSER_CONTRACT", "V37_ACTION_LEDGER_CONTRACT")
-    ):
-        raise GateError(f"{label}: baseline effective environment inherited progress action contracts")
+    for key in ("V37_ACTION_PARSER_CONTRACT", "V37_ACTION_LEDGER_CONTRACT"):
+        if audited.get(key) != "1" or environment.get(key) != "1":
+            raise GateError(f"{label}: effective environment lost shared ledger contract {key}")
     return dict(environment)
 
 
@@ -1459,7 +1456,8 @@ def _validate_mechanism_config(manifest: Mapping[str, Any], arm: str, run_class:
     expected_arm = {
         "baseline": {
             "arm": "baseline", "estimator": "bok_grpo", "native_action_enabled": False,
-            "native_action_parser_contract": "disabled", "native_action_ledger_contract": "disabled",
+            "native_action_parser_contract": "native_action_parser_v1",
+            "native_action_ledger_contract": "native_action_ledger_v2",
             "step_signal": None, "step_weight": 0.0,
             "answer_gate": {"mode": None, "minimum": None},
         },

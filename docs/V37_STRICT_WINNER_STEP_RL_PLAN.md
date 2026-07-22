@@ -9,7 +9,7 @@
 | 标记 | 修改 | 可插拔/回滚边界 | 当前验证 |
 |---|---|---|---|
 | V37-01 | correctness-first `answer_correct/raw_success` 与 homogeneous terminal zero | 仅 `BOK_CORRECTNESS_FIRST/BOK_ALLWRONG_TERMINAL_ZERO` | 对抗输入与随机 BoK parity |
-| V37-02 | token-native `native_action_ledger_v2` 与局部 point credit | `ACTION_EVENT_REWARD_ENABLE=1`；baseline 为 0 | ledger mutation、span/tail 隔离 probe |
+| V37-02 | token-native `native_action_ledger_v2` 与局部 point credit | 两臂 `ACTION_EVENT_LEDGER_ENABLE=1`；仅 progress `ACTION_EVENT_REWARD_ENABLE=1` | ledger mutation、span/tail 隔离 probe |
 | V37-03 | response-token global-mean adaptive actor KL | `algorithm.adaptive_actor_kl=true` | 数学/符号/controller 静态与 probe |
 | V37-04 | adaptive state 的 manifest-first checkpoint 发布与恢复 | adaptive 模式专用；legacy save 路径保留 | incomplete save、idempotent publish 测试 |
 | V37-05 | 严格 integer answer winner 路由 | V37 wrapper 强制 1；V36 默认 0 | ambiguous/valid integer 对抗 probe |
@@ -82,17 +82,18 @@ paired gate 只比较真正的 sample-level 指标：五桶 answer macro、`answ
 
 ## 3. Baseline / Progress A/B
 
-两臂共享 checkpoint-476、frontier 数据、seed、严格 action-close scheduler、EOS/cap 终止语义、reward outcome、correctness-first 和 adaptive actor KL。严格 scheduler 由两臂共同的 `V37_STRICT_POINT_PARSER_CONTRACT=1` 控制；`ACTION_EVENT_REWARD_ENABLE` 只决定 ledger 是否进入 step reward，因此预期实验差异仅为 native action-level process credit：
+两臂共享 checkpoint-476、frontier 数据、seed、严格 action-close scheduler、EOS/cap 终止语义、reward outcome、correctness-first 和 adaptive actor KL。两臂都固定 `ACTION_EVENT_LEDGER_ENABLE=1`，使用相同 token-bound parser/ledger 做 `cap/abort/answer` 判定并 fail closed；`ACTION_EVENT_REWARD_ENABLE` 只决定是否导出 action values 并进入 step reward，因此预期实验差异仅为 native action-level process credit：
 
 | 机制 | baseline | progress |
 |---|---|---|
 | `ADV_ESTIMATOR` | `bok_grpo` | `bok_grpo_step` |
+| `ACTION_EVENT_LEDGER_ENABLE` | 1（只读） | 1（只读） |
 | `ACTION_EVENT_REWARD_ENABLE` | 0 | 1 |
 | `PROCESS_REWARD_ENABLE` | 0 | 0 |
 | `BOK_STEP_WEIGHT` | 0 | 0.1 |
 | `BOK_STEP_GATE` / `BOK_STEP_MIN_GATE` | 不适用 | `answer_soft` / `0.2` |
 
-`PROCESS_REWARD_ENABLE=0` 在两臂都固定，关闭旧的 decode 后搜索 `</point>` 并重定位 token 的 retokenized process 路径。progress 只消费 rollout 直接产生的 `action_event_ledger`，错误 span、缺行或非 sequential reward manager 都会失败。
+`PROCESS_REWARD_ENABLE=0` 在两臂都固定，关闭旧的 decode 后搜索 `</point>` 并重定位 token 的 retokenized process 路径。两臂都校验 rollout 直接产生的 `action_event_ledger`，错误 span、缺行或非 sequential reward manager 都会失败；baseline 只记录 ledger diagnostics，不生成 `_action_event_values` 或 `action_step_*` 训练张量。
 
 共同 outcome 语义固定为：
 
