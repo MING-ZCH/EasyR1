@@ -20,7 +20,7 @@ implement PPO
 
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from typing import TYPE_CHECKING, Tuple
+from typing import TYPE_CHECKING, Any, Tuple
 
 import numpy as np
 import torch
@@ -42,22 +42,70 @@ class KLController(ABC):
         """Update kl_coef according to current KL."""
         ...
 
+    @abstractmethod
+    def state_dict(self) -> dict[str, Any]:
+        ...
+
+    @abstractmethod
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        ...
+
+
+def _validate_kl_scalar(
+    name: str, value: Any, *, strictly_positive: bool = False, allow_negative: bool = False
+) -> float:
+    try:
+        value = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(f"{name} must be numeric, got {value!r}.") from exc
+    if not np.isfinite(value) or (not allow_negative and value < 0) or (strictly_positive and value <= 0):
+        qualifier = "finite" if allow_negative else ("positive" if strictly_positive else "finite and nonnegative")
+        raise ValueError(f"{name} must be {qualifier}, got {value}.")
+    return value
+
 
 class AdaptiveKLController(KLController):
     """Adaptive KL controller described in: https://arxiv.org/pdf/1909.08593.pdf
 
     Copied from https://github.com/huggingface/trl/blob/v0.11.0/trl/trainer/utils.py#L54"""
 
-    def __init__(self, init_kl_coef: float, target_kl: float, horizon: float):
-        self.kl_coef = init_kl_coef
-        self.target = target_kl
-        self.horizon = horizon
+    def __init__(
+        self, init_kl_coef: float, target_kl: float, horizon: float, *, strict_nonnegative_kl: bool = False
+    ):
+        self.kl_coef = _validate_kl_scalar("kl_coef", init_kl_coef)
+        self.target = _validate_kl_scalar("target", target_kl, strictly_positive=True)
+        self.horizon = _validate_kl_scalar("horizon", horizon, strictly_positive=True)
+        self.strict_nonnegative_kl = bool(strict_nonnegative_kl)
 
     def update(self, current_kl: float, n_steps: int) -> None:
+        current_kl = _validate_kl_scalar(
+            "current_kl", current_kl, allow_negative=not self.strict_nonnegative_kl
+        )
+        if int(n_steps) <= 0:
+            raise ValueError(f"n_steps must be positive, got {n_steps}.")
         target = self.target
         proportional_error = np.clip(current_kl / target - 1, -0.2, 0.2)
         mult = 1 + proportional_error * n_steps / self.horizon
         self.kl_coef *= mult
+        self.kl_coef = _validate_kl_scalar("kl_coef", self.kl_coef)
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "type": "adaptive",
+            "beta": self.kl_coef,
+            "target": self.target,
+            "horizon": self.horizon,
+            "strict_nonnegative_kl": self.strict_nonnegative_kl,
+        }
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        if state.get("type") != "adaptive":
+            raise ValueError(f"Expected adaptive KL state, got {state.get('type')!r}.")
+        if bool(state.get("strict_nonnegative_kl", False)) != self.strict_nonnegative_kl:
+            raise ValueError("Adaptive KL strictness differs from the checkpoint.")
+        self.kl_coef = _validate_kl_scalar("beta", state.get("beta"))
+        self.target = _validate_kl_scalar("target", state.get("target"), strictly_positive=True)
+        self.horizon = _validate_kl_scalar("horizon", state.get("horizon"), strictly_positive=True)
 
 
 class FixedKLController(KLController):
@@ -66,10 +114,18 @@ class FixedKLController(KLController):
     Copeid from https://github.com/huggingface/trl/blob/v0.11.0/trl/trainer/utils.py#L72"""
 
     def __init__(self, init_kl_coef: float):
-        self.kl_coef = init_kl_coef
+        self.kl_coef = _validate_kl_scalar("kl_coef", init_kl_coef)
 
     def update(self, current_kl: float, n_steps: int) -> None:
         pass
+
+    def state_dict(self) -> dict[str, Any]:
+        return {"type": "fixed", "beta": self.kl_coef}
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        if state.get("type") != "fixed":
+            raise ValueError(f"Expected fixed KL state, got {state.get('type')!r}.")
+        self.kl_coef = _validate_kl_scalar("beta", state.get("beta"))
 
 
 def get_kl_controller(algorithm_config: "AlgorithmConfig") -> KLController:
@@ -82,6 +138,7 @@ def get_kl_controller(algorithm_config: "AlgorithmConfig") -> KLController:
             init_kl_coef=algorithm_config.kl_coef,
             target_kl=algorithm_config.kl_target,
             horizon=algorithm_config.kl_horizon,
+            strict_nonnegative_kl=bool(getattr(algorithm_config, "adaptive_actor_kl", False)),
         )
     else:
         raise ValueError(f"Unknown kl type: {algorithm_config.kl_type}.")
@@ -436,6 +493,9 @@ def compute_bok_grpo_advantage(
     global_step: int = 0,
     total_steps: int = 1,
     answer_scores: torch.Tensor = None,
+    answer_correct_scores: torch.Tensor = None,
+    raw_success_scores: torch.Tensor = None,
+    trajectory_quality_scores: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Best-of-K GRPO advantage with Dr.GRPO-enhanced fallback.
 
@@ -462,6 +522,8 @@ def compute_bok_grpo_advantage(
         collapse_threshold:  if max softmax weight > this, increase uniform mix
         low_var_threshold:   fallback to batch baseline when group std < this
         bok_tau_init / bok_tau_final / global_step / total_steps: τ annealing
+        answer_scores: shaped answer reward retained for legacy routing fallback
+        answer_correct_scores: independent binary answer correctness used for routing
 
     Returns:
         advantages, returns -- both (bs, response_length)
@@ -513,6 +575,20 @@ def compute_bok_grpo_advantage(
     # Preserves directional signal from soft_decay but prevents overpowered +bok_clip advantage.
     _allwrong_cap = float(os.environ.get("BOK_ALLWRONG_CAP", "0"))  # 0 = disabled
     _allwrong_answer_threshold = float(os.environ.get("BOK_ALLWRONG_ANSWER_THRESHOLD", "0.5"))
+    _correctness_first = int(os.environ.get("BOK_CORRECTNESS_FIRST", "0")) > 0
+    _allwrong_terminal_zero = int(os.environ.get("BOK_ALLWRONG_TERMINAL_ZERO", "0")) > 0
+    _correctness_task_weight = float(os.environ.get("BOK_CORRECTNESS_TASK_WEIGHT", "0.25"))
+    _correctness_quality_weight = float(os.environ.get("BOK_CORRECTNESS_QUALITY_WEIGHT", "0.1"))
+    _correctness_partial_scale = float(os.environ.get("BOK_CORRECTNESS_PARTIAL_SCALE", "0.25"))
+    _correctness_sign_margin = float(os.environ.get("BOK_CORRECTNESS_SIGN_MARGIN", "1e-4"))
+    if _correctness_first and (raw_success_scores is None or answer_correct_scores is None):
+        raise ValueError(
+            "BOK_CORRECTNESS_FIRST requires row-aligned raw_success_scores and answer_correct_scores."
+        )
+    if _correctness_task_weight < 0 or _correctness_quality_weight < 0 or _correctness_partial_scale < 0:
+        raise ValueError("Correctness-first secondary weights must be nonnegative.")
+    # V37: correctness routing must not depend on the shaped answer reward when
+    # a complete binary channel is available for the current prompt group.
 
     # --- V3 improvements: Winner Amplification, Easy Dampening, Quality Bonus ---
     # Winner Amplification: boost correct-trajectory advantages in BoK groups
@@ -528,6 +604,14 @@ def compute_bok_grpo_advantage(
     # ---- per-group statistics ----
     id2indices: dict = defaultdict(list)
     bsz = scores.shape[0]
+    for name, values in (
+        ("answer_scores", answer_scores),
+        ("answer_correct_scores", answer_correct_scores),
+        ("raw_success_scores", raw_success_scores),
+        ("trajectory_quality_scores", trajectory_quality_scores),
+    ):
+        if values is not None and values.shape[0] != bsz:
+            raise ValueError(f"{name} must contain one value per response: {values.shape[0]} != {bsz}")
     for i in range(bsz):
         id2indices[index[i]].append(i)
 
@@ -544,8 +628,14 @@ def compute_bok_grpo_advantage(
     n_all_correct_released = 0  # V24: all-correct groups released to Easy by smart filter
     n_allwrong_capped = 0
     n_winner_boosted = 0
+    n_binary_tiebreak = 0
+    n_correctness_mixed = 0
+    n_correctness_partial = 0
+    n_terminal_zero = 0
     n_tau_bumped = 0
     all_group_stds = []  # for diagnostics
+    low_var_allwrong_rows = set()
+    dapo_filtered_rows = set()
 
     for idx, indices in id2indices.items():
         K = len(indices)
@@ -556,14 +646,187 @@ def compute_bok_grpo_advantage(
         if not torch.isfinite(group_std):
             group_std = torch.tensor(0.0, device=scores.device)
         all_group_stds.append(group_std.item())
-
-        if group_std.item() <= low_var_threshold:
-            # ---- Low-variance fallback ----
+        is_low_var = group_std.item() <= low_var_threshold
+        if is_low_var:
             n_low_var += K
+
+        # Exact V36 feature-off compatibility: the historical implementation
+        # handles low-variance groups before answer routing.  Keep that ordering
+        # unless the V37 correctness-first contract is explicitly enabled.
+        if is_low_var and not (_correctness_first or _allwrong_terminal_zero):
+            if _dapo_filter:
+                n_dapo_filtered += K
+                dapo_filtered_rows.update(indices)
+                continue
+            if _fallback_mode == "drgrpo":
+                for global_i in indices:
+                    advantages_1d[global_i] = scores[global_i] - batch_mean
+            elif _fallback_mode == "clip_std":
+                effective_std = max(batch_std.item(), _min_batch_std)
+                for global_i in indices:
+                    advantages_1d[global_i] = (scores[global_i] - batch_mean) / effective_std
+            elif batch_std.item() > eps:
+                for global_i in indices:
+                    advantages_1d[global_i] = (scores[global_i] - batch_mean) / (batch_std + eps)
+            continue
+
+        # Resolve correctness before low-variance handling.  The previous order
+        # skipped all-correct/all-wrong logic and let homogeneous wrong groups
+        # inherit positive batch-fallback advantages.
+        group_answer = None
+        group_has_explicit_correctness = False
+        group_has_answer_routing = False
+        if (_correctness_first or _allwrong_terminal_zero) and answer_correct_scores is not None:
+            binary_candidate = torch.stack([answer_correct_scores[j] for j in indices])
+            if torch.isfinite(binary_candidate).all():
+                group_answer = binary_candidate
+                group_has_explicit_correctness = True
+                group_has_answer_routing = True
+        if group_answer is None and answer_scores is not None:
+            shaped_candidate = torch.stack([answer_scores[j] for j in indices])
+            if torch.isfinite(shaped_candidate).all():
+                group_answer = shaped_candidate
+                group_has_answer_routing = True
+        if group_answer is not None:
+            threshold = 0.5 if group_has_explicit_correctness else _allwrong_answer_threshold
+            group_correct = group_answer >= threshold
+        else:
+            group_correct = group_scores > _easy_score_threshold
+        pass_rate = group_correct.float().mean().item()
+        is_all_correct = bool(group_correct.all().item())
+        if group_has_answer_routing:
+            is_allwrong = bool((~group_correct).all().item())
+        else:
+            # Preserve the legacy overall-score fallback at the exact threshold.
+            is_allwrong = bool((group_scores < _allwrong_answer_threshold).all().item())
+
+        if _correctness_first:
+            group_raw = torch.stack([raw_success_scores[j] for j in indices])
+            if not torch.isfinite(group_raw).all():
+                raise ValueError(f"Non-finite raw_success in correctness-first group {idx!r}.")
+            group_correct = group_raw >= 0.5
+            pass_rate = group_correct.float().mean().item()
+            is_all_correct = bool(group_correct.all().item())
+            is_allwrong = bool((~group_correct).all().item())
+
+            group_answer_exact = torch.stack([answer_correct_scores[j] for j in indices]).to(
+                dtype=scores.dtype
+            )
+            if not torch.isfinite(group_answer_exact).all():
+                raise ValueError(f"Non-finite answer_correct in correctness-first group {idx!r}.")
+            group_answer_exact = (group_answer_exact >= 0.5).to(dtype=scores.dtype)
+            secondary_rank = group_answer_exact + _correctness_task_weight * group_scores
+            if trajectory_quality_scores is not None and _correctness_quality_weight > 0:
+                group_quality = torch.stack([trajectory_quality_scores[j] for j in indices]).to(
+                    dtype=scores.dtype
+                )
+                if not torch.isfinite(group_quality).all():
+                    raise ValueError(f"Non-finite trajectory_quality in correctness-first group {idx!r}.")
+                secondary_rank = secondary_rank + _correctness_quality_weight * group_quality
+
+            if is_all_correct:
+                n_terminal_zero += K
+                continue
+
+            if is_allwrong:
+                # A strict failure with an exact answer is intentionally not
+                # equivalent to a completely wrong trajectory.  Learn the
+                # bounded secondary ranking only when at least one exact answer
+                # exists; an all-answer-wrong group remains terminal-zero and
+                # cannot reinforce a "least wrong" answer.
+                if _allwrong_terminal_zero and not bool((group_answer_exact > 0.5).any().item()):
+                    n_terminal_zero += K
+                    continue
+                group_adv = (secondary_rank - secondary_rank.mean()) * _correctness_partial_scale
+                for local_i, global_i in enumerate(indices):
+                    advantages_1d[global_i] = group_adv[local_i]
+                n_correctness_partial += K
+                continue
+
+            base = group_correct.to(dtype=scores.dtype) - pass_rate
+            residual = torch.zeros_like(base)
+            for tier in (False, True):
+                tier_mask = group_correct == tier
+                if int(tier_mask.sum().item()) >= 2:
+                    centered = secondary_rank[tier_mask] - secondary_rank[tier_mask].mean()
+                    residual[tier_mask] = centered * _correctness_partial_scale
+            limit = (base.abs() - _correctness_sign_margin).clamp_min(0.0)
+            residual = torch.maximum(torch.minimum(residual, limit), -limit)
+            group_adv = base + residual
+            group_adv = torch.where(
+                group_correct,
+                group_adv.clamp_min(_correctness_sign_margin),
+                group_adv.clamp_max(-_correctness_sign_margin),
+            )
+            if _winner_boost > 0:
+                n_correct = int(group_correct.sum().item())
+                boost = min(_winner_boost, math.sqrt(K / max(n_correct, 1)))
+                group_adv = torch.where(group_correct & (group_adv > 0), group_adv * boost, group_adv)
+                n_winner_boosted += K
+            for local_i, global_i in enumerate(indices):
+                advantages_1d[global_i] = group_adv[local_i]
+            n_correctness_mixed += K
+            continue
+
+        if _allwrong_terminal_zero and is_allwrong:
+            n_terminal_zero += K
+            continue
+
+        # ---- P2: All-correct group filter (V11) ----
+        if _filter_all_correct and is_all_correct:
+            # A low-variance all-correct group has no within-prompt ranking
+            # signal.  Releasing it into the batch fallback would give every
+            # trajectory the same cross-prompt advantage and can reinforce a
+            # uniformly low-quality trajectory.  Smart release is meaningful
+            # only when the group still contains discriminative score variance.
+            if is_low_var:
+                n_all_correct_filtered += K
+                continue
+            if _smart_filter_threshold > 0 and group_mean.item() < _smart_filter_threshold:
+                # V24: all-correct but point quality below threshold -> release to Easy path
+                n_all_correct_released += K
+            else:
+                n_all_correct_filtered += K
+                # advantages_1d already initialized to 0 — no action needed
+                continue
+
+        if is_low_var:
+            # ---- Low-variance fallback ----
+            if is_allwrong:
+                low_var_allwrong_rows.update(indices)
+
+            # Shaping can collapse an exact-answer winner and a wrong answer to
+            # the same overall score (for example after point penalties). The
+            # independent binary outcome still supplies valid within-group
+            # credit and must take precedence over generic low-var handling.
+            if group_has_explicit_correctness and not is_all_correct and not is_allwrong:
+                centered_correctness = group_correct.to(dtype=scores.dtype) - pass_rate
+                for local_i, global_i in enumerate(indices):
+                    advantages_1d[global_i] = centered_correctness[local_i]
+                if pass_rate > _easy_threshold:
+                    n_easy_drgrpo += K
+                    for global_i in indices:
+                        advantages_1d[global_i] = advantages_1d[global_i] * _easy_scale
+                if _winner_boost > 0:
+                    n_correct = int(group_correct.sum().item())
+                    boost = min(_winner_boost, math.sqrt(K / max(n_correct, 1)))
+                    for local_i, global_i in enumerate(indices):
+                        if group_correct[local_i]:
+                            advantages_1d[global_i] = advantages_1d[global_i] * boost
+                    n_winner_boosted += K
+                if _bok_adv_normalize:
+                    group_adv = torch.stack([advantages_1d[i] for i in indices])
+                    adv_std = group_adv.std()
+                    if adv_std.item() > eps:
+                        for global_i in indices:
+                            advantages_1d[global_i] = advantages_1d[global_i] / adv_std
+                n_binary_tiebreak += K
+                continue
 
             # DAPO filtering: optionally zero-out homogeneous groups
             if _dapo_filter:
                 n_dapo_filtered += K
+                dapo_filtered_rows.update(indices)
                 # Leave advantages as 0 → no gradient for this group
                 continue
 
@@ -584,37 +847,24 @@ def compute_bok_grpo_advantage(
                     for j, global_i in enumerate(indices):
                         advantages_1d[global_i] = (scores[global_i] - batch_mean) / (batch_std + eps)
                 # else: leave as 0
-            continue
 
-        # ---- P2: All-correct group filter (V11) ----
-        # If all K trajectories in a group score > threshold, skip (zero gradient)
-        # This removes trivially easy samples that waste gradient budget
-        if _filter_all_correct:
-            # V25: use answer_scores for routing when available (more precise than mixed score)
-            if answer_scores is not None:
-                group_answer = torch.stack([answer_scores[j] for j in indices])
-                pass_rate_full = (group_answer >= _allwrong_answer_threshold).float().mean().item()
-            else:
-                pass_rate_full = (group_scores > _easy_score_threshold).float().mean().item()
-            if pass_rate_full >= 1.0 - 1e-6:  # all K correct
-                if _smart_filter_threshold > 0 and group_mean.item() < _smart_filter_threshold:
-                    # V24: all-correct but point quality below threshold -> release to Easy path
-                    n_all_correct_released += K
-                else:
-                    n_all_correct_filtered += K
-                    # advantages_1d already initialized to 0 — no action needed
-                    continue
+            # A homogeneous all-wrong group may be above the batch mean, but it
+            # must never reinforce a wrong trajectory through that fallback.
+            if is_allwrong:
+                for global_i in indices:
+                    v = min(0.0, advantages_1d[global_i].item())
+                    if _allwrong_cap > 0:
+                        v = max(-_allwrong_cap, v)
+                    advantages_1d[global_i] = v
+                if _allwrong_cap > 0:
+                    n_allwrong_capped += K
+            continue
 
         # ---- Difficulty-Aware Advantage Routing (V11 / V25 answer-based) ----
         # Easy groups (high pass rate) -> Dr.GRPO raw centering (score - mean, NO std division)
         # Hard groups (low pass rate) -> BOK softmax (concentrate probability on rare correct trajectories)
         # V25: route by answer correctness, not mixed score (avoids point-inflated routing errors)
         # V31: Fixed z-score amplification bug — Easy path now uses true Dr.GRPO (raw centering)
-        if answer_scores is not None:
-            group_answer = torch.stack([answer_scores[j] for j in indices])
-            pass_rate = (group_answer >= _allwrong_answer_threshold).float().mean().item()
-        else:
-            pass_rate = (group_scores > _easy_score_threshold).float().mean().item()
         if pass_rate > _easy_threshold:
             n_easy_drgrpo += K
             for j, global_i in enumerate(indices):
@@ -673,21 +923,20 @@ def compute_bok_grpo_advantage(
         # ---- V3: Winner Amplification ----
         # Boost correct-trajectory advantages proportional to their rarity.
         # Rare correct solutions (low pass_rate) get stronger gradient.
-        if _winner_boost > 0 and answer_scores is not None:
-            group_answer = torch.stack([answer_scores[j] for j in indices])
-            n_correct = int((group_answer >= _allwrong_answer_threshold).sum().item())
+        if _winner_boost > 0 and group_has_answer_routing:
+            n_correct = int(group_correct.sum().item())
             if 0 < n_correct < K:
                 boost = min(_winner_boost, math.sqrt(K / max(n_correct, 1)))
                 for j, global_i in enumerate(indices):
-                    if answer_scores[global_i] >= _allwrong_answer_threshold:
+                    if group_correct[j]:
                         advantages_1d[global_i] = advantages_1d[global_i] * boost
                 n_winner_boosted += K
 
         # ---- V3: Quality-Ranked BoK ----
         # Among correct trajectories, add bonus for higher point quality.
         # Encourages model to learn the best correct path, not just any correct path.
-        if _quality_bonus > 0 and answer_scores is not None:
-            correct_indices = [j for j in indices if answer_scores[j] >= _allwrong_answer_threshold]
+        if _quality_bonus > 0 and group_has_answer_routing:
+            correct_indices = [global_i for local_i, global_i in enumerate(indices) if group_correct[local_i]]
             if len(correct_indices) >= 2:
                 # quality ≈ point + format component (overall - 0.6*answer)
                 qualities = [scores[j].item() - 0.6 for j in correct_indices]
@@ -702,13 +951,6 @@ def compute_bok_grpo_advantage(
         # This preserves the directional signal (best wrong > worst wrong) but
         # prevents overpowered positive advantage that would push wrong answers too hard.
         if _allwrong_cap > 0:
-            if answer_scores is not None:
-                # Precise detection using per-sample answer scores from reward function
-                group_answer_scores = torch.stack([answer_scores[j] for j in indices])
-                is_allwrong = (group_answer_scores < _allwrong_answer_threshold).all().item()
-            else:
-                # Fallback: use overall scores (less precise but backward-compatible)
-                is_allwrong = (group_scores < _allwrong_answer_threshold).all().item()
             if is_allwrong:
                 n_allwrong_capped += K
                 # V25: force advantages to [-cap, 0] for all-wrong groups.
@@ -734,11 +976,13 @@ def compute_bok_grpo_advantage(
 
     # ---- Safety: detect and mitigate death spiral from DAPO filter ----
     low_var_rate = n_low_var / max(bsz, 1)
-    if _dapo_filter and low_var_rate > _dapo_auto_disable_threshold:
+    dapo_filtered_rate = n_dapo_filtered / max(bsz, 1)
+    if _dapo_filter and n_dapo_filtered > 0 and dapo_filtered_rate > _dapo_auto_disable_threshold:
         # DAPO filter is removing too many samples → death spiral risk.
         # Re-compute advantages for filtered samples using fallback instead of zero.
         print(
-            f"[BoK-GRPO][SAFETY] low_var_rate={low_var_rate:.1%} > {_dapo_auto_disable_threshold:.0%} "
+            f"[BoK-GRPO][SAFETY] dapo_filtered_rate={dapo_filtered_rate:.1%} > "
+            f"{_dapo_auto_disable_threshold:.0%} "
             f"with DAPO filter ON! Auto-falling back to '{_fallback_mode}' for "
             f"{n_dapo_filtered}/{bsz} filtered samples to prevent death spiral."
         )
@@ -748,6 +992,10 @@ def compute_bok_grpo_advantage(
             group_scores = torch.stack([scores[j] for j in indices])
             group_std = group_scores.std() if K > 1 else torch.tensor(0.0, device=scores.device)
             if group_std.item() <= low_var_threshold:
+                # Restore exactly the rows zeroed by DAPO. Independent
+                # all-correct filtering and binary tie-break groups stay intact.
+                if not all(global_i in dapo_filtered_rows for global_i in indices):
+                    continue
                 # Apply fallback advantage instead of zero
                 if _fallback_mode == "drgrpo":
                     for j, global_i in enumerate(indices):
@@ -760,6 +1008,12 @@ def compute_bok_grpo_advantage(
                     if batch_std.item() > eps:
                         for j, global_i in enumerate(indices):
                             advantages_1d[global_i] = (scores[global_i] - batch_mean) / (batch_std + eps)
+                if any(global_i in low_var_allwrong_rows for global_i in indices):
+                    for global_i in indices:
+                        v = min(0.0, advantages_1d[global_i].item())
+                        if _allwrong_cap > 0:
+                            v = max(-_allwrong_cap, v)
+                        advantages_1d[global_i] = v
 
     # ---- VCRL: Variance-based Curriculum RL ----
     # Per-group reward variance determines learning potential:
@@ -825,7 +1079,7 @@ def compute_bok_grpo_advantage(
             f"[BoK-GRPO] batch={bsz} tau={bok_tau:.3f} step={global_step}/{total_steps}  "
             f"low_var={n_low_var}/{bsz}  collapsed={n_collapsed}  lvt={low_var_threshold:.1e}  "
             f"tau_bumped={n_tau_bumped}/{bsz}  logit_cap={_logit_cap:.1f}  "
-            f"adv_normalize={_bok_adv_normalize}  fallback={_fallback_mode}  easy_drgrpo={n_easy_drgrpo}/{bsz}  all_correct_filtered={n_all_correct_filtered}/{bsz}  ac_released={n_all_correct_released}/{bsz}  allwrong_capped={n_allwrong_capped}/{bsz}  winner_boosted={n_winner_boosted}/{bsz}  "
+            f"adv_normalize={_bok_adv_normalize}  fallback={_fallback_mode}  easy_drgrpo={n_easy_drgrpo}/{bsz}  all_correct_filtered={n_all_correct_filtered}/{bsz}  ac_released={n_all_correct_released}/{bsz}  allwrong_capped={n_allwrong_capped}/{bsz}  binary_tiebreak={n_binary_tiebreak}/{bsz}  correctness_mixed={n_correctness_mixed}/{bsz}  correctness_partial={n_correctness_partial}/{bsz}  terminal_zero={n_terminal_zero}/{bsz}  winner_boosted={n_winner_boosted}/{bsz}  "
             f"adv_mean={advantages_1d.mean().item():.4f} adv_std={advantages_1d.std().item():.4f} "
             f"adv_range=[{advantages_1d.min().item():.3f}, {advantages_1d.max().item():.3f}]"
         )
@@ -846,7 +1100,7 @@ def compute_bok_grpo_advantage(
                 f"score: range=[{scores.min().item():.4f},{scores.max().item():.4f}] "
                 f"batch_mean={batch_mean.item():.4f} batch_std={batch_std.item():.4f} "
                 f"dapo_filter={_dapo_filter} dapo_filtered={n_dapo_filtered}/{bsz} "
-                f"easy_drgrpo={n_easy_drgrpo}/{bsz} all_correct_filtered={n_all_correct_filtered}/{bsz} ac_released={n_all_correct_released}/{bsz} allwrong_capped={n_allwrong_capped}/{bsz} "
+                f"easy_drgrpo={n_easy_drgrpo}/{bsz} all_correct_filtered={n_all_correct_filtered}/{bsz} ac_released={n_all_correct_released}/{bsz} allwrong_capped={n_allwrong_capped}/{bsz} binary_tiebreak={n_binary_tiebreak}/{bsz} "
                 f"smart_filter_th={_smart_filter_threshold:.3f} easy_threshold={_easy_threshold:.2f} easy_score_threshold={_easy_score_threshold:.2f} allwrong_cap={_allwrong_cap:.2f} allwrong_answer_th={_allwrong_answer_threshold:.2f} "
                 f"winner_boost={_winner_boost:.1f} easy_scale={_easy_scale:.2f} quality_bonus={_quality_bonus:.1f}"
             )
@@ -891,6 +1145,12 @@ def compute_bok_grpo_step_advantage(
     answer_scores: torch.Tensor = None,
     point_step_mask: torch.Tensor = None,
     point_step_value: torch.Tensor = None,
+    answer_correct_scores: torch.Tensor = None,
+    raw_success_scores: torch.Tensor = None,
+    trajectory_quality_scores: torch.Tensor = None,
+    action_step_span: torch.Tensor = None,
+    action_step_value: torch.Tensor = None,
+    action_step_type: torch.Tensor = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Outcome-primary BoK-GRPO with semantic point-step auxiliary credit.
 
@@ -917,6 +1177,9 @@ def compute_bok_grpo_step_advantage(
         global_step=global_step,
         total_steps=total_steps,
         answer_scores=answer_scores,
+        answer_correct_scores=answer_correct_scores,
+        raw_success_scores=raw_success_scores,
+        trajectory_quality_scores=trajectory_quality_scores,
     )
 
     bsz, seq_len = token_level_rewards.shape
@@ -938,6 +1201,154 @@ def compute_bok_grpo_step_advantage(
     step_min_gate = float(os.environ.get("BOK_STEP_MIN_GATE", os.environ.get("BOK_STEP_GATE_FLOOR", "0.2")))
     outcome_weight = float(os.environ.get("BOK_STEP_OUTCOME_WEIGHT", "1.0"))
     exclude_final = os.environ.get("BOK_STEP_EXCLUDE_FINAL", "1").lower() in ("1", "true", "yes")
+
+    def _step_gates() -> torch.Tensor:
+        if gate_mode == "none":
+            return torch.ones_like(outcome_1d)
+        if gate_mode in ("positive_outcome", "traj_positive"):
+            return (outcome_1d > 0).to(dtype=token_level_rewards.dtype)
+        if gate_mode in ("outcome_sigmoid", "traj_soft"):
+            return torch.sigmoid(outcome_1d)
+        if gate_mode in ("answer_hard", "hard_answer"):
+            if answer_scores is not None:
+                fallback_hard = (answer_scores.to(dtype=token_level_rewards.dtype) >= 0.5).to(
+                    dtype=token_level_rewards.dtype
+                )
+            else:
+                fallback_hard = (outcome_1d > 0).to(dtype=token_level_rewards.dtype)
+            if answer_correct_scores is not None:
+                binary_scores = answer_correct_scores.to(dtype=token_level_rewards.dtype)
+                binary_hard = (torch.nan_to_num(binary_scores, nan=0.0) >= 0.5).to(
+                    dtype=token_level_rewards.dtype
+                )
+                return torch.where(torch.isfinite(binary_scores), binary_hard, fallback_hard)
+            return fallback_hard
+
+        # answer_soft / soft_count_closeness / answer
+        if answer_scores is not None:
+            gates = torch.nan_to_num(
+                answer_scores.to(dtype=token_level_rewards.dtype), nan=0.0, posinf=1.0, neginf=0.0
+            ).clamp(0.0, 1.0)
+        else:
+            gates = torch.sigmoid(outcome_1d)
+        if step_min_gate > 0:
+            gates = step_min_gate + (1.0 - step_min_gate) * gates
+        return gates
+
+    if action_step_span is not None:
+        if action_step_span.ndim != 3 or action_step_span.shape[0] != bsz or action_step_span.shape[2] != 2:
+            raise ValueError("action_step_span must have shape (batch, events, 2).")
+        expected_event_shape = tuple(action_step_span.shape[:2])
+        if action_step_value is None or tuple(action_step_value.shape) != expected_event_shape:
+            raise ValueError("action_step_value must align with action_step_span events.")
+        if action_step_type is None or tuple(action_step_type.shape) != expected_event_shape:
+            raise ValueError("action_step_type must align with action_step_span events.")
+        if ((action_step_type < 0) | (action_step_type > 4)).any():
+            raise ValueError("action_step_type contains an unsupported event type ID.")
+        if ((action_step_type != 1) & (action_step_value != 0)).any():
+            raise ValueError("Only point events may carry native local action value.")
+        if not torch.isfinite(action_step_value).all():
+            raise ValueError("Non-finite native action value.")
+
+        event_present = action_step_type > 0
+        valid_lengths_for_spans = response_mask.long().sum(dim=-1)
+        starts, ends = action_step_span[..., 0], action_step_span[..., 1]
+        if ((starts < 0) | (ends < starts) | (ends > valid_lengths_for_spans.unsqueeze(1))).any():
+            raise ValueError("action_step_span contains an invalid or out-of-response span.")
+        credited = (action_step_type == 1) | (action_step_type == 2)
+        if (credited & (ends <= starts)).any():
+            raise ValueError("point/answer action spans must have positive length.")
+        if (((action_step_type == 3) | (action_step_type == 4)) & (ends != starts)).any():
+            raise ValueError("cap/abort action markers must have zero-length spans.")
+        action_step_type_metadata = action_step_type.detach().cpu().tolist()
+        event_present_metadata = event_present.detach().cpu().tolist()
+        starts_metadata = starts.detach().cpu().tolist()
+        ends_metadata = ends.detach().cpu().tolist()
+        event_adv = torch.zeros_like(action_step_value, dtype=token_level_rewards.dtype)
+        id2indices: dict = defaultdict(list)
+        for row_idx in range(bsz):
+            id2indices[index[row_idx]].append(row_idx)
+        n_action_events = sum(sum(bool(value) for value in row) for row in event_present_metadata)
+        low_var_flags: list[torch.Tensor] = []
+        for _, indices in id2indices.items():
+            # Align the kth point with the kth point, not the kth ledger slot:
+            # rows may terminate early and therefore place answer/cap markers at
+            # different absolute event indices.  Only point events carry local
+            # process quality; terminal answer/cap/abort values stay neutral.
+            point_slots = {
+                row_idx: [
+                    event_idx
+                    for event_idx in range(action_step_span.shape[1])
+                    if event_present_metadata[row_idx][event_idx]
+                    and int(action_step_type_metadata[row_idx][event_idx]) == 1
+                ]
+                for row_idx in indices
+            }
+            max_point_events = max((len(slots) for slots in point_slots.values()), default=0)
+            for point_ordinal in range(max_point_events):
+                present = [row_idx for row_idx in indices if point_ordinal < len(point_slots[row_idx])]
+                if len(present) < 2:
+                    continue
+                event_indices = [point_slots[row_idx][point_ordinal] for row_idx in present]
+                values = torch.stack(
+                    [action_step_value[row_idx, event_idx] for row_idx, event_idx in zip(present, event_indices)]
+                )
+                value_std = values.std()
+                has_variance = value_std > step_low_var_threshold
+                normalized_candidate = (values - values.mean()) / (value_std + eps)
+                normalized = torch.where(has_variance, normalized_candidate, torch.zeros_like(values))
+                low_var_flags.append(~has_variance)
+                if step_clip > 0:
+                    normalized = normalized.clamp(-step_clip, step_clip)
+                for local_idx, (row_idx, event_idx) in enumerate(zip(present, event_indices)):
+                    event_adv[row_idx, event_idx] = normalized[local_idx]
+
+        advantages = outcome_weight * outcome_1d.unsqueeze(-1) * response_mask
+        gates = _step_gates()
+        # Scatter directly into one BxL signal.  The compact source tensors are
+        # BxEx2/BxE, so no BxExL allocation or broadcast temporary exists.
+        action_aux = torch.zeros_like(token_level_rewards)
+        for row_idx in range(bsz):
+            for event_idx in range(action_step_span.shape[1]):
+                if (
+                    not event_present_metadata[row_idx][event_idx]
+                    or int(action_step_type_metadata[row_idx][event_idx]) != 1
+                ):
+                    continue
+                start = int(starts_metadata[row_idx][event_idx])
+                end = int(ends_metadata[row_idx][event_idx])
+                local_advantage = step_lambda * gates[row_idx] * event_adv[row_idx, event_idx]
+                action_aux[row_idx, start:end] = local_advantage
+        # Native action spans are already decision-local; never re-center over
+        # the response because that would leak point credit into answer tails.
+        advantages = (advantages + action_aux) * response_mask
+        advantages = torch.nan_to_num(
+            advantages,
+            nan=0.0,
+            posinf=total_clip if total_clip > 0 else bok_clip,
+            neginf=-(total_clip if total_clip > 0 else bok_clip),
+        )
+        if total_clip > 0:
+            advantages = advantages.clamp(-total_clip, total_clip) * response_mask
+        _last_step = getattr(compute_bok_grpo_step_advantage, "_last_action_logged_step", -1)
+        if global_step != _last_step:
+            compute_bok_grpo_step_advantage._last_action_logged_step = global_step
+            n_low_var_actions = int(torch.stack(low_var_flags).sum().item()) if low_var_flags else 0
+            type_counts = {
+                action_type: sum(
+                    int(value == type_id)
+                    for row in action_step_type_metadata
+                    for value in row
+                )
+                for action_type, type_id in (("point", 1), ("answer", 2), ("cap", 3), ("abort", 4))
+            }
+            print(
+                f"[BoK-GRPO-Action] batch={bsz} step={global_step}/{total_steps} "
+                f"events={n_action_events} point={type_counts['point']} answer={type_counts['answer']} "
+                f"cap={type_counts['cap']} low_var={n_low_var_actions} "
+                f"gate={gate_mode} min_gate={step_min_gate:.3f} gate_mean={gates.mean().item():.4f} tail_leak=0"
+            )
+        return advantages, advantages.clone()
 
     has_explicit_mask = point_step_mask is not None and tuple(point_step_mask.shape) == tuple(token_level_rewards.shape)
     if has_explicit_mask:
@@ -1028,28 +1439,7 @@ def compute_bok_grpo_step_advantage(
                 step_adv_values[row_idx][step_idx] = normalized[local_idx]
                 n_step_values += 1
 
-    if gate_mode == "none":
-        gates = torch.ones_like(outcome_1d)
-    elif gate_mode in ("positive_outcome", "traj_positive"):
-        gates = (outcome_1d > 0).to(dtype=token_level_rewards.dtype)
-    elif gate_mode in ("outcome_sigmoid", "traj_soft"):
-        gates = torch.sigmoid(outcome_1d)
-    elif gate_mode in ("answer_hard", "hard_answer"):
-        if answer_scores is not None:
-            gates = (answer_scores.to(dtype=token_level_rewards.dtype) >= 0.5).to(dtype=token_level_rewards.dtype)
-        else:
-            gates = (outcome_1d > 0).to(dtype=token_level_rewards.dtype)
-    else:
-        # answer_soft / soft_count_closeness / answer use the available answer score.
-        # In StepCount this is usually binary or soft-decayed; min_gate preserves
-        # a small amount of point learning for answer-wrong but visually useful traces.
-        if answer_scores is not None:
-            gates = torch.nan_to_num(answer_scores.to(dtype=token_level_rewards.dtype), nan=0.0, posinf=1.0, neginf=0.0)
-            gates = gates.clamp(0.0, 1.0)
-        else:
-            gates = torch.sigmoid(outcome_1d)
-        if step_min_gate > 0:
-            gates = step_min_gate + (1.0 - step_min_gate) * gates
+    gates = _step_gates()
 
     aux_components = []
     n_active_spans = 0
@@ -1415,3 +1805,43 @@ def compute_kl(log_probs: torch.FloatTensor, ref_log_probs: torch.FloatTensor, k
         return F.kl_div(ref_log_probs, log_probs, log_target=True, reduction="none").sum(-1)
 
     raise NotImplementedError(f"Unknown KL penalty: {kl_penalty}.")
+
+
+def compute_stable_low_var_kl(
+    log_probs: torch.FloatTensor,
+    ref_log_probs: torch.FloatTensor,
+    exp_clamp: float = 20.0,
+) -> torch.Tensor:
+    """Sampled-token low-variance KL with logarithmic tangent continuation.
+
+    The exact ``exp(x) - x - 1`` estimator is used on the central interval.
+    Outside it, a logarithmically compressed continuation matches the value
+    and derivative at the boundary. This keeps both the value and restoring
+    gradient finite and non-zero across the complete finite fp32 domain.
+    """
+    if log_probs.shape != ref_log_probs.shape:
+        raise ValueError(f"KL log-prob shapes differ: {tuple(log_probs.shape)} != {tuple(ref_log_probs.shape)}")
+    if exp_clamp <= 0 or not np.isfinite(exp_clamp):
+        raise ValueError(f"exp_clamp must be finite and positive, got {exp_clamp}.")
+    # Subtract in fp64 so opposite-sign extreme finite fp32 inputs do not
+    # overflow before the continuation is applied.
+    log_ratio = ref_log_probs.double() - log_probs.double()
+    central = log_ratio.clamp(-exp_clamp, exp_clamp)
+    central_value = torch.expm1(central) - central
+    tail_scale = 256.0
+
+    upper_boundary = torch.as_tensor(exp_clamp, dtype=log_ratio.dtype, device=log_ratio.device)
+    upper_value = torch.expm1(upper_boundary) - upper_boundary
+    upper_slope = torch.expm1(upper_boundary)
+    upper_delta = (log_ratio - upper_boundary).clamp_min(0.0)
+    upper = upper_value + upper_slope * tail_scale * torch.log1p(upper_delta / tail_scale)
+
+    lower_boundary = -upper_boundary
+    lower_value = torch.expm1(lower_boundary) - lower_boundary
+    lower_slope = torch.expm1(lower_boundary)
+    lower_delta = (lower_boundary - log_ratio).clamp_min(0.0)
+    lower = lower_value - lower_slope * tail_scale * torch.log1p(lower_delta / tail_scale)
+
+    continued = torch.where(log_ratio > upper_boundary, upper, central_value)
+    continued = torch.where(log_ratio < lower_boundary, lower, continued)
+    return continued.clamp_min(0.0).float()

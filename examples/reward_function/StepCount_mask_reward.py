@@ -190,6 +190,11 @@ def _mask_require_enabled() -> bool:
     return os.environ.get("STEPCOUNT_MASK_REQUIRE", "0") == "1"
 
 
+def _v37_reward_fail_closed_enabled() -> bool:
+    """Whether reward infrastructure failures must abort the training batch."""
+    return os.environ.get("V37_REWARD_FAIL_CLOSED", "0").lower() in ("1", "true", "yes")
+
+
 def _get_mask_helper():
     """获取或初始化 MaskRewardHelper（懒加载）"""
     global _MASK_HELPER
@@ -1155,6 +1160,22 @@ def _count_point_key_aliases(predict: str) -> int:
     return len(_POINT_KEY_ALIAS_RE.findall(predict)) + len(_BROKEN_POINT_KEY_ALIAS_RE.findall(predict))
 
 
+def _parse_point_payload(raw_payload: str) -> Optional[Tuple[Tuple[float, float], str]]:
+    raw = _normalize_point_keys(raw_payload.strip())
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict) and "point_2d" in data:
+            point_2d = data["point_2d"]
+            label = data.get("label", "object")
+            return ((float(point_2d[0]), float(point_2d[1])), label)
+    except Exception:
+        pass
+    if os.environ.get("TRAJ_POINT_STRICT_JSON", "1") == "1":
+        return None
+    coords = parse_coordinates_from_text(raw)
+    return (coords[0], "object") if coords else None
+
+
 def _parse_pred_point(predict: str) -> Optional[Tuple[Tuple[float, float], str]]:
     """从预测中解析点坐标与标签
 
@@ -1172,34 +1193,43 @@ def _parse_pred_point(predict: str) -> Optional[Tuple[Tuple[float, float], str]]
     if not content_match:
         return None
 
-    raw = _normalize_point_keys(content_match.group(1).strip())
+    return _parse_point_payload(content_match.group(1))
 
-    # 优先 JSON
-    try:
-        data = json.loads(raw)
-        if isinstance(data, dict) and "point_2d" in data:
-            point_2d = data["point_2d"]
-            label = data.get("label", "object")
-            return ((float(point_2d[0]), float(point_2d[1])), label)
-    except Exception:
-        pass
 
-    # 严格模式：JSON 失败直接拒绝，导致 point_reward=0，强迫模型维持合法 JSON。
-    if os.environ.get("TRAJ_POINT_STRICT_JSON", "1") == "1":
-        return None
+def _parse_pred_point_slots(predict: str) -> List[Optional[Tuple[Tuple[float, float], str]]]:
+    """Return reward slots, preserving malformed ordinals under V37 contracts.
 
-    # 向后兼容兔底路径 (TRAJ_POINT_STRICT_JSON=0)
-    coords = parse_coordinates_from_text(raw)
-    if coords and len(coords) > 0:
-        return (coords[0], "object")
-
-    return None
+    V36 filtered malformed payloads before counting/evaluating steps.  That is
+    the exact default path.  V37 strict winner uses the same slot semantics in
+    baseline and progress; native ACTION additionally requires its ledger-side
+    parser contract.
+    """
+    parsed = [_parse_point_payload(raw) for raw in re.findall(r"<point>(.*?)</point>", predict, re.DOTALL)]
+    strict_slot_contract = os.environ.get("V37_STRICT_POINT_PARSER_CONTRACT", "0").lower() in (
+        "1", "true", "yes",
+    )
+    action_slot_contract = os.environ.get("V37_ACTION_PARSER_CONTRACT", "0").lower() in (
+        "1", "true", "yes",
+    )
+    strict_winner = os.environ.get("V37_RAW_SUCCESS_STRICT_WINNER", "0").lower() in (
+        "1", "true", "yes",
+    )
+    action_mode = os.environ.get("ACTION_EVENT_REWARD_ENABLE", "0").lower() in ("1", "true", "yes")
+    if action_mode and not action_slot_contract:
+        raise RuntimeError(
+            "ACTION_EVENT_REWARD_ENABLE requires V37_ACTION_PARSER_CONTRACT=1 "
+            "to preserve malformed point ordinals"
+        )
+    if strict_slot_contract or strict_winner or action_mode:
+        return parsed
+    return [point for point in parsed if point is not None]
 
 
 def _parse_pred_points(predict: str) -> List[Tuple[Tuple[float, float], str]]:
+    # Keep this implementation byte-for-byte equivalent in semantics to V36:
+    # one independently parsed result per closed tag, malformed entries dropped.
     parsed_points: List[Tuple[Tuple[float, float], str]] = []
-    matches = re.findall(r"<point>(.*?)</point>", predict, re.DOTALL)
-    for raw in matches:
+    for raw in re.findall(r"<point>(.*?)</point>", predict, re.DOTALL):
         parsed = _parse_pred_point(f"<point>{raw}</point>")
         if parsed is not None:
             parsed_points.append(parsed)
@@ -1210,11 +1240,117 @@ def _extract_last_answer_number(predict: str) -> Optional[int]:
     answer_matches = re.findall(r"<answer>(.*?)</answer>", predict, re.DOTALL)
     if not answer_matches:
         return None
-    return parse_number(answer_matches[-1].strip())
+    answer_text = answer_matches[-1].strip()
+    # V37 opt-in: exact-answer routing must not accept ambiguous prose such as
+    # "5 or 6" or "5 objects". The default remains V36's permissive parser.
+    strict_integer = os.environ.get("TRAJ_STRICT_ANSWER_INTEGER_PARSE", "0").lower() in (
+        "1", "true", "yes",
+    )
+    if strict_integer:
+        return int(answer_text) if re.fullmatch(r"[+-]?\d+", answer_text) else None
+    return parse_number(answer_text)
 
 
 def _has_answer_tag(predict: str) -> bool:
     return re.search(r"<answer>.*?</answer>", predict, re.DOTALL) is not None
+
+
+def _has_single_terminal_answer(predict: str) -> bool:
+    """Require exactly one answer whose close tag ends model output."""
+    if predict.count("<answer>") != 1 or predict.count("</answer>") != 1:
+        return False
+    return re.search(r"<answer>.*?</answer>\s*\Z", predict, re.DOTALL) is not None
+
+
+def _strict_integer_value(value: Any) -> Optional[int]:
+    """Parse one complete integer value without accepting prose or booleans."""
+    if isinstance(value, bool) or value is None:
+        return None
+    if type(value) is int:
+        return value
+    if isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value.strip()):
+        return int(value.strip())
+    return None
+
+
+def _strict_point_payload_complete(raw: str, ordinal: int) -> bool:
+    """Validate the canonical V37 point payload used by strict winner routing."""
+    try:
+        data = json.loads(raw.strip())
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return False
+    if not isinstance(data, dict) or "point_2d" not in data:
+        return False
+    point = data["point_2d"]
+    if not isinstance(point, list) or len(point) != 2:
+        return False
+    if any(
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not math.isfinite(float(value))
+        for value in point
+    ):
+        return False
+    return _strict_integer_value(data.get("count_number")) == ordinal
+
+
+def _strict_trajectory_structure(predict: str, expected_point_steps: int) -> Dict[str, bool]:
+    """Validate ordered point actions followed by one terminal answer.
+
+    This is intentionally separate from the graded format reward.  Strict
+    winner eligibility is a discrete contract and must not be inferred from a
+    configurable floating-point shaping score.
+    """
+    control = re.compile(r"</?(?:point|answer)>")
+    state = "outside"
+    answer_seen = False
+    point_start: Optional[int] = None
+    point_payloads: List[str] = []
+    tag_order_violation = False
+
+    for match in control.finditer(predict):
+        tag = match.group(0)
+        if tag == "<point>":
+            if state != "outside" or answer_seen:
+                tag_order_violation = True
+                break
+            state = "point"
+            point_start = match.end()
+        elif tag == "</point>":
+            if state != "point" or point_start is None:
+                tag_order_violation = True
+                break
+            point_payloads.append(predict[point_start:match.start()])
+            state = "outside"
+            point_start = None
+        elif tag == "<answer>":
+            if state != "outside" or answer_seen:
+                tag_order_violation = True
+                break
+            state = "answer"
+            answer_seen = True
+        else:  # </answer>
+            if state != "answer":
+                tag_order_violation = True
+                break
+            state = "answered"
+
+    if state != "answered" or not answer_seen:
+        tag_order_violation = True
+
+    expected = max(0, int(expected_point_steps))
+    point_count_violation = len(point_payloads) != expected
+    payload_violation = any(
+        not _strict_point_payload_complete(raw, ordinal)
+        for ordinal, raw in enumerate(point_payloads, start=1)
+    )
+    complete = not (tag_order_violation or point_count_violation or payload_violation)
+    return {
+        "complete": complete,
+        "tag_order_violation": tag_order_violation,
+        "point_count_violation": point_count_violation,
+        "payload_violation": payload_violation,
+    }
 
 
 def _trajectory_tag_balance_violation(predict: str) -> bool:
@@ -1399,16 +1535,19 @@ def _trajectory_point_dense_reward(
     if not point_sequence:
         return 0.0
 
-    pred_points = _parse_pred_points(predict)
-    if not pred_points:
+    pred_point_slots = _parse_pred_point_slots(predict)
+    if not pred_point_slots:
         return 0.0
 
     used_sample_ids: Set[str] = set()
     total_score = 0.0
-    matched_steps = min(len(pred_points), len(point_sequence))
+    matched_steps = min(len(pred_point_slots), len(point_sequence))
 
     for step_idx in range(matched_steps):
-        pred_point, pred_label = pred_points[step_idx]
+        parsed_point = pred_point_slots[step_idx]
+        if parsed_point is None:
+            continue
+        pred_point, pred_label = parsed_point
         gt_step = point_sequence[step_idx]
         gt_point = gt_step.get("point_2d", [0.0, 0.0])
         gt_label = gt_step.get("label", pred_label)
@@ -1427,6 +1566,8 @@ def _trajectory_point_dense_reward(
             image_path=image_path,
         )
         if mask_score is None:
+            if _v37_reward_fail_closed_enabled():
+                raise RuntimeError("Required trajectory mask lookup returned no score.")
             step_score = point_reward(synthetic_predict, gt_point, img_width=img_width, img_height=img_height)
         else:
             step_score = mask_score
@@ -1435,7 +1576,7 @@ def _trajectory_point_dense_reward(
 
     point_dense_score = clamp_reward(total_score / max(len(point_sequence), 1))
     extra_pt_lambda = float(os.environ.get("TRAJ_EXTRA_POINT_PENALTY_LAMBDA", "1.0"))
-    extra_points = max(0, len(pred_points) - len(point_sequence))
+    extra_points = max(0, len(pred_point_slots) - len(point_sequence))
     if extra_points > 0 and extra_pt_lambda > 0:
         point_dense_score = clamp_reward(
             point_dense_score - extra_pt_lambda * extra_points / float(max(len(point_sequence), 1))
@@ -1461,16 +1602,20 @@ def _trajectory_point_step_scores(
     if not point_sequence:
         return []
 
-    pred_points = _parse_pred_points(predict)
-    if not pred_points:
+    pred_point_slots = _parse_pred_point_slots(predict)
+    if not pred_point_slots:
         return []
 
     used_sample_ids: Set[str] = set()
-    matched_steps = min(len(pred_points), len(point_sequence))
+    matched_steps = min(len(pred_point_slots), len(point_sequence))
     step_scores: List[float] = []
 
     for step_idx in range(matched_steps):
-        pred_point, pred_label = pred_points[step_idx]
+        parsed_point = pred_point_slots[step_idx]
+        if parsed_point is None:
+            step_scores.append(0.0)
+            continue
+        pred_point, pred_label = parsed_point
         gt_step = point_sequence[step_idx]
         gt_point = gt_step.get("point_2d", [0.0, 0.0])
         gt_label = gt_step.get("label", pred_label)
@@ -1489,6 +1634,8 @@ def _trajectory_point_step_scores(
             image_path=image_path,
         )
         if mask_score is None:
+            if _v37_reward_fail_closed_enabled():
+                raise RuntimeError("Required trajectory step mask lookup returned no score.")
             step_score = point_reward(synthetic_predict, gt_point, img_width=img_width, img_height=img_height)
         else:
             step_score = mask_score
@@ -1531,15 +1678,19 @@ def _trajectory_point_dense_reward_without_gt_points_details(
     """
     helper = _get_mask_helper()
     if helper is None:
+        if _v37_reward_fail_closed_enabled():
+            raise RuntimeError("Required mask helper is unavailable for trajectory reward.")
         return 0.0, [], [], [], 0.0, 0.0
 
-    pred_points = _parse_pred_points(predict)
-    if not pred_points:
+    pred_point_slots = _parse_pred_point_slots(predict)
+    if not pred_point_slots:
         return 0.0, [], [], [], 0.0, 0.0
 
     sequence_id, sequence_samples = helper.get_sequence_from_image_path(image_path)
     if not sequence_samples:
         _mask_debug_tick(mask_no_sequence=1)
+        if _v37_reward_fail_closed_enabled():
+            raise RuntimeError(f"Required mask sequence is missing for image_path={image_path!r}.")
 
         # Fallback for datasets that only provide numeric GT answer and no usable
         # image_path/sequence id (common in some eval parquet exports).
@@ -1550,7 +1701,7 @@ def _trajectory_point_dense_reward_without_gt_points_details(
 
         gt_count_raw = gt_data.get("count_number")
         gt_count = parse_number(str(gt_count_raw)) if gt_count_raw is not None else None
-        pred_count = len(pred_points)
+        pred_count = len(pred_point_slots)
 
         if gt_count is None or gt_count < 0:
             # If GT count is unavailable, keep conservative zero fallback.
@@ -1609,7 +1760,7 @@ def _trajectory_point_dense_reward_without_gt_points_details(
 
     used_sample_ids: Set[str] = set()
     matched_unused = 0.0
-    max_eval_steps = int(min(len(pred_points), target_count))
+    max_eval_steps = int(min(len(pred_point_slots), target_count))
     ref_sample_id = sequence_samples[0].get("sample_id") if sequence_samples else None
 
     # Load the sequence's masks ONCE for this trajectory and reuse across every
@@ -1618,6 +1769,13 @@ def _trajectory_point_dense_reward_without_gt_points_details(
     # seq_len) CephFS reads per trajectory. This is the dominant cost when GPUs
     # idle during reward evaluation. Result is numerically identical.
     cached_sequence_masks = helper.get_sequence_masks(sequence_id)
+    if _v37_reward_fail_closed_enabled():
+        loaded_sample_ids = {sample_id for sample_id, _, _ in cached_sequence_masks}
+        if len(loaded_sample_ids) < target_count:
+            raise RuntimeError(
+                f"Required mask sequence {sequence_id!r} is incomplete: "
+                f"loaded={len(loaded_sample_ids)} target={target_count}."
+            )
 
     denom = float(max(target_count, 1))
     step_contribs: List[float] = []
@@ -1634,7 +1792,14 @@ def _trajectory_point_dense_reward_without_gt_points_details(
     total_miss_decay_score = 0.0
 
     for step_idx in range(max_eval_steps):
-        pred_point, _ = pred_points[step_idx]
+        parsed_point = pred_point_slots[step_idx]
+        if parsed_point is None:
+            step_contribs.append(0.0)
+            step_hit_any.append(0.0)
+            step_is_duplicate.append(0.0)
+            _traj_mask_debug_tick(traj_steps_evaluated=1, traj_miss=1)
+            continue
+        pred_point, _ = parsed_point
         is_pixel_coord = not (0.0 <= pred_point[0] <= 1.0 and 0.0 <= pred_point[1] <= 1.0)
         check = helper.check_point_in_sequence_masks(
             sequence_id=sequence_id,
@@ -1689,11 +1854,102 @@ def _trajectory_point_dense_reward_without_gt_points_details(
     point_dense_score = clamp_reward(float(matched_unused) / denom + total_miss_decay_score)
     # --- Extra point penalty: eliminate structural overcounting advantage ---
     _extra_pt_lambda = float(os.environ.get("TRAJ_EXTRA_POINT_PENALTY_LAMBDA", "1.0"))
-    _extra_points = max(0, len(pred_points) - target_count)
+    _extra_points = max(0, len(pred_point_slots) - target_count)
     if _extra_points > 0 and _extra_pt_lambda > 0:
         _extra_penalty = _extra_pt_lambda * _extra_points / denom
         point_dense_score = clamp_reward(point_dense_score - _extra_penalty)
     return point_dense_score, step_contribs, step_hit_any, step_is_duplicate, float(target_count), float(max_eval_steps)
+
+
+def _strict_duplicate_evidence(
+    predict: str,
+    gt_data: Dict,
+    image_path: Optional[str],
+) -> Tuple[List[float], List[float], bool]:
+    """Return object-level duplicate/hit flags plus evidence completeness.
+
+    Strict winner routing never falls back to coordinate equality or a count
+    simulator.  Every emitted point must be checked against a loaded sequence
+    mask, and a repeated hit is keyed by the matched object/sample id.
+    """
+    point_slots = _parse_pred_point_slots(predict)
+    raw_target = gt_data.get("count_number")
+    target = parse_number(str(raw_target)) if raw_target is not None else None
+    if target is None:
+        target = len(gt_data.get("point_sequence", []))
+    target = max(0, int(target))
+
+    helper = _get_mask_helper()
+    if helper is None:
+        if _v37_reward_fail_closed_enabled():
+            raise RuntimeError("Required mask helper is unavailable for strict winner evidence.")
+        return [], [], False
+    sequence_id, sequence_samples = helper.get_sequence_from_image_path(image_path)
+    if not sequence_id or not sequence_samples:
+        _mask_debug_tick(mask_no_sequence=1)
+        if _v37_reward_fail_closed_enabled():
+            raise RuntimeError(f"Required strict-winner mask sequence is missing for {image_path!r}.")
+        return [], [], False
+    sequence_masks = helper.get_sequence_masks(sequence_id)
+    loaded_ids = {sample_id for sample_id, _, _ in sequence_masks}
+    if len(loaded_ids) < target:
+        _mask_debug_tick(mask_no_masks_loaded=1)
+        if _v37_reward_fail_closed_enabled():
+            raise RuntimeError(
+                f"Required strict-winner mask sequence {sequence_id!r} is incomplete: "
+                f"loaded={len(loaded_ids)} target={target}."
+            )
+        return [], [], False
+
+    if target == 0:
+        return [], [], True
+
+    reference_sample_id = sequence_samples[0].get("sample_id")
+    used_sample_ids: Set[str] = set()
+    duplicate_flags: List[float] = []
+    hit_flags: List[float] = []
+    for parsed in point_slots:
+        if parsed is None:
+            # A malformed model action is a trajectory-quality failure, not a
+            # missing mask-infrastructure route. Keep the vector aligned while
+            # raw_success/format diagnostics reject the action independently.
+            duplicate_flags.append(0.0)
+            hit_flags.append(0.0)
+            continue
+        point, _ = parsed
+        if not all(math.isfinite(float(value)) for value in point):
+            duplicate_flags.append(0.0)
+            hit_flags.append(0.0)
+            continue
+        is_pixel_coord = not (0.0 <= point[0] <= 1.0 and 0.0 <= point[1] <= 1.0)
+        check = helper.check_point_in_sequence_masks(
+            sequence_id=sequence_id,
+            point=point,
+            used_sample_ids=used_sample_ids,
+            is_pixel_coord=is_pixel_coord,
+            reference_sample_id=reference_sample_id,
+            sequence_masks=sequence_masks,
+        )
+        is_duplicate = bool(check.get("is_duplicate"))
+        hit_unused = bool(check.get("in_unused_mask"))
+        duplicate_flags.append(1.0 if is_duplicate else 0.0)
+        hit_flags.append(1.0 if hit_unused else 0.0)
+        if hit_unused:
+            sample_id = check.get("matched_sample_id")
+            if not sample_id:
+                if _v37_reward_fail_closed_enabled():
+                    raise RuntimeError("Mask matcher reported an unused hit without a target identity.")
+                return [], [], False
+            used_sample_ids.add(sample_id)
+        elif bool(check.get("in_any_mask")) and not is_duplicate:
+            if _v37_reward_fail_closed_enabled():
+                raise RuntimeError("Mask matcher returned an internally inconsistent target classification.")
+            return [], [], False
+
+    # Completeness attests that this sample resolved to a complete mask route.
+    # Point count, payload validity, misses, and duplicates remain model-quality
+    # signals and must not make infrastructure coverage impossible to satisfy.
+    return duplicate_flags, hit_flags, True
 
 
 def _trajectory_coverage_stats(
@@ -2180,6 +2436,7 @@ def compute_score(
     sample_id: Any = None,
     sample_index: int = -1,
     is_eval: bool = False,
+    action_events: List[Dict[str, Any]] = None,
 ) -> Dict[str, float]:
     """
     计算综合得分 - 兼容 verl 训练框架
@@ -2206,6 +2463,10 @@ def compute_score(
         "format": 0.0,
         "content": 0.0,
         "answer": 0.0,
+        "answer_correct": 0.0,
+        "answer_exact": 0.0,
+        "raw_success": 0.0,
+        "trajectory_quality": 0.0,
         "point": 0.0,
         "is_point_task": 0.0,
         "is_count_task": 0.0,
@@ -2215,6 +2476,8 @@ def compute_score(
         "format_fail": 0.0,
         "no_point_pred": 0.0,
         "turns_exceeded": 0.0,
+        "early_stop": 0.0,
+        "mask_evidence_complete": 0.0,
         "stopped_by_answer": 0.0,
         "stop_violation": 1.0,
         "tag_balance_violation": 0.0,
@@ -2271,8 +2534,15 @@ def compute_score(
             expected_steps = len(gt_data.get("point_sequence", []))
             if expected_steps <= 0:
                 expected_steps = parse_number(str(gt_data.get("count_number", 0))) or 0
-            pred_points = _parse_pred_points(predict)
+            pred_point_slots = _parse_pred_point_slots(predict)
+            pred_points = [parsed for parsed in pred_point_slots if parsed is not None]
             stopped_by_answer = _has_answer_tag(predict)
+            action_event_mode = str(os.environ.get("ACTION_EVENT_REWARD_ENABLE", "0")).lower() in (
+                "1", "true", "yes"
+            )
+            strict_raw_success_winner = str(
+                os.environ.get("V37_RAW_SUCCESS_STRICT_WINNER", "0")
+            ).lower() in ("1", "true", "yes")
             effective_max_turns = compute_adaptive_max_turns_from_gt(
                 gt_data,
                 max_turns=max_turns,
@@ -2281,8 +2551,23 @@ def compute_score(
             )
             # In interleaved rollout, max_turns is the hard cap of turns. If we see too many point tags,
             # treat it as exceeding and zero out reward.
-            turns_exceeded = len(pred_points) >= effective_max_turns
+            ledger_cap = bool(action_events) and any(event.get("type") == "cap" for event in action_events)
+            ledger_abort = bool(action_events) and any(event.get("type") == "abort" for event in action_events)
+            abort_reasons = {
+                str(event.get("stop_reason"))
+                for event in (action_events or [])
+                if event.get("type") == "abort"
+            }
+            turns_exceeded = ledger_cap or len(pred_point_slots) >= effective_max_turns
             pred_answer = _extract_last_answer_number(predict) if stopped_by_answer else None
+            gt_answer = gt_data.get("count_number")
+            # Independent binary outcome channel.  This intentionally ignores
+            # point quality, coverage, format/integrity shaping and turn limits:
+            # it answers only whether an explicit, parseable <answer> equals GT.
+            answer_correct = 0.0
+            if stopped_by_answer and pred_answer is not None and gt_answer is not None:
+                answer_correct = 1.0 if int(pred_answer) == int(gt_answer) else 0.0
+            answer_exact = answer_correct
             answer_gated = False
             tag_balance_violation = _trajectory_tag_balance_violation(predict)
             (
@@ -2301,7 +2586,7 @@ def compute_score(
                 "1",
                 "true",
                 "yes",
-            )
+            ) or action_event_mode or strict_raw_success_winner
 
             # For W&B/verl compatibility we only emit scalar floats.
             # `step_scores` are per-step contributions that (approximately) sum to `point_dense_score`.
@@ -2312,11 +2597,11 @@ def compute_score(
             point_eval_steps: float = 0.0
 
             point_dense_score = 0.0
-            if not turns_exceeded:
+            if not turns_exceeded or action_event_mode:
                 # Special-case: GT expects zero points (answer==0). We should not force <point>.
                 # Give full point score iff the model also predicts zero points; otherwise 0.
                 if expected_steps == 0:
-                    point_dense_score = 1.0 if len(pred_points) == 0 else 0.0
+                    point_dense_score = 1.0 if len(pred_point_slots) == 0 else 0.0
                 else:
                     if gt_data.get("point_sequence"):
                         point_dense_score = _trajectory_point_dense_reward(
@@ -2344,7 +2629,12 @@ def compute_score(
                                 image_path=image_path,
                             )
                         except Exception:
-                            pass  # point_dense_score stays 0.0, step_scores stays []
+                            if _v37_reward_fail_closed_enabled():
+                                raise
+                            # Legacy fallback remains nonfatal when mask use is
+                            # optional. Strict winner later marks missing
+                            # duplicate evidence ineligible.
+                            pass
                     else:
                         point_dense_score = _trajectory_point_dense_reward_without_gt_points(
                             predict=predict,
@@ -2352,7 +2642,9 @@ def compute_score(
                             image_path=image_path,
                         )
 
-            if return_step_scores and (not turns_exceeded) and expected_steps > 0:
+            if (return_step_scores or strict_raw_success_winner) and (
+                not turns_exceeded or action_event_mode
+            ) and expected_steps > 0:
                 if gt_data.get("point_sequence"):
                     try:
                         raw_step_scores = _trajectory_point_step_scores(
@@ -2365,11 +2657,35 @@ def compute_score(
                         )
                         denom = float(max(len(gt_data.get("point_sequence", [])), 1))
                         step_scores = [clamp_reward(float(s) / denom) for s in raw_step_scores]
+                        step_hit_any = [1.0 if float(s) > 0 else 0.0 for s in raw_step_scores]
                         point_target_count = float(len(gt_data.get("point_sequence", [])))
                         point_eval_steps = float(len(step_scores))
                     except Exception:
+                        if _v37_reward_fail_closed_enabled():
+                            raise
                         step_scores = []
                 # else: already computed above in the unified _details call
+
+            duplicate_evidence_complete = not strict_raw_success_winner
+            if strict_raw_success_winner:
+                try:
+                    (
+                        strict_duplicate_flags,
+                        strict_hit_flags,
+                        duplicate_evidence_complete,
+                    ) = _strict_duplicate_evidence(
+                        predict=predict,
+                        gt_data=gt_data,
+                        image_path=image_path,
+                    )
+                except Exception:
+                    if _v37_reward_fail_closed_enabled():
+                        raise
+                    strict_duplicate_flags, strict_hit_flags, duplicate_evidence_complete = [], [], False
+                # V37 diagnostics and routing use object-level mask identity;
+                # never infer a hit from a positive distance-decay score.
+                step_is_duplicate = strict_duplicate_flags
+                step_hit_any = strict_hit_flags
 
             count_number_point_penalty_weight = clamp_reward(
                 float(os.environ.get("TRAJ_COUNT_NUMBER_POINT_PENALTY_WEIGHT", "0.20"))
@@ -2391,7 +2707,7 @@ def compute_score(
 
             answer_point_count_consistent = True
             if stopped_by_answer and pred_answer is not None:
-                answer_point_count_consistent = int(pred_answer) == int(len(pred_points))
+                answer_point_count_consistent = int(pred_answer) == int(len(pred_point_slots))
             consistency_violation = 0.0 if answer_point_count_consistent else 1.0
 
             if not answer_point_count_consistent:
@@ -2401,7 +2717,7 @@ def compute_score(
                         "pred_answer=%s point_count=%s -> consistency penalty",
                         sample_index,
                         pred_answer,
-                        len(pred_points),
+                        len(pred_point_slots),
                     )
 
             strict_trajectory_integrity = str(
@@ -2432,6 +2748,50 @@ def compute_score(
                 or (hard_reject_count_number and point_count_number_violation)
                 or (strict_answer_point_consistency and (not answer_point_count_consistent))
             )
+            if action_event_mode:
+                answer_events = [event for event in (action_events or []) if event.get("type") == "answer"]
+                unique_closed_answer = (
+                    len(answer_events) == 1
+                    and bool(answer_events[0].get("closed"))
+                    and _has_single_terminal_answer(predict)
+                )
+            else:
+                unique_closed_answer = _has_single_terminal_answer(predict)
+            duplicate_violation = any(float(value) > 0.5 for value in step_is_duplicate)
+            strict_structure = _strict_trajectory_structure(predict, expected_steps)
+            strict_winner_format_violation = (
+                not strict_structure["complete"]
+                if strict_raw_success_winner
+                else float(format_score) < 1.0 - 1e-9
+            )
+            duplicate_evidence_violation = strict_raw_success_winner and not duplicate_evidence_complete
+            strict_winner_miss_violation = strict_raw_success_winner and (
+                len(step_hit_any) != expected_steps
+                or any(float(value) < 0.5 for value in step_hit_any)
+            )
+            raw_success = float(
+                answer_exact == 1.0
+                and unique_closed_answer
+                and not turns_exceeded
+                and not ledger_abort
+                and not tag_balance_violation
+                and not trajectory_integrity_violation
+                and not trajectory_hard_reject
+                and (
+                    not strict_raw_success_winner
+                    or (
+                        not duplicate_violation
+                        and not duplicate_evidence_violation
+                        and not strict_winner_miss_violation
+                        and not strict_winner_format_violation
+                    )
+                )
+            )
+            trajectory_quality = clamp_reward(
+                0.6 * float(point_dense_score)
+                + 0.3 * float(format_score)
+                + 0.1 * float(point_count_number_score)
+            )
 
             # ============================================================
             # Two-Level Reward Architecture (v5)
@@ -2459,7 +2819,6 @@ def compute_score(
                     and (not eval_require_integrity or not trajectory_integrity_violation)
                     and not trajectory_hard_reject
                 ):
-                    gt_answer = gt_data.get("count_number")
                     if gt_answer is not None and int(pred_answer) == int(gt_answer):
                         answer_score = 1.0
                 overall_score = clamp_reward(answer_score)
@@ -2485,12 +2844,10 @@ def compute_score(
                 if eval_answer_only_on_no_mask:
                     # No mask sequence available → answer-only (binary)
                     if stopped_by_answer and pred_answer is not None:
-                        gt_answer = gt_data.get("count_number")
                         if gt_answer is not None and int(pred_answer) == int(gt_answer):
                             answer_score = 1.0
 
                 elif stopped_by_answer and not turns_exceeded:
-                    gt_answer = gt_data.get("count_number")
                     if pred_answer is not None and gt_answer is not None and int(pred_answer) == int(gt_answer):
                         if soft_gate_mode == "off":
                             # No gating: pure binary answer correctness
@@ -2575,6 +2932,7 @@ def compute_score(
                             _early_stop_pen = float(os.environ.get("TRAJ_EARLY_STOP_PENALTY", "0.15"))
                             answer_score = max(0.0, answer_score - _early_stop_pen)
                             score["early_stop_penalty"] = _early_stop_pen
+                            score["early_stop"] = 1.0
 
                 # --- Coverage Penalty (Phase 1B, V34: mask-based uncovered count) ---
                 # Penalises early stopping when the model gives <answer> but GT still
@@ -2656,8 +3014,15 @@ def compute_score(
                     answer_score = 0.0
                     point_dense_score = 0.0
                 if turns_exceeded:
-                    overall_score = 0.0
-                    answer_score = 0.0
+                    if action_event_mode and answer_exact == 1.0:
+                        partial_answer = clamp_reward(
+                            float(os.environ.get("TRAJ_EXACT_ANSWER_PARTIAL_REWARD", "0.25"))
+                        )
+                        answer_score = max(float(answer_score), partial_answer)
+                        overall_score = max(float(overall_score), answer_weight * partial_answer)
+                    else:
+                        overall_score = 0.0
+                        answer_score = 0.0
                     point_dense_score = 0.0
 
                 score["overall"] = overall_score
@@ -2671,6 +3036,21 @@ def compute_score(
             score["is_point_task"] = is_point_task
             score["is_count_task"] = is_count_task
             score["is_trajectory_task"] = is_trajectory_task
+            score["answer_correct"] = answer_correct
+            score["answer_exact"] = answer_exact
+            score["raw_success"] = raw_success
+            if strict_raw_success_winner:
+                score["raw_success_duplicate_violation"] = 1.0 if duplicate_violation else 0.0
+                score["raw_success_duplicate_evidence_missing"] = 1.0 if duplicate_evidence_violation else 0.0
+                score["raw_success_miss_violation"] = 1.0 if strict_winner_miss_violation else 0.0
+                score["raw_success_format_violation"] = 1.0 if strict_winner_format_violation else 0.0
+                score["raw_success_tag_order_violation"] = (
+                    1.0 if strict_structure["tag_order_violation"] else 0.0
+                )
+                score["raw_success_point_payload_violation"] = (
+                    1.0 if strict_structure["payload_violation"] else 0.0
+                )
+            score["trajectory_quality"] = trajectory_quality
 
             if return_step_scores:
                 # Keep as scalar floats for verl/W&B compatibility.
@@ -2702,8 +3082,26 @@ def compute_score(
             point_key_alias_count = _count_point_key_aliases(predict)
             score["point_key_typo"] = float(point_key_alias_count)
             score["point_key_typo_rate"] = 1.0 if point_key_alias_count > 0 else 0.0
-            score["no_point_pred"] = 1.0 if len(pred_points) == 0 else 0.0
+            score["no_point_pred"] = 1.0 if len(pred_point_slots) == 0 else 0.0
             score["turns_exceeded"] = 1.0 if turns_exceeded else 0.0
+            score.setdefault("early_stop", 0.0)
+            # Under STEPCOUNT_MASK_REQUIRE, every missing/ambiguous mask route
+            # raises before this point. This attests infrastructure coverage;
+            # malformed/missing/extra model points remain separate quality
+            # failures and do not masquerade as a missing mask route.
+            score["mask_evidence_complete"] = (
+                1.0
+                if (
+                    _mask_require_enabled()
+                    and is_trajectory_task
+                    and duplicate_evidence_complete
+                )
+                else 0.0
+            )
+            score["generation_error"] = 1.0 if "generation_error" in abort_reasons else 0.0
+            score["immediate_eos"] = 1.0 if "immediate_eos" in abort_reasons else 0.0
+            score["empty_response"] = 1.0 if abort_reasons & {"immediate_eos", "empty_completion"} else 0.0
+            score["invalid_generation"] = 1.0 if ledger_abort else 0.0
             score["stopped_by_answer"] = 1.0 if stopped_by_answer else 0.0
             score["tag_balance_violation"] = 1.0 if tag_balance_violation else 0.0
             score["point_count_number_score"] = float(point_count_number_score)
@@ -2720,6 +3118,43 @@ def compute_score(
                 )
                 else 0.0
             )
+
+            if action_event_mode:
+                action_values: List[float] = []
+                point_ordinal = 0
+                for event in action_events or []:
+                    event_type = event.get("type")
+                    if event_type == "point":
+                        if point_ordinal >= expected_steps:
+                            value = -1.0
+                        else:
+                            hit = step_hit_any[point_ordinal] if point_ordinal < len(step_hit_any) else 0.0
+                            duplicate = (
+                                step_is_duplicate[point_ordinal]
+                                if point_ordinal < len(step_is_duplicate)
+                                else 0.0
+                            )
+                            count_number_ok = (
+                                point_count_number_step_scores[point_ordinal]
+                                if point_ordinal < len(point_count_number_step_scores)
+                                else 1.0
+                            )
+                            value = (
+                                -1.0
+                                if duplicate > 0.5 or count_number_ok < 0.5
+                                else (1.0 if hit > 0.5 else 0.0)
+                            )
+                        point_ordinal += 1
+                    elif event_type == "answer":
+                        # Terminal raw_success broadcasting is the sole answer
+                        # correctness channel.  Local action credit is process-only.
+                        value = 0.0
+                    elif event_type in ("cap", "abort"):
+                        value = 0.0
+                    else:
+                        raise ValueError(f"Unsupported action event type: {event_type!r}")
+                    action_values.append(value)
+                score["_action_event_values"] = action_values
 
             # --- Per-turn process rewards for step-level GRPO ---
             # _step_rewards: list of per-turn reward scalars to be placed at
@@ -2845,6 +3280,8 @@ def compute_score(
                 image_path=image_path
             )
             if mask_score is None:
+                if _v37_reward_fail_closed_enabled():
+                    raise RuntimeError("Required point-task mask lookup returned no score.")
                 _mask_debug_tick(mask_fallback_distance=1)
                 pt_score = point_reward(
                     predict,
@@ -2865,6 +3302,19 @@ def compute_score(
             acc_score = accuracy_reward(predict, str(gt_data["count_number"]))
             content_score = clamp_reward(acc_score)
             score["accuracy"] = content_score
+            pred_answer = _extract_last_answer_number(predict)
+            score["answer_correct"] = (
+                1.0
+                if pred_answer is not None and int(pred_answer) == int(gt_data["count_number"])
+                else 0.0
+            )
+            score["answer_exact"] = score["answer_correct"]
+            score["raw_success"] = float(
+                score["answer_exact"] == 1.0
+                and _has_single_terminal_answer(predict)
+                and not _trajectory_tag_balance_violation(predict)
+            )
+            score["trajectory_quality"] = clamp_reward(format_score)
             score["is_point_task"] = is_point_task
             score["is_count_task"] = is_count_task
             score["is_trajectory_task"] = is_trajectory_task
@@ -2875,9 +3325,15 @@ def compute_score(
         score["overall"] = overall_score
         score["format"] = format_score
         score["content"] = content_score
-        # Ensure consistent key schema across all task types (point/count/unknown)
-        # so downstream metric aggregation never encounters KeyError.
+        # Keep common metrics stable.  Binary answer correctness is emitted only
+        # for tasks that actually have a final count answer; point-only tasks
+        # intentionally omit it so BoK keeps its legacy shaped-score routing.
         score.setdefault("answer", content_score)
+        if task_type in ("trajectory", "count"):
+            score.setdefault("answer_correct", 0.0)
+            score.setdefault("answer_exact", score["answer_correct"])
+            score.setdefault("raw_success", 0.0)
+            score.setdefault("trajectory_quality", 0.0)
         score.setdefault("point", 0.0)
         score.setdefault("is_point_task", is_point_task)
         score.setdefault("is_count_task", is_count_task)
@@ -2885,6 +3341,8 @@ def compute_score(
         score.setdefault("consistency_violation", 0.0)
         score.setdefault("answer_gated", 0.0)
         score.setdefault("format_fail", 1.0 if format_score <= 0.0 else 0.0)
+        score.setdefault("early_stop", 0.0)
+        score.setdefault("mask_evidence_complete", 0.0)
         score.setdefault("no_point_pred", 0.0)
         score.setdefault("turns_exceeded", 0.0)
         score.setdefault("stopped_by_answer", 0.0)
@@ -2893,6 +3351,9 @@ def compute_score(
         return score
         
     except Exception as e:
+        if _v37_reward_fail_closed_enabled():
+            logger.exception(f"compute_score exception: {e}")
+            raise
         logger.error(f"compute_score exception: {e}")
         return default_score
 

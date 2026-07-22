@@ -30,6 +30,7 @@ from transformers import PreTrainedTokenizer, ProcessorMixin
 
 from ..models.transformers.qwen2_vl import get_rope_index
 from . import torch_functional as VF
+from .path_remap import remap_image_payload
 
 
 def collate_fn(features: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -53,10 +54,19 @@ def collate_fn(features: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def process_image(image: Union[Dict[str, Any], ImageObject, str], min_pixels: int, max_pixels: int) -> ImageObject:
+    # RLHFDataset resolves the path once, then preserves that same payload for
+    # processor, rollout, FSDP, and reward consumers.
     if isinstance(image, str):
         image = Image.open(image)
     elif isinstance(image, dict):
-        image = Image.open(BytesIO(image["bytes"]))
+        payload = image.get("bytes")
+        path = image.get("path")
+        if payload is not None:
+            image = Image.open(BytesIO(payload))
+        elif isinstance(path, str) and path:
+            image = Image.open(path)
+        else:
+            raise ValueError("Image dict requires non-null bytes or a path.")
     elif isinstance(image, bytes):
         image = Image.open(BytesIO(image))
 
@@ -218,6 +228,7 @@ class RLHFDataset(Dataset):
                 # Ensure raw_image_data is a list
                 if not isinstance(raw_image_data, list):
                     raw_image_data = [raw_image_data]
+                raw_image_data = [remap_image_payload(image) for image in raw_image_data]
                 
                 # Use the configured max_pixels/min_pixels to match training behavior exactly
                 # This ensures the token count calculation during filtering matches the training phase
@@ -250,6 +261,7 @@ class RLHFDataset(Dataset):
         if self.image_key in example:
             prompt = self.processor.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
             raw_image_data = example.pop(self.image_key)
+            raw_image_data = [remap_image_payload(image) for image in raw_image_data]
             # # 检查图像数据类型并适当处理
             # if isinstance(raw_image_data, list):
             #   images = [

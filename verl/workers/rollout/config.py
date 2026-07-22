@@ -54,6 +54,9 @@ class RolloutConfig:
     interleaved_process_prompt_template: Optional[str] = None
     interleaved_first_turn_prompt_file: Optional[str] = None
     interleaved_process_prompt_file: Optional[str] = None
+    # Optional fail-closed content binding used by V37. Legacy launchers leave
+    # this unset and retain the existing path-only behavior.
+    interleaved_process_prompt_sha256: Optional[str] = None
     interleaved_append_process_prompt: bool = True
     # History mode aligned with eval semantics:
     #   -1: keep full text history across turns (default)

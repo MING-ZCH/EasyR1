@@ -70,6 +70,7 @@ from ..utils.fsdp_utils import (
     offload_fsdp_optimizer,
 )
 from ..utils.dataset import process_image
+from ..utils.ray_environment import validate_v37_remote_environment
 from ..utils.model_utils import print_gpu_memory_usage, print_model_size
 from ..utils.tokenizer import get_processor, get_tokenizer
 from ..utils.torch_dtypes import PrecisionType
@@ -78,6 +79,39 @@ from .config import ActorConfig, CriticConfig, FSDPConfig, ModelConfig, OptimCon
 from .rollout import vLLMRollout
 from .sharding_manager import FSDPVLLMShardingManager
 from .sharding_manager.fsdp_ulysses import FSDPUlyssesShardingManager
+
+
+def _adaptive_actor_scheduler_should_step(metrics: dict) -> bool:
+    """Advance adaptive LR only when this RPC executed an optimizer update."""
+    raw = metrics.get("actor/optimizer_steps_executed")
+    if raw is None:
+        raise RuntimeError("adaptive actor metrics are missing optimizer_steps_executed")
+    values = np.asarray(raw, dtype=object).reshape(-1)
+    if values.size != 1:
+        raise RuntimeError("adaptive actor optimizer_steps_executed must be one nonnegative integer")
+    value = values[0]
+    if (
+        isinstance(value, (bool, str))
+        or not isinstance(value, (int, float, np.integer, np.floating))
+    ):
+        raise RuntimeError("adaptive actor optimizer_steps_executed must be one nonnegative integer")
+    numeric = float(value)
+    if not np.isfinite(numeric) or numeric < 0 or not numeric.is_integer():
+        raise RuntimeError("adaptive actor optimizer_steps_executed must be one nonnegative integer")
+    return int(numeric) > 0
+
+
+def _reconcile_spike_cooldown_lr(actor, optimizer, scheduler_advanced: bool) -> float:
+    """Reapply cooldown only after a scheduler update changed optimizer LR."""
+    cooldown = int(getattr(actor, "_spike_cooldown_remaining", 0))
+    original_lrs = getattr(actor, "_original_lrs", None)
+    if cooldown > 0 and original_lrs is not None and scheduler_advanced:
+        scheduled_lrs = [float(group["lr"]) for group in optimizer.param_groups]
+        actor._original_lrs = scheduled_lrs
+        factor = float(actor._spike_lr_factor)
+        for group, scheduled_lr in zip(optimizer.param_groups, scheduled_lrs):
+            group["lr"] = scheduled_lr * factor
+    return float(optimizer.param_groups[0]["lr"])
 
 
 def _set_cuda_device_from_local_rank() -> Optional[int]:
@@ -114,6 +148,7 @@ class FSDPWorker(Worker):
         role: Literal["actor", "critic", "rollout", "ref", "actor_rollout", "actor_rollout_ref"],
     ):
         super().__init__()
+        validate_v37_remote_environment("FSDP worker")
         self.config = config
         self.role = role
         cuda_device = _set_cuda_device_from_local_rank()
@@ -680,19 +715,19 @@ class FSDPWorker(Worker):
             ) / (1024**3)
             metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
 
-            self.lr_scheduler.step()
-            lr = self.lr_scheduler.get_last_lr()[0]
-
-            # If spike cooldown is active, override scheduler LR with reduced LR
-            if hasattr(self.actor, '_spike_cooldown_remaining') and self.actor._spike_cooldown_remaining > 0:
-                if self.actor._original_lrs is not None:
-                    # Save the scheduler's intended LR as the new original
-                    self.actor._original_lrs = [pg["lr"] for pg in self.optimizer.param_groups]
-                    for pg in self.optimizer.param_groups:
-                        pg["lr"] = pg["lr"] * self.actor._spike_lr_factor
-                    lr = self.optimizer.param_groups[0]["lr"]
+            adaptive_actor_kl = bool(getattr(self.config.actor, "adaptive_actor_kl", False))
+            scheduler_advanced = (
+                _adaptive_actor_scheduler_should_step(metrics) if adaptive_actor_kl else True
+            )
+            if scheduler_advanced:
+                self.lr_scheduler.step()
+            # A skipped adaptive update leaves the already-reduced cooldown LR
+            # untouched. Reapply the factor only when scheduler.step() actually
+            # replaced optimizer LR with a newly scheduled baseline.
+            lr = _reconcile_spike_cooldown_lr(self.actor, self.optimizer, scheduler_advanced)
 
             metrics["actor/lr"] = lr
+            metrics["actor/lr_scheduler_advanced"] = 1.0 if scheduler_advanced else 0.0
 
             # Metrics should be in non_tensor_batch instead of meta_info, as DataProto not concat meta_info.
             output = DataProto(

@@ -21,6 +21,7 @@ algorithm:
   adv_estimator: grpo
   disable_kl: false
   use_kl_loss: true
+  adaptive_actor_kl: false
   kl_penalty: low_var_kl
   kl_coef: 1.0e-2
 
@@ -93,3 +94,7 @@ trainer:
   save_limit: 5  # -1 to disable
   save_checkpoint_path: ./save/easy_r1_default
   load_checkpoint_path: null
+  v37_run_class: null
+  v37_resume_mode: null
+  v37_expected_resume_checkpoint_path: null
+  v37_expected_resume_checkpoint_sha256: null

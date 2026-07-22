@@ -68,6 +68,32 @@ class FSDPCheckpointManager(BaseCheckpointManager):
     ):
         super().__init__(model, optimizer, lr_scheduler, processing_class)
 
+    @staticmethod
+    def _adaptive_runtime_required(actor_state_loader) -> bool:
+        owner = getattr(actor_state_loader, "__self__", None)
+        config = getattr(owner, "config", None)
+        return bool(getattr(config, "adaptive_actor_kl", False))
+
+    @staticmethod
+    def _assert_runtime_agreement(state, label: str) -> None:
+        if not dist.is_available() or not dist.is_initialized():
+            return
+        gathered = [None for _ in range(dist.get_world_size())]
+        dist.all_gather_object(gathered, state)
+        if any(item != gathered[0] for item in gathered[1:]):
+            raise RuntimeError(f"Distributed {label} checkpoint state disagrees across ranks.")
+
+    @staticmethod
+    def _assert_all_ranks(condition: bool, label: str) -> None:
+        if not dist.is_available() or not dist.is_initialized():
+            if not condition:
+                raise RuntimeError(label)
+            return
+        gathered = [None for _ in range(dist.get_world_size())]
+        dist.all_gather_object(gathered, bool(condition))
+        if not all(gathered):
+            raise RuntimeError(label)
+
     def load_checkpoint(self, path: Optional[str] = None):
         if path is None:
             return
@@ -83,6 +109,25 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         optim_state_dict = torch.load(optim_path, weights_only=False)
         extra_state_dict = torch.load(extra_path, weights_only=False)
 
+        actor_state_loader = getattr(self.optimizer, "_easy_r1_actor_state_loader", None)
+        adaptive_runtime = self._adaptive_runtime_required(actor_state_loader)
+        actor_runtime_state = extra_state_dict.get("actor_runtime_state")
+        self._assert_runtime_agreement(actor_runtime_state, "actor runtime")
+
+        rollout_state_loader = getattr(self.model, "_easy_r1_rollout_state_loader", None)
+        rollout_runtime_state = extra_state_dict.get("rollout_runtime_state")
+        if adaptive_runtime:
+            runtime_complete = (
+                actor_runtime_state is not None
+                and rollout_state_loader is not None
+                and rollout_runtime_state is not None
+                and "rng" in extra_state_dict
+            )
+            self._assert_all_ranks(
+                runtime_complete,
+                "adaptive_actor_kl checkpoint is missing actor, rollout, or process RNG runtime state on a rank.",
+            )
+
         state_dict_options = StateDictOptions(cpu_offload=True)
         set_state_dict(
             model=self.model,
@@ -96,6 +141,11 @@ class FSDPCheckpointManager(BaseCheckpointManager):
         # recover random state
         if "rng" in extra_state_dict:
             self.load_rng_state(extra_state_dict["rng"])
+
+        if actor_state_loader is not None:
+            actor_state_loader(actor_runtime_state)
+        if rollout_state_loader is not None and rollout_runtime_state is not None:
+            rollout_state_loader(rollout_runtime_state)
 
     def save_checkpoint(self, path: str, save_model_only: bool = False):
         path = self.local_mkdir(path)
@@ -117,6 +167,38 @@ class FSDPCheckpointManager(BaseCheckpointManager):
                 "lr_scheduler": self.lr_scheduler.state_dict(),
                 "rng": self.get_rng_state(),
             }
+            actor_state_getter = getattr(self.optimizer, "_easy_r1_actor_state_getter", None)
+            actor_runtime_state = None
+            if actor_state_getter is not None:
+                actor_runtime_state = actor_state_getter()
+            self._assert_runtime_agreement(actor_runtime_state, "actor runtime")
+            if actor_runtime_state is not None:
+                extra_state_dict["actor_runtime_state"] = actor_runtime_state
+            rollout_state_getter = getattr(self.model, "_easy_r1_rollout_state_getter", None)
+            adaptive_runtime = bool(
+                isinstance(actor_runtime_state, dict)
+                and actor_runtime_state.get("config_identity", {}).get("adaptive_actor_kl", False)
+            )
+            if adaptive_runtime and rollout_state_getter is None:
+                raise RuntimeError("adaptive_actor_kl cannot checkpoint the rollout generation RNG state.")
+            if rollout_state_getter is not None:
+                rollout_runtime_state = None
+                rollout_error = None
+                try:
+                    rollout_runtime_state = rollout_state_getter()
+                except RuntimeError as exc:
+                    rollout_error = str(exc)
+                if dist.is_available() and dist.is_initialized():
+                    rollout_errors = [None for _ in range(dist.get_world_size())]
+                    dist.all_gather_object(rollout_errors, rollout_error)
+                else:
+                    rollout_errors = [rollout_error]
+                if adaptive_runtime and any(error is not None for error in rollout_errors):
+                    raise RuntimeError(
+                        f"adaptive_actor_kl could not checkpoint rollout RNG state on every rank: {rollout_errors}."
+                    )
+                if rollout_runtime_state is not None:
+                    extra_state_dict["rollout_runtime_state"] = rollout_runtime_state
             print(f"[rank-{self.rank}]: Saving model to {os.path.abspath(model_path)}.")
             print(f"[rank-{self.rank}]: Saving optimizer to {os.path.abspath(optim_path)}.")
             print(f"[rank-{self.rank}]: Saving extra_state to {os.path.abspath(extra_path)}.")

@@ -72,6 +72,7 @@ class AlgorithmConfig:
     adv_estimator: str = "grpo"
     disable_kl: bool = False
     use_kl_loss: bool = False
+    adaptive_actor_kl: bool = False
     kl_penalty: str = "kl"
     kl_coef: float = 1e-3
     kl_type: str = "fixed"
@@ -97,6 +98,10 @@ class TrainerConfig:
     save_limit: int = -1
     save_checkpoint_path: Optional[str] = None
     load_checkpoint_path: Optional[str] = None
+    v37_run_class: Optional[str] = None
+    v37_resume_mode: Optional[str] = None
+    v37_expected_resume_checkpoint_path: Optional[str] = None
+    v37_expected_resume_checkpoint_sha256: Optional[str] = None
 
     def post_init(self):
         if self.save_checkpoint_path is None:
@@ -105,6 +110,10 @@ class TrainerConfig:
         self.save_checkpoint_path = os.path.abspath(self.save_checkpoint_path)  # ray job uses absolute path
         if self.load_checkpoint_path is not None:
             self.load_checkpoint_path = os.path.abspath(self.load_checkpoint_path)
+        if self.v37_expected_resume_checkpoint_path is not None:
+            self.v37_expected_resume_checkpoint_path = os.path.abspath(
+                self.v37_expected_resume_checkpoint_path
+            )
 
 
 @dataclass
@@ -115,11 +124,16 @@ class PPOConfig:
     trainer: TrainerConfig = field(default_factory=TrainerConfig)
 
     def post_init(self):
+        if self.algorithm.adaptive_actor_kl and self.algorithm.use_kl_loss:
+            raise ValueError(
+                "algorithm.adaptive_actor_kl and algorithm.use_kl_loss are mutually exclusive actor-KL modes."
+            )
         self.worker.rollout.prompt_length = self.data.max_prompt_length
         self.worker.rollout.response_length = self.data.max_response_length
         self.worker.rollout.trust_remote_code = self.worker.actor.model.trust_remote_code
         self.worker.actor.disable_kl = self.algorithm.disable_kl
         self.worker.actor.use_kl_loss = self.algorithm.use_kl_loss
+        self.worker.actor.adaptive_actor_kl = self.algorithm.adaptive_actor_kl
         self.worker.actor.kl_penalty = self.algorithm.kl_penalty
         self.worker.actor.kl_coef = self.algorithm.kl_coef
 

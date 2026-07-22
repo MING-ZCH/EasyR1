@@ -86,6 +86,11 @@ class ActorConfig:
     padding_free: bool = False
     ulysses_sequence_parallel_size: int = 1
     use_torch_compile: bool = True
+    # Pluggable compatibility policy for the torch CE fallback used when the
+    # FlashAttention cross-entropy kernel is unavailable.
+    # legacy: preserve historical EasyR1 behavior; correct: return true log-probs;
+    # error: require FlashAttention and fail before training.
+    torch_logprob_fallback_mode: str = "legacy"
     model: ModelConfig = field(default_factory=ModelConfig)
     optim: OptimConfig = field(default_factory=OptimConfig)
     fsdp: FSDPConfig = field(default_factory=FSDPConfig)
@@ -94,6 +99,7 @@ class ActorConfig:
     global_batch_size_per_device: int = field(default=-1, init=False)
     disable_kl: bool = field(default=False, init=False)
     use_kl_loss: bool = field(default=False, init=False)
+    adaptive_actor_kl: bool = field(default=False, init=False)
     kl_penalty: str = field(default="kl", init=False)
     kl_coef: float = field(default=0.0, init=False)
 

@@ -18,15 +18,21 @@ This trainer supports model-agonistic model initialization with huggingface
 
 import os
 import json
+import random
 import re
+import shutil
+import subprocess
+import sys
 import uuid
 import time
 import logging
 import traceback
+import tempfile
 from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass, field
 from enum import Enum, IntEnum, auto
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Type, Tuple
 
 import numpy as np
@@ -41,15 +47,225 @@ from ..single_controller.base import Worker
 from ..single_controller.ray import RayClassWithInitArgs, RayResourcePool, RayWorkerGroup
 from ..single_controller.ray.base import create_colocated_worker_cls
 from ..utils import torch_functional as VF
+from ..utils.action_ledger import ACTION_TYPE_IDS, validate_action_event_row
 from ..utils.checkpoint import CHECKPOINT_TRACKER, remove_obsolete_ckpt
+from ..utils.checkpoint.checkpoint_manager import (
+    checkpoint_manifest_hash,
+    publish_staged_checkpoint,
+    reference_content_identity,
+    validate_checkpoint_manifest,
+    write_checkpoint_manifest,
+)
 from ..utils.logger import Tracker
 from ..utils.py_functional import convert_dict_to_str, timer
 from ..utils.seqlen_balancing import get_seqlen_balanced_partitions, log_seqlen_unbalance
+from ..utils.v37_training_evidence import (
+    TrainingEvidenceError,
+    TrainingEvidenceRecorder,
+    require_clean_optimizer_step,
+    reward_counts as v37_reward_counts,
+    tree_sha256 as v37_tree_sha256,
+    validate_resume_checkpoint_binding,
+)
 from ..workers.fsdp_workers import FSDPWorker
 from ..workers.reward import FunctionRewardManager
 from . import core_algos
 from .config import PPOConfig
 from .metrics import compute_data_metrics, compute_throughout_metrics, compute_timing_metrics, reduce_metrics
+
+
+TRAINER_RUNTIME_STATE_FILE = "trainer_runtime.pt"
+TRAINER_RUNTIME_STATE_VERSION = 1
+logger = logging.getLogger(__name__)
+
+
+def _atomic_write_json(path: str, payload: dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=f".{os.path.basename(path)}.", dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+        directory_fd = os.open(os.path.dirname(path), os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except BaseException:
+        try:
+            os.unlink(tmp_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def capture_controller_rng_state() -> dict[str, Any]:
+    """Capture controller-process RNG state without lossy serialization."""
+    cuda_available = bool(torch.cuda.is_available())
+    cuda_device_count = int(torch.cuda.device_count()) if cuda_available else 0
+    cuda_states = torch.cuda.get_rng_state_all() if cuda_available else []
+    if len(cuda_states) != cuda_device_count:
+        raise RuntimeError("Controller CUDA RNG state count does not match the visible CUDA topology.")
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+        "torch_cuda": cuda_states,
+        "cuda_available": cuda_available,
+        "cuda_device_count": cuda_device_count,
+    }
+
+
+def restore_controller_rng_state(state: dict[str, Any]) -> None:
+    """Validate a controller RNG snapshot completely, then restore it."""
+    if not isinstance(state, dict):
+        raise RuntimeError("Invalid controller RNG checkpoint state.")
+    cuda_available = bool(torch.cuda.is_available())
+    cuda_device_count = int(torch.cuda.device_count()) if cuda_available else 0
+    if type(state.get("cuda_available")) is not bool:
+        raise RuntimeError("Controller RNG checkpoint has an invalid CUDA availability marker.")
+    saved_cuda_count = state.get("cuda_device_count")
+    if isinstance(saved_cuda_count, bool) or not isinstance(saved_cuda_count, int) or saved_cuda_count < 0:
+        raise RuntimeError("Controller RNG checkpoint has an invalid CUDA device count.")
+    if state["cuda_available"] != cuda_available or saved_cuda_count != cuda_device_count:
+        raise RuntimeError(
+            "Controller RNG checkpoint CUDA topology differs from this process: "
+            f"saved=({state['cuda_available']}, {saved_cuda_count}), "
+            f"current=({cuda_available}, {cuda_device_count})."
+        )
+
+    python_state = state.get("python")
+    numpy_state = state.get("numpy")
+    torch_cpu_state = state.get("torch_cpu")
+    torch_cuda_states = state.get("torch_cuda")
+    try:
+        random.Random().setstate(python_state)
+        np.random.RandomState().set_state(numpy_state)
+    except Exception as exc:
+        raise RuntimeError("Controller Python/NumPy RNG checkpoint state is corrupt.") from exc
+    if (
+        not isinstance(torch_cpu_state, torch.Tensor)
+        or torch_cpu_state.device.type != "cpu"
+        or torch_cpu_state.dtype != torch.uint8
+        or torch_cpu_state.ndim != 1
+        or torch_cpu_state.numel() == 0
+    ):
+        raise RuntimeError("Controller Torch CPU RNG checkpoint state is corrupt.")
+    try:
+        torch.Generator(device="cpu").set_state(torch_cpu_state)
+    except Exception as exc:
+        raise RuntimeError("Controller Torch CPU RNG checkpoint state is corrupt.") from exc
+    if not isinstance(torch_cuda_states, list) or len(torch_cuda_states) != saved_cuda_count:
+        raise RuntimeError("Controller Torch CUDA RNG checkpoint state is topology-incompatible.")
+    if any(
+        not isinstance(item, torch.Tensor)
+        or item.device.type != "cpu"
+        or item.dtype != torch.uint8
+        or item.ndim != 1
+        or item.numel() == 0
+        for item in torch_cuda_states
+    ):
+        raise RuntimeError("Controller Torch CUDA RNG checkpoint state is corrupt.")
+
+    random.setstate(python_state)
+    np.random.set_state(numpy_state)
+    torch.set_rng_state(torch_cpu_state)
+    if cuda_available:
+        torch.cuda.set_rng_state_all(torch_cuda_states)
+
+
+def compute_monitor_old_ref_kl(data: DataProto) -> tuple[float, float, int]:
+    """Return strict valid-response-token KL mean, sum and count on the driver."""
+    response_mask = data.batch["response_mask"]
+    kld = core_algos.compute_stable_low_var_kl(data.batch["old_log_probs"], data.batch["ref_log_probs"])
+    if kld.shape != response_mask.shape:
+        raise ValueError("monitor_old_ref KL and response_mask shapes differ.")
+    # kld is a fresh diagnostic tensor. Mask it in place to avoid materializing
+    # two additional BxL float buffers on long-horizon batches.
+    kld.mul_(response_mask)
+    valid_sum = kld.sum(dtype=torch.float64)
+    valid_count = int(response_mask.sum().item())
+    if valid_count <= 0 or not torch.isfinite(valid_sum):
+        raise ValueError(f"Invalid monitor_old_ref KL aggregate: sum={valid_sum.item()}, count={valid_count}.")
+    return float((valid_sum / valid_count).item()), float(valid_sum.item()), valid_count
+
+
+def strict_optimizer_counter_metrics(metrics: Dict[str, Any]) -> tuple[int, int, int]:
+    """Read worker-agreed counters without lossy mean-and-round coercion."""
+    agreement = metrics.get("actor/optimizer_counter_agreement", 0.0)
+    if (
+        isinstance(agreement, (bool, str))
+        or not isinstance(agreement, (int, float, np.integer, np.floating))
+        or not np.isfinite(float(agreement))
+        or float(agreement) != 1.0
+    ):
+        raise RuntimeError("Actor workers did not attest optimizer counter agreement.")
+
+    def _read(name: str) -> int:
+        raw = metrics.get(name)
+        if isinstance(raw, (bool, str)) or not isinstance(raw, (int, float, np.integer, np.floating)):
+            raise RuntimeError(f"Missing or invalid actor counter {name}: {raw!r}.")
+        value = float(raw)
+        if not np.isfinite(value) or value < 0 or not value.is_integer():
+            raise RuntimeError(f"Actor counter {name} must be an exact nonnegative integer, got {value!r}.")
+        return int(value)
+
+    attempted = _read("actor/optimizer_steps_attempted")
+    executed = _read("actor/optimizer_steps_executed")
+    skipped = _read("actor/optimizer_steps_skipped")
+    if executed + skipped != attempted:
+        raise RuntimeError(
+            f"Invalid actor optimizer-step status: attempted={attempted}, executed={executed}, skipped={skipped}."
+        )
+    return attempted, executed, skipped
+
+
+def build_action_step_tensors(
+    event_rows: list[Any],
+    values: list[list[float]],
+    response_mask: torch.Tensor,
+    response_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    bsz, response_length = response_mask.shape
+    if tuple(response_ids.shape) != (bsz, response_length):
+        raise ValueError("Response IDs must align exactly with the response mask.")
+    if not (len(event_rows) == len(values) == bsz):
+        raise ValueError("Action event rows must align exactly with the response batch.")
+    def _event_count(row: Any) -> int:
+        if isinstance(row, dict) and isinstance(row.get("events"), (list, tuple)):
+            return len(row["events"])
+        return len(row) if isinstance(row, (list, tuple)) else 0
+
+    max_events = max((_event_count(row) for row in event_rows), default=0)
+    spans = torch.zeros((bsz, max_events, 2), dtype=torch.long, device=response_mask.device)
+    event_values = torch.zeros((bsz, max_events), dtype=torch.float32, device=response_mask.device)
+    event_types = torch.zeros((bsz, max_events), dtype=torch.long, device=response_mask.device)
+    for row_idx, (row_events, row_values) in enumerate(zip(event_rows, values)):
+        # Invalid ledger rows were already failed closed by the reward worker.
+        if not row_events:
+            if row_values:
+                raise ValueError(f"Invalid action row {row_idx} cannot carry values.")
+            continue
+        valid_length = int(response_mask[row_idx].sum().item())
+        validated = validate_action_event_row(
+            row_events,
+            valid_length,
+            response_token_ids=response_ids[row_idx, :valid_length].tolist(),
+            require_token_binding=True,
+        )
+        if len(validated) != len(row_values):
+            raise ValueError(f"Action event/value mismatch on row {row_idx}.")
+        for event_idx, (event, value) in enumerate(zip(validated, row_values)):
+            start, end = event["decision_start"], event["decision_end"]
+            event_type = event["type"]
+            if event_type != "point" and float(value) != 0.0:
+                raise ValueError(f"{event_type} cannot carry native local action credit.")
+            spans[row_idx, event_idx] = torch.tensor((start, end), device=response_mask.device)
+            event_values[row_idx, event_idx] = float(value)
+            event_types[row_idx, event_idx] = ACTION_TYPE_IDS[event_type]
+    return spans, event_values, event_types
 
 
 def _parse_stepcount_gt_answer(ground_truth: Any) -> Optional[int]:
@@ -247,14 +463,21 @@ def compute_advantage(data: DataProto, adv_estimator: AdvantageEstimator, gamma:
         # total_steps: prefer meta_info (auto-computed), fallback to env var
         _ts_meta = int(data.meta_info.get("total_steps", 0)) if hasattr(data, "meta_info") and data.meta_info else 0
         _ts = _ts_meta if _ts_meta > 1 else int(os.environ.get("BOK_TOTAL_STEPS", "1"))
-        # Pass answer_scores for AllWrong group detection if available
+        # Prefer independent binary correctness for routing; retain shaped
+        # answer_scores for legacy callers and step-level soft gating.
         _answer_scores = data.batch.get("answer_scores", None)
+        _answer_correct_scores = data.batch.get("answer_correct_scores", None)
+        _raw_success_scores = data.batch.get("raw_success_scores", None)
+        _trajectory_quality_scores = data.batch.get("trajectory_quality_scores", None)
         advantages, returns = core_algos.compute_bok_grpo_advantage(
             token_level_rewards, response_mask, index,
             bok_tau=bok_tau, bok_clip=bok_clip, bok_uniform_mix=bok_uniform_mix,
             bok_tau_init=bok_tau_init, bok_tau_final=bok_tau_final,
             global_step=_gs, total_steps=_ts,
             answer_scores=_answer_scores,
+            answer_correct_scores=_answer_correct_scores,
+            raw_success_scores=_raw_success_scores,
+            trajectory_quality_scores=_trajectory_quality_scores,
         )
     elif adv_estimator == AdvantageEstimator.BOK_GRPO_STEP:
         import os
@@ -267,8 +490,14 @@ def compute_advantage(data: DataProto, adv_estimator: AdvantageEstimator, gamma:
         _ts_meta = int(data.meta_info.get("total_steps", 0)) if hasattr(data, "meta_info") and data.meta_info else 0
         _ts = _ts_meta if _ts_meta > 1 else int(os.environ.get("BOK_TOTAL_STEPS", "1"))
         _answer_scores = data.batch.get("answer_scores", None)
+        _answer_correct_scores = data.batch.get("answer_correct_scores", None)
+        _raw_success_scores = data.batch.get("raw_success_scores", None)
+        _trajectory_quality_scores = data.batch.get("trajectory_quality_scores", None)
         _point_step_mask = data.batch.get("point_step_mask", None)
         _point_step_value = data.batch.get("point_step_value", None)
+        _action_step_span = data.batch.get("action_step_span", None)
+        _action_step_value = data.batch.get("action_step_value", None)
+        _action_step_type = data.batch.get("action_step_type", None)
         advantages, returns = core_algos.compute_bok_grpo_step_advantage(
             token_level_rewards, response_mask, index,
             bok_tau=bok_tau, bok_clip=bok_clip, bok_uniform_mix=bok_uniform_mix,
@@ -277,6 +506,12 @@ def compute_advantage(data: DataProto, adv_estimator: AdvantageEstimator, gamma:
             answer_scores=_answer_scores,
             point_step_mask=_point_step_mask,
             point_step_value=_point_step_value,
+            answer_correct_scores=_answer_correct_scores,
+            raw_success_scores=_raw_success_scores,
+            trajectory_quality_scores=_trajectory_quality_scores,
+            action_step_span=_action_step_span,
+            action_step_value=_action_step_value,
+            action_step_type=_action_step_type,
         )
     else:
         raise NotImplementedError
@@ -311,6 +546,11 @@ class RayPPOTrainer:
         self.config = config
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
+        self.adaptive_actor_kl = bool(config.algorithm.adaptive_actor_kl)
+        self.effective_actor_updates = 0
+        self._current_step_complete = False
+        self._adaptive_ref_identity = None
+        self._v37_oom_count_cumulative = 0
 
         self.hybrid_engine = config.worker.hybrid_engine
         if self.hybrid_engine:
@@ -333,6 +573,41 @@ class RayPPOTrainer:
             self.use_reference_policy = False
             self.kl_ctrl = core_algos.FixedKLController(init_kl_coef=0.0)
             print("KL is disabled, no KL metrics will be logged. Please set `kl_coef=0` to log KL metrics.")
+
+        if self.adaptive_actor_kl:
+            if not self.use_reference_policy:
+                raise ValueError("adaptive_actor_kl requires an enabled reference policy.")
+            if config.algorithm.use_kl_loss:
+                raise ValueError("adaptive_actor_kl is independent of use_kl_loss; enable only one actor KL mode.")
+            if config.algorithm.kl_type != "adaptive":
+                raise ValueError("adaptive_actor_kl requires algorithm.kl_type=adaptive.")
+            if config.algorithm.kl_penalty != "low_var_kl":
+                raise ValueError("adaptive_actor_kl only supports sampled-token low_var_kl.")
+            if os.environ.get("EASYR1_ALLOW_ZERO_MM_LOGPROB", "0").lower() in ("1", "true", "yes", "on"):
+                raise ValueError("adaptive_actor_kl forbids EASYR1_ALLOW_ZERO_MM_LOGPROB.")
+            # Hash once per trainer process. The reference policy is immutable
+            # after construction, while hashing multi-shard weights per save is
+            # prohibitively expensive.
+            self._adaptive_ref_identity = reference_content_identity(config.worker.actor.model.model_path)
+
+        action_event_reward = os.environ.get("ACTION_EVENT_REWARD_ENABLE", "0").lower() in (
+            "1", "true", "yes"
+        )
+        if action_event_reward:
+            if config.worker.reward.reward_type != "sequential":
+                raise ValueError("ACTION_EVENT_REWARD_ENABLE requires worker.reward.reward_type=sequential.")
+            if not config.worker.rollout.interleaved_point_to_count:
+                raise ValueError("ACTION_EVENT_REWARD_ENABLE requires interleaved_point_to_count rollout.")
+            if config.algorithm.adv_estimator != AdvantageEstimator.BOK_GRPO_STEP:
+                raise ValueError("ACTION_EVENT_REWARD_ENABLE requires algorithm.adv_estimator=bok_grpo_step.")
+            if int(os.environ.get("BOK_CORRECTNESS_FIRST", "0")) != 1:
+                raise ValueError("ACTION_EVENT_REWARD_ENABLE requires BOK_CORRECTNESS_FIRST=1.")
+            if os.environ.get("BOK_STEP_SIGNAL", "").strip().lower() != "native_action_event":
+                raise ValueError("ACTION_EVENT_REWARD_ENABLE requires BOK_STEP_SIGNAL=native_action_event.")
+            if os.environ.get("V37_ACTION_PARSER_CONTRACT", "0").lower() not in ("1", "true", "yes"):
+                raise ValueError("ACTION_EVENT_REWARD_ENABLE requires V37_ACTION_PARSER_CONTRACT=1.")
+            if os.environ.get("V37_ACTION_LEDGER_CONTRACT", "0").lower() not in ("1", "true", "yes"):
+                raise ValueError("ACTION_EVENT_REWARD_ENABLE requires V37_ACTION_LEDGER_CONTRACT=1.")
 
         if config.algorithm.adv_estimator == AdvantageEstimator.GAE:
             self.use_critic = True
@@ -490,6 +765,10 @@ class RayPPOTrainer:
             successful_indices = None
             
             if exceeds_threshold:
+                # Formal evidence treats a proactive high-memory fallback as an
+                # avoided OOM event. Otherwise a run could silently switch to
+                # per-sample validation while still reporting oom_count=0.
+                self._v37_oom_count_cumulative += 1
                 print(f"Warning: GPU memory usage ({usage_ratio*100:.1f}%) is high before batch processing. "
                       f"Falling back to per-sample processing to avoid OOM...")
                 # Try to free some memory
@@ -531,6 +810,7 @@ class RayPPOTrainer:
                                 pass
                         
                         if is_actor_died:
+                            self._v37_oom_count_cumulative += 1
                             if retry < max_retries - 1:
                                 print(f"Warning: Actor died during batch validation (likely OOM). Retrying ({retry + 1}/{max_retries}) after {retry_delay}s...")
                                 time.sleep(retry_delay)
@@ -660,6 +940,7 @@ class RayPPOTrainer:
                 prompt_len = len(test_gen_batch[i].batch['input_ids'][0]) if len(test_gen_batch[i].batch['input_ids']) > 0 else 0
                 print(f"Warning: Skipping sample {i} - GPU memory usage ({usage_ratio*100:.1f}%) exceeds threshold ({memory_threshold*100:.1f}%) (prompt length: {prompt_len} tokens)")
                 skipped_samples.append(i)
+                self._v37_oom_count_cumulative += 1
                 # Try to free some memory
                 try:
                     torch.cuda.empty_cache()
@@ -702,6 +983,7 @@ class RayPPOTrainer:
                         pass
                 
                 if is_actor_died:
+                    self._v37_oom_count_cumulative += 1
                     try:
                         ids = test_gen_batch[i].batch['input_ids']
                         if ids.dim() == 0:
@@ -808,51 +1090,284 @@ class RayPPOTrainer:
         self.actor_rollout_wg = all_wg["actor_rollout"]
         self.actor_rollout_wg.init_model()
 
-    def _save_checkpoint(self) -> None:
+    def _save_checkpoint(self) -> bool:
         # path: {save_checkpoint_path}/global_step_{global_step}/{actor,critic}
-        remove_obsolete_ckpt(
-            self.config.trainer.save_checkpoint_path,
-            self.global_step,
-            best_global_step=-1,
-            save_limit=self.config.trainer.save_limit,
+        sealed_checkpoint = (
+            self.adaptive_actor_kl
+            or os.environ.get("V37_TRAINING_EVIDENCE_REQUIRED", "0") == "1"
+            or os.environ.get("V37_FINALIZE_HF_CHECKPOINT", "0") == "1"
         )
-        folder_path = os.path.join(self.config.trainer.save_checkpoint_path, f"global_step_{self.global_step}")
-        actor_path = os.path.join(folder_path, "actor")
-        self.actor_rollout_wg.save_checkpoint(actor_path)
-
+        if not sealed_checkpoint:
+            # Preserve the historical V36 layout, integer tracker and retention
+            # order when every V37/adaptive checkpoint feature is disabled.
+            remove_obsolete_ckpt(
+                self.config.trainer.save_checkpoint_path,
+                self.global_step,
+                best_global_step=-1,
+                save_limit=self.config.trainer.save_limit,
+            )
+            folder_path = os.path.join(
+                self.config.trainer.save_checkpoint_path, f"global_step_{self.global_step}"
+            )
+            self.actor_rollout_wg.save_checkpoint(os.path.join(folder_path, "actor"))
+            if self.use_critic:
+                self.critic_wg.save_checkpoint(os.path.join(folder_path, "critic"))
+            torch.save(
+                self.train_dataloader.state_dict(), os.path.join(folder_path, "dataloader.pt")
+            )
+            with open(
+                os.path.join(self.config.trainer.save_checkpoint_path, CHECKPOINT_TRACKER),
+                "w",
+                encoding="utf-8",
+            ) as handle:
+                handle.write(str(self.global_step))
+            return True
+        if sealed_checkpoint and not self._current_step_complete:
+            logger.warning(
+                "Skipping sealed checkpoint at global_step=%s because the optimizer step is incomplete; "
+                "the last complete checkpoint remains authoritative.",
+                self.global_step,
+            )
+            return False
+        save_root = self.config.trainer.save_checkpoint_path
+        os.makedirs(save_root, exist_ok=True)
+        folder_path = os.path.join(save_root, f"global_step_{self.global_step}")
+        required_paths = ["actor", "dataloader.pt"]
         if self.use_critic:
-            critic_path = os.path.join(folder_path, "critic")
-            self.critic_wg.save_checkpoint(critic_path)
+            required_paths.append("critic")
+        if self.adaptive_actor_kl:
+            required_paths.append(TRAINER_RUNTIME_STATE_FILE)
+        finalize_hf_requested = os.environ.get("V37_FINALIZE_HF_CHECKPOINT", "0") == "1"
+        if finalize_hf_requested and os.environ.get("V37_RUN_CLASS") != "formal":
+            raise RuntimeError(
+                "V37_FINALIZE_HF_CHECKPOINT is reserved for formal training."
+            )
+        # Formal runs may still save resumable shard checkpoints before the
+        # terminal step (for example step 10 of a 12-step run).  Only the
+        # terminal checkpoint pays the CPU merge cost and becomes evaluable.
+        finalize_hf = finalize_hf_requested and self.global_step == self.training_steps
+        if finalize_hf:
+            required_paths.append("actor/huggingface")
 
-        dataloader_path = os.path.join(folder_path, "dataloader.pt")
-        dataloader_state_dict = self.train_dataloader.state_dict()
-        torch.save(dataloader_state_dict, dataloader_path)
+        # A sealed same-step directory is already complete. Re-publish only its
+        # tracker entry; never rewrite distributed shards in place.
+        if os.path.exists(folder_path):
+            manifest = validate_checkpoint_manifest(folder_path, expected_step=self.global_step)
+            if not set(required_paths).issubset(manifest["required_paths"]):
+                raise RuntimeError("Existing same-step checkpoint does not satisfy this trainer's artifact contract.")
+            tracker_payload = {
+                "last_global_step": int(self.global_step),
+                "manifest_sha256": checkpoint_manifest_hash(folder_path),
+            }
+            _atomic_write_json(os.path.join(save_root, CHECKPOINT_TRACKER), tracker_payload)
+            remove_obsolete_ckpt(
+                save_root, self.global_step, best_global_step=-1, save_limit=self.config.trainer.save_limit
+            )
+            return True
 
-        last_global_step_path = os.path.join(self.config.trainer.save_checkpoint_path, CHECKPOINT_TRACKER)
-        with open(last_global_step_path, "w") as f:
-            f.write(str(self.global_step))
+        staging_path = os.path.join(save_root, f".global_step_{self.global_step}.staging-{uuid.uuid4().hex}")
+        os.makedirs(staging_path, exist_ok=False)
+        try:
+            self.actor_rollout_wg.save_checkpoint(os.path.join(staging_path, "actor"))
+            if finalize_hf:
+                merger = Path(__file__).resolve().parents[2] / "scripts" / "model_merger.py"
+                if not merger.is_file():
+                    raise RuntimeError(f"V37 checkpoint merger is missing: {merger}")
+                merge_environment = dict(os.environ)
+                merge_environment.update({
+                    "HF_DATASETS_OFFLINE": "1",
+                    "HF_HUB_OFFLINE": "1",
+                    "TRANSFORMERS_OFFLINE": "1",
+                    "WANDB_MODE": "offline",
+                    "PYTHONUNBUFFERED": "1",
+                })
+                merge_memory_policy = os.environ.get(
+                    "V37_HF_MERGE_HOST_MEMORY_PREFLIGHT", "off"
+                )
+                if merge_memory_policy not in {"off", "warn", "error"}:
+                    raise RuntimeError(
+                        "V37_HF_MERGE_HOST_MEMORY_PREFLIGHT must be off, warn, or error"
+                    )
+                merge_memory_factor = os.environ.get(
+                    "V37_HF_MERGE_HOST_MEMORY_SAFETY_FACTOR", "2.0"
+                )
+                try:
+                    parsed_memory_factor = float(merge_memory_factor)
+                except ValueError as exc:
+                    raise RuntimeError(
+                        "V37_HF_MERGE_HOST_MEMORY_SAFETY_FACTOR must be numeric"
+                    ) from exc
+                if not np.isfinite(parsed_memory_factor) or parsed_memory_factor < 1.0:
+                    raise RuntimeError(
+                        "V37_HF_MERGE_HOST_MEMORY_SAFETY_FACTOR must be finite and >= 1.0"
+                    )
+                merge_command = [
+                    sys.executable,
+                    str(merger),
+                    "--local_dir",
+                    os.path.join(staging_path, "actor"),
+                    "--host-memory-preflight",
+                    merge_memory_policy,
+                    "--host-memory-safety-factor",
+                    merge_memory_factor,
+                ]
+                subprocess.run(
+                    merge_command,
+                    cwd=str(Path(__file__).resolve().parents[2]),
+                    env=merge_environment,
+                    check=True,
+                )
+                hf_path = Path(staging_path) / "actor" / "huggingface"
+                weight_files = sorted(hf_path.glob("*.safetensors"))
+                if not weight_files or any(not item.is_file() or item.is_symlink() for item in weight_files):
+                    raise RuntimeError("V37 formal checkpoint merger produced no regular safetensors weights.")
+            if self.use_critic:
+                self.critic_wg.save_checkpoint(os.path.join(staging_path, "critic"))
 
-    def _load_checkpoint(self) -> None:
+            torch.save(self.train_dataloader.state_dict(), os.path.join(staging_path, "dataloader.pt"))
+
+            if self.adaptive_actor_kl:
+                trainer_runtime_state = {
+                    "version": TRAINER_RUNTIME_STATE_VERSION,
+                    "controller": self.kl_ctrl.state_dict(),
+                    "effective_updates": int(self.effective_actor_updates),
+                    "ref_identity": self._adaptive_ref_identity,
+                    "global_step": int(self.global_step),
+                    "step_complete": bool(self._current_step_complete),
+                    "worker_world_size": int(self.actor_rollout_wg.world_size),
+                    "controller_rng": capture_controller_rng_state(),
+                }
+                torch.save(
+                    trainer_runtime_state,
+                    os.path.join(staging_path, TRAINER_RUNTIME_STATE_FILE),
+                )
+
+            write_checkpoint_manifest(staging_path, self.global_step, required_paths)
+            publish_staged_checkpoint(staging_path, folder_path, self.global_step)
+
+            # Publication order is intentional: checkpoint, then tracker, then
+            # retention. Pre-publication failures preserve the previous tracker;
+            # retention failures leave the newly tracked checkpoint authoritative.
+            tracker_payload = {
+                "last_global_step": int(self.global_step),
+                "manifest_sha256": checkpoint_manifest_hash(folder_path),
+            }
+            _atomic_write_json(os.path.join(save_root, CHECKPOINT_TRACKER), tracker_payload)
+            remove_obsolete_ckpt(
+                save_root, self.global_step, best_global_step=-1, save_limit=self.config.trainer.save_limit
+            )
+            return True
+        finally:
+            if os.path.exists(staging_path):
+                shutil.rmtree(staging_path, ignore_errors=True)
+
+    def _load_checkpoint(self) -> bool:
         if self.config.trainer.load_checkpoint_path is None:
-            return
+            return False
 
         if "global_step_" not in self.config.trainer.load_checkpoint_path.strip(os.path.sep).split(os.path.sep)[-1]:
             raise ValueError("`load_checkpoint_path` should end with `global_step_*`.")
 
+        validate_resume_checkpoint_binding(
+            self.config.trainer.load_checkpoint_path,
+            config_binding={
+                "V37_RUN_CLASS": self.config.trainer.v37_run_class,
+                "V37_RESUME_MODE": self.config.trainer.v37_resume_mode,
+                "V37_EXPECTED_RESUME_CHECKPOINT_PATH": (
+                    self.config.trainer.v37_expected_resume_checkpoint_path
+                ),
+                "V37_EXPECTED_RESUME_CHECKPOINT_SHA256": (
+                    self.config.trainer.v37_expected_resume_checkpoint_sha256
+                ),
+            },
+        )
+
         print(f"Load from checkpoint: {self.config.trainer.load_checkpoint_path}.")
         self.global_step = int(self.config.trainer.load_checkpoint_path.strip(os.path.sep).split("global_step_")[-1])
+        trainer_runtime_state = None
+        if self.adaptive_actor_kl:
+            manifest = validate_checkpoint_manifest(
+                self.config.trainer.load_checkpoint_path, expected_step=self.global_step
+            )
+            if TRAINER_RUNTIME_STATE_FILE not in manifest["required_paths"]:
+                raise RuntimeError(
+                    f"adaptive_actor_kl manifest does not require {TRAINER_RUNTIME_STATE_FILE}."
+                )
+            trainer_state_path = os.path.join(
+                self.config.trainer.load_checkpoint_path, TRAINER_RUNTIME_STATE_FILE
+            )
+            try:
+                trainer_runtime_state = torch.load(trainer_state_path, weights_only=False, map_location="cpu")
+            except Exception as exc:
+                raise RuntimeError(
+                    f"adaptive_actor_kl trainer runtime artifact is corrupt: {trainer_state_path}."
+                ) from exc
+            if (
+                not isinstance(trainer_runtime_state, dict)
+                or trainer_runtime_state.get("version") != TRAINER_RUNTIME_STATE_VERSION
+            ):
+                raise RuntimeError("adaptive_actor_kl trainer runtime artifact has an unsupported contract.")
+            if (
+                trainer_runtime_state.get("global_step") != self.global_step
+                or trainer_runtime_state.get("step_complete") is not True
+            ):
+                raise RuntimeError("adaptive_actor_kl refuses incomplete or mismatched trainer runtime state.")
+            saved_world_size = trainer_runtime_state.get("worker_world_size")
+            if (
+                isinstance(saved_world_size, bool)
+                or not isinstance(saved_world_size, int)
+                or saved_world_size != int(self.actor_rollout_wg.world_size)
+            ):
+                raise RuntimeError("adaptive_actor_kl worker topology differs from the trainer runtime artifact.")
+            expected_ref = self._adaptive_ref_identity
+            if trainer_runtime_state.get("ref_identity") != expected_ref:
+                raise RuntimeError("adaptive_actor_kl reference identity differs from the checkpoint.")
+            expected = self.kl_ctrl.state_dict()
+            controller_state = trainer_runtime_state.get("controller")
+            if not isinstance(controller_state, dict) or controller_state.get("type") != expected.get("type"):
+                raise RuntimeError("adaptive_actor_kl controller type differs from the checkpoint.")
+            for key in ("target", "horizon"):
+                try:
+                    matches = float(controller_state.get(key)) == float(expected.get(key))
+                except (TypeError, ValueError, OverflowError):
+                    matches = False
+                if not matches:
+                    raise RuntimeError(f"adaptive_actor_kl {key} differs from the checkpoint.")
+            effective_updates = trainer_runtime_state.get("effective_updates")
+            if isinstance(effective_updates, bool) or not isinstance(effective_updates, int) or effective_updates < 0:
+                raise RuntimeError("adaptive_actor_kl effective_updates must be an exact nonnegative integer.")
+            # Require the native RNG payload here; full validation/restoration
+            # happens after every other load operation.
+            rng_state = trainer_runtime_state.get("controller_rng")
+            if not isinstance(rng_state, dict):
+                raise RuntimeError("adaptive_actor_kl trainer runtime artifact is missing controller RNG state.")
+
+        dataloader_path = os.path.join(self.config.trainer.load_checkpoint_path, "dataloader.pt")
+        if not os.path.exists(dataloader_path):
+            if self.adaptive_actor_kl:
+                raise RuntimeError(f"adaptive_actor_kl resume requires {dataloader_path}.")
+            print(f"No dataloader state found at {dataloader_path}, will start from scratch.")
+            dataloader_state_dict = None
+        else:
+            dataloader_state_dict = torch.load(dataloader_path, weights_only=False)
+
         actor_path = os.path.join(self.config.trainer.load_checkpoint_path, "actor")
         self.actor_rollout_wg.load_checkpoint(actor_path)
         if self.use_critic:
             critic_path = os.path.join(self.config.trainer.load_checkpoint_path, "critic")
             self.critic_wg.load_checkpoint(critic_path)
 
-        dataloader_path = os.path.join(self.config.trainer.load_checkpoint_path, "dataloader.pt")
-        if os.path.exists(dataloader_path):
-            dataloader_state_dict = torch.load(dataloader_path, weights_only=False)
+        if dataloader_state_dict is not None:
             self.train_dataloader.load_state_dict(dataloader_state_dict)
-        else:
-            print(f"No dataloader state found at {dataloader_path}, will start from scratch.")
+        if trainer_runtime_state is not None:
+            self.kl_ctrl.load_state_dict(trainer_runtime_state["controller"])
+            self.effective_actor_updates = trainer_runtime_state["effective_updates"]
+            self._current_step_complete = bool(trainer_runtime_state["step_complete"])
+            # Restore last: worker/dataloader deserialization is allowed to use
+            # controller RNG internally, but validation/training must observe
+            # the exact stream captured at checkpoint publication.
+            restore_controller_rng_state(trainer_runtime_state["controller_rng"])
+        return True
 
     def _balance_batch(self, batch: DataProto, metrics: Dict[str, Any], logging_prefix: str = "global_seqlen") -> None:
         """Reorder the data on single controller such that each dp rank gets similar total tokens"""
@@ -870,6 +1385,41 @@ class RayPPOTrainer:
             seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix
         )
         metrics.update(global_balance_stats)
+
+    def _finalize_training(
+        self,
+        val_metrics: Optional[Dict[str, Any]],
+        last_validation_step: Optional[int],
+        last_checkpoint_step: Optional[int],
+        v37_evidence: Optional[TrainingEvidenceRecorder] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Preserve legacy ordering unless exact adaptive continuation is enabled."""
+        needs_terminal_validation = (
+            self.val_reward_fn is not None and last_validation_step != self.global_step
+        )
+        exact_continuation = bool(getattr(self, "adaptive_actor_kl", False))
+        if exact_continuation and needs_terminal_validation and last_checkpoint_step != self.global_step:
+            if self._save_checkpoint():
+                last_checkpoint_step = self.global_step
+
+        if needs_terminal_validation:
+            val_metrics = self._validate()
+            if v37_evidence is not None:
+                v37_evidence.update_latest_oom_count(
+                    self._v37_oom_count_cumulative
+                )
+            self.logger.log(data=val_metrics, step=self.global_step)
+            last_validation_step = self.global_step
+
+        if self.val_reward_fn is not None and val_metrics is not None:
+            print(f"Final validation metrics: {convert_dict_to_str(val_metrics)}")
+
+        # Feature-off V36 and normal periodic validation preserve the established
+        # validation-then-checkpoint ordering.
+        if last_checkpoint_step != self.global_step:
+            self._save_checkpoint()
+
+        return val_metrics
 
     def fit(self):
         """
@@ -900,13 +1450,16 @@ class RayPPOTrainer:
         logger.info("=" * 80)
         
         self.logger = Tracker(loggers=self.config.trainer.logger, config=self.config.to_dict())
+        v37_evidence = TrainingEvidenceRecorder.from_environment()
         self.global_step = 0
         val_metrics: Optional[Dict[str, Any]] = None
+        last_validation_step: Optional[int] = None
+        last_checkpoint_step: Optional[int] = None
 
         # load checkpoint before doing anything
         logger.info("Loading checkpoint...")
         try:
-            self._load_checkpoint()
+            resumed_from_checkpoint = self._load_checkpoint()
             logger.info(f"Checkpoint loaded. Starting from global_step: {self.global_step}")
         except Exception as e:
             logger.error(f"Error loading checkpoint: {e}\n{traceback.format_exc()}")
@@ -914,11 +1467,15 @@ class RayPPOTrainer:
 
         # perform validation before training
         # currently, we only support validation using the reward_function.
-        if self.val_reward_fn is not None and self.config.trainer.val_before_train:
+        skip_resume_validation = self.adaptive_actor_kl and resumed_from_checkpoint and not self.config.trainer.val_only
+        if skip_resume_validation:
+            logger.info("Skipping validation-before-train on adaptive resume to preserve the restored RNG stream.")
+        if self.val_reward_fn is not None and self.config.trainer.val_before_train and not skip_resume_validation:
             logger.info("Running validation before training...")
             try:
                 val_metrics = self._validate()
                 self.logger.log(data=val_metrics, step=self.global_step)
+                last_validation_step = self.global_step
                 logger.info(f"Validation completed. Metrics: {val_metrics}")
             except Exception as e:
                 logger.error(f"Error during validation: {e}\n{traceback.format_exc()}")
@@ -931,15 +1488,34 @@ class RayPPOTrainer:
         for epoch_idx in range(self.config.trainer.total_epochs):
             if getattr(self, '_early_stopped', False):
                 break
+            # Check before constructing/advancing the dataloader iterator. A
+            # post-fetch max_steps check consumes one extra batch and stores an
+            # incorrect dataloader cursor in the final checkpoint.
+            if self.global_step >= self.training_steps:
+                logger.info(f"Reached training steps limit ({self.training_steps}). Stopping.")
+                break
             if epoch_idx == 0 or (epoch_idx + 1) % 10 == 0:  # Log every 10 epochs
                 logger.info(f"Starting epoch {epoch_idx + 1}/{self.config.trainer.total_epochs}")
             try:
                 for batch_idx, batch_dict in enumerate(self.train_dataloader):
-                    self.global_step += 1
-                    
-                    if self.global_step > self.training_steps:
+                    if self.global_step >= self.training_steps:
                         logger.info(f"Reached training steps limit ({self.training_steps}). Stopping.")
                         break
+                    self.global_step += 1
+                    self._current_step_complete = False
+                    monitor_old_ref_kl = None
+                    beta_before = None
+                    v37_reward_summary = None
+                    v37_action_rows_expected = 0
+                    v37_action_rows_mapped = 0
+                    v37_frontier_groups = 0
+                    v37_frontier_mixed_groups = 0
+                    v37_allwrong_groups = 0
+                    v37_sign_errors = 0
+                    v37_optimizer_attempted = None
+                    v37_optimizer_executed = None
+                    v37_optimizer_skipped = None
+                    v37_nonfinite_cumulative = None
                     if getattr(self, '_early_stopped', False):
                         break
 
@@ -1083,8 +1659,23 @@ class RayPPOTrainer:
                                 # get token level scores
                                 reward_tensor, reward_metrics = ray.get(reward_ref)
                                 batch.batch["token_level_scores"] = reward_tensor
+                                if v37_evidence is not None:
+                                    v37_reward_summary = v37_reward_counts(
+                                        reward_metrics, int(reward_tensor.shape[0])
+                                    )
                                 _raw_point_step_positions = reward_metrics.pop("_point_step_token_positions", None)
                                 _raw_point_step_values = reward_metrics.pop("_point_step_value", None)
+                                _raw_action_events = reward_metrics.pop("_action_events", None)
+                                _raw_action_values = reward_metrics.pop("_action_event_values", None)
+                                _selector_task_scores = reward_metrics.pop("_selector_task_scores", None)
+                                if v37_evidence is not None and os.environ.get(
+                                    "ACTION_EVENT_REWARD_ENABLE", "0"
+                                ) == "1":
+                                    v37_action_rows_expected = int(reward_tensor.shape[0])
+                                    if _raw_action_events is None or _raw_action_values is None:
+                                        raise TrainingEvidenceError(
+                                            "progress arm reward omitted row-aligned action evidence"
+                                        )
                                 if _raw_point_step_positions is not None and len(_raw_point_step_positions) == reward_tensor.shape[0]:
                                     point_step_mask = torch.zeros_like(reward_tensor, dtype=torch.float32)
                                     # Parallel value tensor (progress/stoptiming arms). When the
@@ -1113,16 +1704,79 @@ class RayPPOTrainer:
                                     batch.batch["point_step_mask"] = point_step_mask
                                     if _has_step_values:
                                         batch.batch["point_step_value"] = point_step_value
+                                if _raw_action_events is not None:
+                                    action_spans, action_values, action_types = build_action_step_tensors(
+                                        _raw_action_events,
+                                        _raw_action_values,
+                                        batch.batch["response_mask"],
+                                        batch.batch["responses"],
+                                    )
+                                    batch.batch["action_step_span"] = action_spans
+                                    batch.batch["action_step_value"] = action_values
+                                    batch.batch["action_step_type"] = action_types
+                                    if v37_evidence is not None and v37_action_rows_expected:
+                                        v37_action_rows_mapped = int(reward_tensor.shape[0])
+                                if _selector_task_scores is not None:
+                                    if len(_selector_task_scores) != reward_tensor.shape[0]:
+                                        raise ValueError("Selector task scores are not row aligned.")
+                                    metrics["bok/selector_task_score_mean"] = float(
+                                        np.mean(_selector_task_scores)
+                                    )
                                 # Extract per-sample answer_scores before reduce_metrics destroys the list
                                 _raw_answer_list = reward_metrics.get("answer", [])
                                 if _raw_answer_list and len(_raw_answer_list) == reward_tensor.shape[0]:
                                     batch.batch["answer_scores"] = torch.tensor(_raw_answer_list, dtype=torch.float32, device=reward_tensor.device)
+                                _raw_answer_correct_list = reward_metrics.pop(
+                                    "_answer_correct_for_routing", None
+                                )
+                                # Backward compatibility for custom managers
+                                # that emit a complete public metric but not the
+                                # internal row-aligned routing channel.
+                                if _raw_answer_correct_list is None:
+                                    _legacy_answer_correct = reward_metrics.get("answer_correct", [])
+                                    if len(_legacy_answer_correct) == reward_tensor.shape[0]:
+                                        _raw_answer_correct_list = _legacy_answer_correct
+                                if (
+                                    _raw_answer_correct_list is not None
+                                    and len(_raw_answer_correct_list) == reward_tensor.shape[0]
+                                ):
+                                    batch.batch["answer_correct_scores"] = torch.tensor(
+                                        _raw_answer_correct_list,
+                                        dtype=torch.float32,
+                                        device=reward_tensor.device,
+                                    )
+                                for metric_name, tensor_name in (
+                                    ("raw_success", "raw_success_scores"),
+                                    ("trajectory_quality", "trajectory_quality_scores"),
+                                ):
+                                    raw_values = reward_metrics.get(metric_name, [])
+                                    if raw_values and len(raw_values) == reward_tensor.shape[0]:
+                                        batch.batch[tensor_name] = torch.tensor(
+                                            raw_values, dtype=torch.float32, device=reward_tensor.device
+                                        )
                                 reward_metrics = {f"reward/{k}": v for k, v in reduce_metrics(reward_metrics).items()}
                                 metrics.update(reward_metrics)
 
                                 # apply kl penalty if available
-                                if not self.config.algorithm.use_kl_loss and self.use_reference_policy:
-                                    # apply kl penalty to reward
+                                if self.adaptive_actor_kl:
+                                    monitor_old_ref_kl, monitor_kl_sum, monitor_kl_count = compute_monitor_old_ref_kl(batch)
+                                    beta_before = float(self.kl_ctrl.kl_coef)
+                                    # Adaptive actor KL is applied only in the
+                                    # differentiable actor loss.  The task reward
+                                    # channel remains untouched by reward-side KL.
+                                    batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
+                                    batch.meta_info["adaptive_actor_kl"] = True
+                                    batch.meta_info["adaptive_actor_kl_coef"] = beta_before
+                                    metrics.update({
+                                        "adaptive_actor_kl/monitor_old_ref_kl": monitor_old_ref_kl,
+                                        "adaptive_actor_kl/monitor_token_sum": monitor_kl_sum,
+                                        "adaptive_actor_kl/monitor_token_count": monitor_kl_count,
+                                        "adaptive_actor_kl/beta_before": beta_before,
+                                        "adaptive_actor_kl/selector_excludes_kl": 1.0,
+                                    })
+                                elif not self.config.algorithm.use_kl_loss and self.use_reference_policy:
+                                    # Legacy V36 route: correctness-first changes
+                                    # selection only; it does not disable reward KL.
                                     batch, kl_metrics = apply_kl_penalty(batch, self.kl_ctrl, self.config.algorithm.kl_penalty)
                                     metrics.update(kl_metrics)
                                 else:
@@ -1135,6 +1789,44 @@ class RayPPOTrainer:
                                     gamma=self.config.algorithm.gamma,
                                     lam=self.config.algorithm.lam,
                                 )
+                                if int(os.environ.get("BOK_CORRECTNESS_FIRST", "0")) > 0:
+                                    raw_success = batch.batch["raw_success_scores"] >= 0.5
+                                    terminal_adv = VF.masked_mean(
+                                        batch.batch["advantages"], batch.batch["response_mask"], dim=-1
+                                    )
+                                    group_rows = defaultdict(list)
+                                    for row_idx, uid in enumerate(batch.non_tensor_batch["uid"]):
+                                        group_rows[uid].append(row_idx)
+                                    mixed_rows = []
+                                    mixed_groups = 0
+                                    allwrong_groups = 0
+                                    allsuccess_groups = 0
+                                    for rows in group_rows.values():
+                                        outcomes = raw_success[rows]
+                                        if bool(outcomes.all()):
+                                            allsuccess_groups += 1
+                                        elif bool((~outcomes).all()):
+                                            allwrong_groups += 1
+                                        else:
+                                            mixed_groups += 1
+                                            mixed_rows.extend(rows)
+                                    sign_errors = 0
+                                    for row_idx in mixed_rows:
+                                        if raw_success[row_idx] and not terminal_adv[row_idx] > 0:
+                                            sign_errors += 1
+                                        if not raw_success[row_idx] and not terminal_adv[row_idx] < 0:
+                                            sign_errors += 1
+                                    metrics.update({
+                                        "bok/correctness_mixed_rows": float(len(mixed_rows)),
+                                        "bok/correctness_sign_errors": float(sign_errors),
+                                        "bok/allwrong_groups": float(allwrong_groups),
+                                        "bok/all_raw_success_groups": float(allsuccess_groups),
+                                    })
+                                    if v37_evidence is not None:
+                                        v37_frontier_groups = len(group_rows)
+                                        v37_frontier_mixed_groups = mixed_groups
+                                        v37_allwrong_groups = allwrong_groups
+                                        v37_sign_errors = sign_errors
 
                             # update critic
                             if self.use_critic:
@@ -1163,6 +1855,82 @@ class RayPPOTrainer:
 
                                 actor_metrics = reduce_metrics(actor_output.non_tensor_batch)
                                 metrics.update(actor_metrics)
+                                if self.adaptive_actor_kl:
+                                    attempted, executed, skipped = strict_optimizer_counter_metrics(actor_metrics)
+                                    if v37_evidence is not None:
+                                        v37_optimizer_attempted = attempted
+                                        v37_optimizer_executed = executed
+                                        v37_optimizer_skipped = skipped
+                                        if actor_metrics.get("actor/nonfinite_counter_agreement") != 1.0:
+                                            raise TrainingEvidenceError(
+                                                "actor workers did not attest nonfinite counter agreement"
+                                            )
+                                        raw_nonfinite = actor_metrics.get("actor/nonfinite_grad_count")
+                                        if (
+                                            isinstance(raw_nonfinite, (bool, str))
+                                            or not isinstance(
+                                                raw_nonfinite,
+                                                (int, float, np.integer, np.floating),
+                                            )
+                                            or not np.isfinite(float(raw_nonfinite))
+                                            or float(raw_nonfinite) < 0
+                                            or not float(raw_nonfinite).is_integer()
+                                        ):
+                                            raise TrainingEvidenceError(
+                                                "actor/nonfinite_grad_count must be an exact cumulative integer"
+                                            )
+                                        v37_nonfinite_cumulative = int(float(raw_nonfinite))
+                                    if executed > 0:
+                                        self.kl_ctrl.update(current_kl=monitor_old_ref_kl, n_steps=executed)
+                                        self.effective_actor_updates += executed
+                                    metrics.update({
+                                        "adaptive_actor_kl/beta_after": float(self.kl_ctrl.kl_coef),
+                                        "adaptive_actor_kl/controller_advanced": float(executed > 0),
+                                        "adaptive_actor_kl/effective_updates": float(self.effective_actor_updates),
+                                    })
+
+                            if v37_evidence is not None:
+                                if (
+                                    v37_optimizer_attempted is None
+                                    or v37_optimizer_executed is None
+                                    or v37_optimizer_skipped is None
+                                    or v37_nonfinite_cumulative is None
+                                ):
+                                    raise TrainingEvidenceError(
+                                        "formal V37 lacks optimizer integrity counters"
+                                    )
+                                require_clean_optimizer_step(
+                                    v37_optimizer_attempted,
+                                    v37_optimizer_executed,
+                                    v37_optimizer_skipped,
+                                    v37_nonfinite_cumulative,
+                                )
+                                if v37_reward_summary is None:
+                                    raise TrainingEvidenceError(
+                                        "formal V37 step lacks reward evidence"
+                                    )
+                                if metrics.get("adaptive_actor_kl/selector_excludes_kl") != 1.0:
+                                    raise TrainingEvidenceError(
+                                        "formal V37 selector KL exclusion was not attested"
+                                    )
+                                v37_evidence.record_step({
+                                    "global_step": self.global_step,
+                                    "optimizer_microsteps_attempted": v37_optimizer_attempted,
+                                    "optimizer_microsteps_executed": v37_optimizer_executed,
+                                    "optimizer_microsteps_skipped": v37_optimizer_skipped,
+                                    "nonfinite_count_cumulative": v37_nonfinite_cumulative,
+                                    "oom_count_cumulative": self._v37_oom_count_cumulative,
+                                    **v37_reward_summary,
+                                    "selector_kl_contribution": 0.0,
+                                    "action_rows_expected": v37_action_rows_expected,
+                                    "action_rows_mapped": v37_action_rows_mapped,
+                                    "frontier_group_count": v37_frontier_groups,
+                                    "frontier_mixed_group_count": v37_frontier_mixed_groups,
+                                    "outcome_allwrong_group_count": v37_allwrong_groups,
+                                    "correctness_sign_error_count": v37_sign_errors,
+                                })
+
+                            self._current_step_complete = True
 
                             # validate
                             if (
@@ -1173,11 +1941,19 @@ class RayPPOTrainer:
                                 with timer("validation", timing_raw):
                                     val_metrics = self._validate()
 
+                                if v37_evidence is not None:
+                                    v37_evidence.update_latest_oom_count(
+                                        self._v37_oom_count_cumulative
+                                    )
+
                                 metrics.update(val_metrics)
+                                last_validation_step = self.global_step
 
                             if self.config.trainer.save_freq > 0 and self.global_step % self.config.trainer.save_freq == 0:
                                 with timer("save_checkpoint", timing_raw):
-                                    self._save_checkpoint()
+                                    checkpoint_saved = self._save_checkpoint()
+                                if checkpoint_saved:
+                                    last_checkpoint_step = self.global_step
 
                             # collect metrics
                             num_gpus = self.resource_pool_manager.get_num_gpus()
@@ -1224,23 +2000,37 @@ class RayPPOTrainer:
                                 except Exception:
                                     pass
                                 logger.warning(f"[Step {self.global_step}] [EARLY_STOP] Saving checkpoint before exit...")
-                                self._save_checkpoint()
-                                logger.warning(f"[Step {self.global_step}] [EARLY_STOP] Checkpoint saved. Exiting training loop.")
+                                checkpoint_saved = self._save_checkpoint()
+                                if checkpoint_saved:
+                                    last_checkpoint_step = self.global_step
+                                    logger.warning(f"[Step {self.global_step}] [EARLY_STOP] Checkpoint saved. Exiting training loop.")
+                                else:
+                                    logger.warning(f"[Step {self.global_step}] [EARLY_STOP] Checkpoint skipped; last complete checkpoint remains authoritative.")
                                 self._early_stopped = True
                                 break  # exit batch loop
                     
                     except Exception as e:
                         logger.error(f"[Step {self.global_step}] Fatal error in training step: {e}\n{traceback.format_exc()}")
                         raise
+
+                    # Stop immediately after the final requested update so the
+                    # next batch is never fetched from the dataloader.
+                    if self.global_step >= self.training_steps:
+                        logger.info(f"Reached training steps limit ({self.training_steps}). Stopping.")
+                        break
             except BaseException as e:
                 logger.error(f"Error in epoch {epoch_idx + 1}, batch loop: {e}\n{traceback.format_exc()}")
                 print(f"Error in epoch {epoch_idx + 1}, batch loop: {e}")
                 logger.info("Saving checkpoint due to error...")
                 print("Saving checkpoint due to error...")
                 try:
-                    self._save_checkpoint()
-                    logger.info("Checkpoint saved successfully after error.")
-                    print("Checkpoint saved successfully after error.")
+                    checkpoint_saved = self._save_checkpoint()
+                    if checkpoint_saved:
+                        logger.info("Checkpoint saved successfully after error.")
+                        print("Checkpoint saved successfully after error.")
+                    else:
+                        logger.warning("Checkpoint skipped after error; last complete checkpoint remains authoritative.")
+                        print("Checkpoint skipped after error; last complete checkpoint remains authoritative.")
                 except Exception as save_e:
                     logger.error(f"Failed to save checkpoint during error handling: {save_e}\n{traceback.format_exc()}")
                     print(f"Failed to save checkpoint during error handling: {save_e}")
@@ -1251,17 +2041,27 @@ class RayPPOTrainer:
         else:
             logger.info(f"Training loop completed. Final global_step: {self.global_step}")
 
-        # perform validation after training
-        if self.val_reward_fn is not None:
-            if (
-                val_metrics is None
-                or self.config.trainer.val_freq <= 0
-                or self.global_step % self.config.trainer.val_freq != 0
-            ):
-                val_metrics = self._validate()
-                self.logger.log(data=val_metrics, step=self.global_step)
-
-            print(f"Final validation metrics: {convert_dict_to_str(val_metrics)}")
-
-        if self.config.trainer.save_freq <= 0 or self.global_step % self.config.trainer.save_freq != 0:
-            self._save_checkpoint()
+        self._finalize_training(
+            val_metrics, last_validation_step, last_checkpoint_step, v37_evidence,
+        )
+        if v37_evidence is not None:
+            checkpoint = Path(self.config.trainer.save_checkpoint_path) / f"global_step_{self.global_step}"
+            validate_checkpoint_manifest(str(checkpoint), expected_step=self.global_step)
+            runtime_path = checkpoint / TRAINER_RUNTIME_STATE_FILE
+            if not runtime_path.is_file():
+                raise TrainingEvidenceError(
+                    f"formal final checkpoint lacks {TRAINER_RUNTIME_STATE_FILE}"
+                )
+            checkpoint_id = (
+                f"{os.environ.get('V37_ARM')}-seed{os.environ.get('V37_SEED')}-{checkpoint.name}"
+            )
+            v37_evidence.finalize(
+                completed=(
+                    not getattr(self, "_early_stopped", False)
+                    and self.global_step == self.training_steps == v37_evidence.expected_steps
+                ),
+                checkpoint_id=checkpoint_id,
+                checkpoint_path=checkpoint,
+                checkpoint_sha256=v37_tree_sha256(checkpoint),
+                kl_recoverable=bool(self.adaptive_actor_kl),
+            )

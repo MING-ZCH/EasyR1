@@ -105,18 +105,20 @@ if [[ "${V32_DRY_RUN:-0}" == "1" ]]; then
 else
 if ! command -v ray >/dev/null 2>&1; then
     if python3 -c "import ray" >/dev/null 2>&1; then
-        ray() { python3 -m ray "$@"; }
+        RAY_CMD=(python3 -m ray)
         echo "[V32] ray CLI not found; using python3 -m ray"
     else
         echo "[V32][ERROR] Ray is not available in this shell. Activate the EasyR1 RL environment with ray installed before launching training." >&2
         exit 127
     fi
+else
+    RAY_CMD=(ray)
 fi
 if [[ "${INDEX:-0}" != "0" ]]; then
     echo "[V32] Worker node INDEX=${INDEX}, starting Ray worker → head=${CHIEF_IP}:6379"
     sleep 20
     mkdir -p "${RAY_TMPDIR}" 2>/dev/null || true
-    ray start --address="${CHIEF_IP}:6379" --num-gpus=${HOST_GPU_NUM:-8} \
+    "${RAY_CMD[@]}" start --address="${CHIEF_IP}:6379" --num-gpus=${HOST_GPU_NUM:-8} \
         --temp-dir="${RAY_TMPDIR}" --block
     exit 0
 fi
@@ -126,40 +128,171 @@ echo "[V32] Launcher node (INDEX=${INDEX:-0}), starting Ray head + trainer..."
 # Ensure Ray tmpdir exists
 mkdir -p "${RAY_TMPDIR}" 2>/dev/null || true
 
+# A hung or unhealthy GCS must not make the launcher wait forever inside one
+# `ray status` call. The outer release wait has its own, longer deadline.
+export RAY_STATUS_TIMEOUT_SECONDS=${RAY_STATUS_TIMEOUT_SECONDS:-10}
+if ! [[ "${RAY_STATUS_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[V32][ERROR] RAY_STATUS_TIMEOUT_SECONDS must be a positive integer, got: ${RAY_STATUS_TIMEOUT_SECONDS}" >&2
+    exit 1
+fi
+command -v timeout >/dev/null 2>&1 || {
+    echo "[V32][ERROR] coreutils timeout is required for bounded Ray status probes." >&2
+    exit 1
+}
+if [[ "${V37_REQUIRE_EXACT_RAY_GPUS:-0}" == "1" ]]; then
+    export RAY_START_TIMEOUT_SECONDS=${RAY_START_TIMEOUT_SECONDS:-60}
+    export RAY_PLACEMENT_GROUP_TIMEOUT_SECONDS=${RAY_PLACEMENT_GROUP_TIMEOUT_SECONDS:-900}
+    for _ray_timeout_name in RAY_START_TIMEOUT_SECONDS RAY_PLACEMENT_GROUP_TIMEOUT_SECONDS; do
+        _ray_timeout_value="${!_ray_timeout_name}"
+        if ! [[ "${_ray_timeout_value}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "[V32][ERROR] ${_ray_timeout_name} must be a positive integer, got: ${_ray_timeout_value}" >&2
+            exit 1
+        fi
+    done
+fi
+
 # Start Ray head if not already running
-if ! ray status >/dev/null 2>&1; then
+if ! timeout --signal=KILL "${RAY_STATUS_TIMEOUT_SECONDS}" "${RAY_CMD[@]}" status >/dev/null 2>&1; then
     echo "[V32] Starting Ray HEAD with extended timeouts..."
-    ray start --head --port=6379 --num-gpus=${HOST_GPU_NUM:-8} \
-        --disable-usage-stats --include-dashboard=false \
+    _ray_start_args=(
+        start --head --port=6379 --num-gpus=${HOST_GPU_NUM:-8}
+        --disable-usage-stats --include-dashboard=false
         --temp-dir="${RAY_TMPDIR}"
+    )
+    if [[ "${V37_REQUIRE_EXACT_RAY_GPUS:-0}" == "1" ]]; then
+        if ! timeout --signal=KILL "${RAY_START_TIMEOUT_SECONDS}" \
+                "${RAY_CMD[@]}" "${_ray_start_args[@]}"; then
+            echo "[V32][ERROR] Ray head failed to start within ${RAY_START_TIMEOUT_SECONDS}s." >&2
+            exit 1
+        fi
+    else
+        "${RAY_CMD[@]}" "${_ray_start_args[@]}"
+    fi
     sleep 15
 fi
 
 # Wait for all worker nodes to join
 EXPECTED_GPUS=$(( ${HOST_NUM:-4} * ${HOST_GPU_NUM:-8} ))
 echo "[V32] Waiting for ${EXPECTED_GPUS} GPUs in Ray cluster..."
-MAX_WAIT=300
+export RAY_GPU_WAIT_TIMEOUT_SECONDS=${RAY_GPU_WAIT_TIMEOUT_SECONDS:-300}
+if ! [[ "${RAY_GPU_WAIT_TIMEOUT_SECONDS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "[V32][ERROR] RAY_GPU_WAIT_TIMEOUT_SECONDS must be a positive integer, got: ${RAY_GPU_WAIT_TIMEOUT_SECONDS}" >&2
+    exit 1
+fi
+MAX_WAIT=${RAY_GPU_WAIT_TIMEOUT_SECONDS}
+WAIT_INTERVAL=15
 WAITED=0
+WAIT_STARTED=${SECONDS}
+RAY_STATUS_OUTPUT=""
 while true; do
-    AVAILABLE_GPUS=$(ray status 2>/dev/null | grep -oP '[\d.]+(?=/[\d.]+\s+GPU)' | head -1)
-    TOTAL_GPUS=$(ray status 2>/dev/null | grep -oP '(?<=/)[\d.]+(?=\s+GPU)' | head -1)
-    TOTAL_GPUS_INT=${TOTAL_GPUS%.*}
-    if [ "${TOTAL_GPUS_INT:-0}" -ge "${EXPECTED_GPUS}" ]; then
-        echo "[V32] All ${TOTAL_GPUS_INT} GPUs available!"
-        break
+    WALL_WAITED=$((SECONDS - WAIT_STARTED))
+    if [ "${WALL_WAITED}" -gt "${WAITED}" ]; then
+        WAITED=${WALL_WAITED}
     fi
-    if [ ${WAITED} -ge ${MAX_WAIT} ]; then
+    if [ "${WAITED}" -ge "${MAX_WAIT}" ]; then
+        if [[ "${V37_REQUIRE_EXACT_RAY_GPUS:-0}" == "1" ]]; then
+            if [[ "${TOTAL_GPUS_INT:-}" =~ ^[0-9]+$ ]] \
+                  && [ "${TOTAL_GPUS_INT}" -eq "${EXPECTED_GPUS}" ]; then
+                echo "[V32][ERROR] V37 formal requires all ${EXPECTED_GPUS} Ray GPUs to be free; timed out after ${MAX_WAIT}s with used=${USED_GPUS:-unknown}, free=${FREE_GPUS:-unknown}, total=${TOTAL_GPUS_INT}." >&2
+            else
+                echo "[V32][ERROR] V37 formal requires ${EXPECTED_GPUS} Ray GPUs; got ${TOTAL_GPUS_INT:-0} after ${MAX_WAIT}s." >&2
+            fi
+            exit 1
+        fi
         echo "[V32] WARNING: Timeout waiting for GPUs. Got ${TOTAL_GPUS_INT:-0}/${EXPECTED_GPUS}."
         echo "[V32] Proceeding with available GPUs..."
         break
     fi
-    echo "[V32] Waiting... (${TOTAL_GPUS_INT:-0}/${EXPECTED_GPUS} GPUs, ${WAITED}s elapsed)"
-    sleep 15
-    WAITED=$((WAITED + 15))
+
+    STATUS_TIMEOUT=${RAY_STATUS_TIMEOUT_SECONDS}
+    REMAINING=$((MAX_WAIT - WAITED))
+    if [ "${STATUS_TIMEOUT}" -gt "${REMAINING}" ]; then
+        STATUS_TIMEOUT=${REMAINING}
+    fi
+    STATUS_STARTED=${SECONDS}
+    if RAY_STATUS_OUTPUT=$(timeout --signal=KILL "${STATUS_TIMEOUT}" "${RAY_CMD[@]}" status 2>/dev/null); then
+        RAY_STATUS_RC=0
+    else
+        RAY_STATUS_RC=$?
+        RAY_STATUS_OUTPUT=""
+    fi
+    STATUS_ELAPSED=$((SECONDS - STATUS_STARTED))
+    if [ "${RAY_STATUS_RC}" -eq 124 ] && [ "${STATUS_ELAPSED}" -lt "${STATUS_TIMEOUT}" ]; then
+        STATUS_ELAPSED=${STATUS_TIMEOUT}
+    fi
+    WAITED=$((WAITED + STATUS_ELAPSED))
+    WALL_WAITED=$((SECONDS - WAIT_STARTED))
+    if [ "${WALL_WAITED}" -gt "${WAITED}" ]; then
+        WAITED=${WALL_WAITED}
+    fi
+
+    GPU_USAGE=$(printf '%s\n' "${RAY_STATUS_OUTPUT}" | awk '
+        / GPU/ {
+            for (i = 1; i < NF; i++) {
+                if ($i ~ /^[0-9]+([.][0-9]+)?\/[0-9]+([.][0-9]+)?$/ && $(i + 1) == "GPU") {
+                    print $i
+                    exit
+                }
+            }
+        }
+    ')
+    USED_GPUS=${GPU_USAGE%%/*}
+    TOTAL_GPUS=${GPU_USAGE##*/}
+    [[ "${GPU_USAGE}" == */* ]] || { USED_GPUS=""; TOTAL_GPUS=""; }
+    TOTAL_GPUS_INT=""
+    if [[ "${TOTAL_GPUS}" =~ ^([0-9]+)([.]0+)?$ ]]; then
+        TOTAL_GPUS_INT=${BASH_REMATCH[1]}
+    elif [[ "${TOTAL_GPUS}" =~ ^[0-9]+[.][0-9]+$ ]]; then
+        if [[ "${V37_REQUIRE_EXACT_RAY_GPUS:-0}" == "1" ]]; then
+            echo "[V32][ERROR] V37 formal requires an integral Ray GPU total, got ${TOTAL_GPUS}." >&2
+            exit 1
+        fi
+        TOTAL_GPUS_INT=${TOTAL_GPUS%%.*}
+    fi
+    FREE_GPUS=$(awk -v total="${TOTAL_GPUS:-0}" -v used="${USED_GPUS:-0}" \
+        'BEGIN { printf "%.3f", total - used }')
+    if [[ "${TOTAL_GPUS_INT}" =~ ^[0-9]+$ ]] \
+          && [ "${TOTAL_GPUS_INT}" -ge "${EXPECTED_GPUS}" ]; then
+        if [[ "${V37_REQUIRE_EXACT_RAY_GPUS:-0}" == "1" \
+              && "${TOTAL_GPUS_INT}" -ne "${EXPECTED_GPUS}" ]]; then
+            echo "[V32][ERROR] V37 formal requires exactly ${EXPECTED_GPUS} Ray GPUs, got ${TOTAL_GPUS_INT}." >&2
+            exit 1
+        fi
+        if [[ "${V37_REQUIRE_EXACT_RAY_GPUS:-0}" != "1" \
+              || "${USED_GPUS:-}" =~ ^0+([.]0+)?$ ]]; then
+            echo "[V32] Ray GPUs ready: used=${USED_GPUS:-unknown}, free=${FREE_GPUS}, total=${TOTAL_GPUS_INT}."
+            break
+        fi
+    fi
+    if [ "${WAITED}" -ge "${MAX_WAIT}" ]; then
+        if [[ "${V37_REQUIRE_EXACT_RAY_GPUS:-0}" == "1" ]]; then
+            if [[ "${TOTAL_GPUS_INT:-0}" -eq "${EXPECTED_GPUS}" ]]; then
+                echo "[V32][ERROR] V37 formal requires all ${EXPECTED_GPUS} Ray GPUs to be free; timed out after ${MAX_WAIT}s with used=${USED_GPUS:-unknown}, free=${FREE_GPUS}, total=${TOTAL_GPUS_INT}." >&2
+            else
+                echo "[V32][ERROR] V37 formal requires ${EXPECTED_GPUS} Ray GPUs; got ${TOTAL_GPUS_INT:-0} after ${MAX_WAIT}s." >&2
+            fi
+            exit 1
+        fi
+        echo "[V32] WARNING: Timeout waiting for GPUs. Got ${TOTAL_GPUS_INT:-0}/${EXPECTED_GPUS}."
+        echo "[V32] Proceeding with available GPUs..."
+        break
+    fi
+    SLEEP_FOR=${WAIT_INTERVAL}
+    REMAINING=$((MAX_WAIT - WAITED))
+    if [ "${SLEEP_FOR}" -gt "${REMAINING}" ]; then
+        SLEEP_FOR=${REMAINING}
+    fi
+    echo "[V32] Waiting... (used=${USED_GPUS:-unknown}, free=${FREE_GPUS}, total=${TOTAL_GPUS_INT:-0}, expected=${EXPECTED_GPUS}, ${WAITED}s/${MAX_WAIT}s elapsed)"
+    sleep "${SLEEP_FOR}"
+    WAITED=$((WAITED + SLEEP_FOR))
 done
 
 echo "[V32] Ray cluster status:"
-ray status
+if [[ -n "${RAY_STATUS_OUTPUT}" ]]; then
+    printf '%s\n' "${RAY_STATUS_OUTPUT}"
+else
+    echo "[V32] Ray status output unavailable from the final bounded probe."
+fi
 
 export RAY_ADDRESS="auto"
 echo "[V32] RAY_ADDRESS=${RAY_ADDRESS}"
@@ -190,10 +323,12 @@ export ACTOR_LR=${ACTOR_LR:-1e-6}
 export DISABLE_KL=${DISABLE_KL:-false}
 export KL_COEF=${KL_COEF:-0.03}
 export USE_KL_LOSS=${USE_KL_LOSS:-true}
+export ADAPTIVE_ACTOR_KL=${ADAPTIVE_ACTOR_KL:-false}
 export KL_TYPE=${KL_TYPE:-fixed}
 export KL_TARGET=${KL_TARGET:-0.0}
 export KL_HORIZON=${KL_HORIZON:-0.0}
 export KL_PENALTY=${KL_PENALTY:-low_var_kl}
+export TORCH_LOGPROB_FALLBACK_MODE=${TORCH_LOGPROB_FALLBACK_MODE:-legacy}
 export CLIP_RATIO_LOW=${CLIP_RATIO_LOW:-0.2}
 export CLIP_RATIO_HIGH=${CLIP_RATIO_HIGH:-0.28}
 export CLIP_RATIO_DUAL=${CLIP_RATIO_DUAL:-3.0}
@@ -371,6 +506,77 @@ FAILFAST_LOG="${MONITOR_DIR}/failfast_v32_${RUN_TS}.log"
 export STOP_FILE="/tmp/v32_stop_${RUN_TS}"
 rm -f "${STOP_FILE}"
 
+if [[ -n "${V37_EFFECTIVE_ENVIRONMENT_PATH:-}" ]]; then
+  python3 - "${V37_EFFECTIVE_ENVIRONMENT_PATH}" <<'PY'
+import hashlib
+import json
+import os
+import stat
+import sys
+from pathlib import Path
+
+target = Path(sys.argv[1])
+expected = Path(os.environ["V31_SAVE_CHECKPOINT_PATH"]) / "v37_effective_environment.json"
+target = Path(os.path.abspath(os.path.expanduser(str(target))))
+expected = Path(os.path.abspath(os.path.expanduser(str(expected))))
+current = Path(target.anchor)
+for part in target.parts[1:-1]:
+    current /= part
+    metadata = os.lstat(current)
+    if stat.S_ISLNK(metadata.st_mode):
+        raise SystemExit(f"V37 effective environment path contains a symlink: {current}")
+if target != expected or target.exists() or target.is_symlink():
+    raise SystemExit("invalid or pre-existing V37 effective environment target")
+if os.environ.get("BASH_ENV") or os.environ.get("ENV") or any(
+    key.startswith("BASH_FUNC_") for key in os.environ
+):
+    raise SystemExit("forbidden shell startup/function environment reached V37 training entry")
+audited_prefixes = (
+    "ACTION_", "ACTOR_", "ADAPTIVE_", "ANSWER_", "BOK_", "CLIP_", "EASYR1_", "GRAD_", "INTERLEAVED_",
+    "KL_", "POINT_", "POLICY_", "PROCESS_", "REWARD_", "ROLLOUT_", "STEPCOUNT_",
+    "TRAIN_", "TRAINER_", "TRAJECTORY_", "TRAJ_", "V31_", "V32_", "V36_", "V37_", "VCRL_",
+    "CUBLAS_", "CUDA_", "FLASH_", "FSDP_", "MKL_", "NCCL_", "OMP_", "PYTORCH_",
+    "RAY_", "TOKENIZERS_", "TORCH_", "TRANSFORMERS_", "VLLM_", "XFORMERS_",
+    "FI_", "GLOO_", "MASTER_", "NVIDIA_", "OMPI_", "PMI_", "PMIX_", "TRITON_", "UCX_",
+)
+allowlist = {
+    "CC", "CHIEF_IP", "CONFIG_PATH", "CONDA_PREFIX", "CUDA_HOME", "CXX", "DISABLE_KL",
+    "HOST_GPU_NUM", "HOST_NUM", "INDEX", "LD_LIBRARY_PATH", "LD_PRELOAD", "MAX_STEPS", "MODEL_PATH",
+    "HF_DATASETS_OFFLINE", "HF_HOME", "HF_HUB_DISABLE_TELEMETRY", "HF_HUB_OFFLINE",
+    "HOME", "HOSTNAME", "LANG", "LC_ALL", "LOCAL_RANK", "LOGNAME", "PATH", "PWD", "PYTHONHASHSEED",
+    "PYTHONIOENCODING", "PYTHONNOUSERSITE", "PYTHONPATH", "PYTHONUNBUFFERED", "PYTHONWARNINGS",
+    "RANK", "SHELL", "SYSTEM_PROMPT_FILE", "TERM", "TMP", "TEMP", "TMPDIR", "TZ", "USE_KL_LOSS",
+    "USER", "VIRTUAL_ENV", "WANDB_DIR", "WANDB_ENTITY", "WANDB_MODE", "WANDB_PROJECT", "WORLD_SIZE",
+    "XDG_CACHE_HOME",
+}
+environment = {
+    key: value for key, value in sorted(os.environ.items())
+    if key.startswith(audited_prefixes) or key in allowlist
+}
+encoded = json.dumps(environment, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+payload = {
+    "schema_version": 1,
+    "contract": "v37_effective_pre_trainer_environment_v1",
+    "environment_sha256": hashlib.sha256(encoded).hexdigest(),
+    "environment": environment,
+}
+temporary = target.with_name(f".{target.name}.tmp.{os.getpid()}")
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+descriptor = os.open(temporary, flags, 0o600)
+with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+    json.dump(payload, handle, ensure_ascii=False, indent=2, allow_nan=False)
+    handle.write("\n")
+    handle.flush()
+    os.fsync(handle.fileno())
+if not stat.S_ISREG(os.lstat(temporary).st_mode):
+    raise SystemExit("V37 effective environment temporary is not a regular file")
+try:
+    os.link(temporary, target, follow_symlinks=False)
+finally:
+    temporary.unlink(missing_ok=True)
+PY
+fi
+
 echo "================================================================"
 echo "[V32] Self-Contained — $((V31_NNODES * V31_N_GPUS_PER_NODE)) GPU (${V31_NNODES} nodes × ${V31_N_GPUS_PER_NODE} GPUs)"
 echo "[V32] CUDA library path prepared; profile=${STEPCOUNT_HARDWARE_PROFILE} CUBLAS126=${CUBLAS126}"
@@ -440,6 +646,7 @@ python3 -m verl.trainer.main \
     algorithm.adv_estimator=${ADV_ESTIMATOR} \
     algorithm.disable_kl=${DISABLE_KL} \
     algorithm.use_kl_loss=${USE_KL_LOSS} \
+    algorithm.adaptive_actor_kl=${ADAPTIVE_ACTOR_KL} \
     algorithm.kl_type=${KL_TYPE} \
     algorithm.kl_target=${KL_TARGET} \
     algorithm.kl_horizon=${KL_HORIZON} \
@@ -451,8 +658,11 @@ python3 -m verl.trainer.main \
     data.val_files="'${STEPCOUNT_VAL_DATA}'" \
     data.max_prompt_length=${V31_MAX_PROMPT_LENGTH:-7500} \
     data.max_response_length=${V31_MAX_RESPONSE_LENGTH:-3200} \
+    data.max_pixels=${V31_MAX_PIXELS:-12845056} \
+    data.min_pixels=${V31_MIN_PIXELS:-262144} \
     data.filter_overlong_num_proc=${V31_FILTER_OVERLONG_NUM_PROC} \
     data.shuffle=true \
+    data.seed=${V31_DATA_SEED:-42} \
     worker.actor.optim.lr=${ACTOR_LR} \
     worker.actor.optim.lr_warmup_ratio=0.05 \
     worker.actor.clip_ratio_low=${CLIP_RATIO_LOW} \
@@ -462,6 +672,7 @@ python3 -m verl.trainer.main \
     worker.actor.max_grad_norm=1.0 \
     worker.actor.model.model_path=${MODEL_PATH} \
     worker.actor.padding_free=true \
+    worker.actor.torch_logprob_fallback_mode=${TORCH_LOGPROB_FALLBACK_MODE} \
     worker.actor.ulysses_sequence_parallel_size=${V31_ULYSSES_SEQUENCE_PARALLEL_SIZE:-1} \
     worker.actor.micro_batch_size_per_device_for_update=${V31_MICRO_BATCH_UPDATE} \
     worker.actor.micro_batch_size_per_device_for_experience=${V31_MICRO_BATCH_EXP} \
@@ -472,6 +683,8 @@ python3 -m verl.trainer.main \
     worker.rollout.enforce_eager=${V31_ENFORCE_EAGER} \
     worker.rollout.n=${ROLLOUT_N} \
     worker.rollout.temperature=${ROLLOUT_TEMPERATURE} \
+    worker.rollout.top_p=${ROLLOUT_TOP_P:-1.0} \
+    worker.rollout.seed=${V31_ROLLOUT_SEED:-1} \
     worker.rollout.stop='["</answer>"]' \
     worker.rollout.interleaved_point_to_count=true \
     worker.rollout.interleaved_max_turns=${INTERLEAVED_MAX_TURNS} \
@@ -483,6 +696,7 @@ python3 -m verl.trainer.main \
     worker.rollout.interleaved_history_mode=${INTERLEAVED_HISTORY_MODE} \
     worker.rollout.interleaved_first_turn_prompt_file=${INTERLEAVED_FIRST_TURN_PROMPT_FILE} \
     worker.rollout.interleaved_process_prompt_file=${INTERLEAVED_PROCESS_PROMPT_FILE} \
+    worker.rollout.interleaved_process_prompt_sha256=${INTERLEAVED_PROCESS_PROMPT_SHA256:-null} \
     worker.rollout.interleaved_stop_tag='</answer>' \
     worker.rollout.interleaved_debug=${INTERLEAVED_DEBUG} \
     worker.rollout.interleaved_debug_print_chars=${INTERLEAVED_DEBUG_PRINT_CHARS} \
@@ -508,6 +722,10 @@ python3 -m verl.trainer.main \
     trainer.val_only=${TRAINER_VAL_ONLY} \
     trainer.val_generations_to_log=${TRAINER_VAL_GENERATIONS_TO_LOG} \
     ${V32_LOAD_CHECKPOINT_PATH:+trainer.load_checkpoint_path=${V32_LOAD_CHECKPOINT_PATH}} \
+    ${V37_RUN_CLASS:+trainer.v37_run_class=${V37_RUN_CLASS}} \
+    ${V37_RESUME_MODE:+trainer.v37_resume_mode=${V37_RESUME_MODE}} \
+    ${V37_EXPECTED_RESUME_CHECKPOINT_PATH:+trainer.v37_expected_resume_checkpoint_path=${V37_EXPECTED_RESUME_CHECKPOINT_PATH}} \
+    ${V37_EXPECTED_RESUME_CHECKPOINT_SHA256:+trainer.v37_expected_resume_checkpoint_sha256=${V37_EXPECTED_RESUME_CHECKPOINT_SHA256}} \
     data.rollout_batch_size=${V31_ROLLOUT_BATCH_SIZE} \
     data.val_batch_size=${V31_VAL_BATCH_SIZE} \
     worker.actor.global_batch_size=${V31_GLOBAL_BATCH_SIZE} \

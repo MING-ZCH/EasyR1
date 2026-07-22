@@ -58,6 +58,117 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         torch.cuda.manual_seed(gen_dp_rank + 1000)  # make sure all tp ranks have the same random states
         self.gen_random_states = torch.cuda.get_rng_state()
         torch.cuda.set_rng_state(self.torch_random_states)
+        self._inside_generation_context = False
+        # FSDPCheckpointManager sees the same FSDP object and persists these
+        # narrow callbacks in each rank's extra-state shard.
+        self.module._easy_r1_rollout_state_getter = self.runtime_state_dict
+        self.module._easy_r1_rollout_state_loader = self.load_runtime_state_dict
+
+    def _model_runner(self):
+        return self.inference_engine.llm_engine.model_executor.driver_worker.worker.model_runner
+
+    def _internal_generator_state(self):
+        runner = self._model_runner()
+        for name in ("generators", "_generators"):
+            generators = getattr(runner, name, None)
+            if generators:
+                if not isinstance(generators, dict) or any(
+                    not isinstance(generator, torch.Generator) for generator in generators.values()
+                ):
+                    raise RuntimeError("Unsupported internal vLLM generator mapping; refusing adaptive checkpoint.")
+                return {
+                    "kind": "mapping",
+                    "attribute": name,
+                    "states": {key: generator.get_state().cpu() for key, generator in generators.items()},
+                }
+        generator = getattr(runner, "generator", None)
+        if generator is None:
+            return None
+        if not isinstance(generator, torch.Generator):
+            raise RuntimeError("Unsupported internal vLLM generator state; refusing adaptive checkpoint.")
+        return {"kind": "single", "attribute": "generator", "state": generator.get_state().cpu()}
+
+    def _restore_internal_generator_state(self, saved_state) -> None:
+        current_state = self._internal_generator_state()
+        if (current_state is None) != (saved_state is None):
+            raise RuntimeError("Internal vLLM generator cannot be restored exactly.")
+        if current_state is None:
+            return
+        if not isinstance(saved_state, dict) or (
+            saved_state.get("kind"), saved_state.get("attribute")
+        ) != (current_state.get("kind"), current_state.get("attribute")):
+            raise RuntimeError("Internal vLLM generator layout differs from the checkpoint.")
+        runner = self._model_runner()
+        try:
+            if saved_state["kind"] == "single":
+                getattr(runner, saved_state["attribute"]).set_state(saved_state["state"])
+            elif saved_state["kind"] == "mapping":
+                generators = getattr(runner, saved_state["attribute"])
+                states = saved_state.get("states")
+                if not isinstance(states, dict) or set(states) != set(generators):
+                    raise RuntimeError("Internal vLLM generator keys differ from the checkpoint.")
+                for key, generator in generators.items():
+                    generator.set_state(states[key])
+            else:
+                raise RuntimeError("Unsupported saved internal vLLM generator kind.")
+        except Exception as exc:
+            raise RuntimeError("Failed to restore internal vLLM generator state exactly.") from exc
+
+    def runtime_state_dict(self) -> dict:
+        if self._inside_generation_context:
+            raise RuntimeError("Cannot checkpoint rollout RNG state during an active generation context.")
+        # Training may advance CUDA RNG between rollout contexts.
+        self.torch_random_states = torch.cuda.get_rng_state()
+        return {
+            "version": 1,
+            "world_size": self.world_size,
+            "tp_size": self.tp_size,
+            "tp_rank": self.tp_rank,
+            "dp_rank": self.device_mesh["dp"].get_local_rank(),
+            "torch_random_states": self.torch_random_states.cpu().clone(),
+            "gen_random_states": self.gen_random_states.cpu().clone(),
+            "internal_generator_state": self._internal_generator_state(),
+        }
+
+    def load_runtime_state_dict(self, state: dict) -> None:
+        if self._inside_generation_context:
+            raise RuntimeError("Cannot restore rollout RNG state during an active generation context.")
+        if not isinstance(state, dict) or state.get("version") != 1:
+            raise RuntimeError("Unsupported rollout runtime checkpoint state.")
+        required_keys = {
+            "world_size",
+            "tp_size",
+            "tp_rank",
+            "dp_rank",
+            "torch_random_states",
+            "gen_random_states",
+            "internal_generator_state",
+        }
+        if not required_keys.issubset(state):
+            raise RuntimeError("Rollout runtime checkpoint state is incomplete.")
+        expected_identity = {
+            "world_size": self.world_size,
+            "tp_size": self.tp_size,
+            "tp_rank": self.tp_rank,
+            "dp_rank": self.device_mesh["dp"].get_local_rank(),
+        }
+        if any(state.get(key) != value for key, value in expected_identity.items()):
+            raise RuntimeError("Rollout topology differs from the checkpoint; RNG restoration is not exact.")
+        torch_state = state.get("torch_random_states")
+        gen_state = state.get("gen_random_states")
+        if not isinstance(torch_state, torch.Tensor) or not isinstance(gen_state, torch.Tensor):
+            raise RuntimeError("Rollout checkpoint is missing CUDA generation RNG tensors.")
+        if (
+            torch_state.dtype != self.torch_random_states.dtype
+            or torch_state.shape != self.torch_random_states.shape
+            or gen_state.dtype != self.gen_random_states.dtype
+            or gen_state.shape != self.gen_random_states.shape
+        ):
+            raise RuntimeError("Rollout CUDA RNG tensor format differs from this runtime.")
+        saved_internal = state.get("internal_generator_state")
+        self._restore_internal_generator_state(saved_internal)
+        self.torch_random_states = torch_state.cpu().clone()
+        self.gen_random_states = gen_state.cpu().clone()
 
     def _rename_weight_keys(self, actor_weights: Dict[str, Union[torch.Tensor, DTensor]], model: PreTrainedModel):
         # convert state dict keys: https://github.com/huggingface/transformers/pull/38385
@@ -125,6 +236,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         if self.device_mesh is not None:
             self.torch_random_states = torch.cuda.get_rng_state()
             torch.cuda.set_rng_state(self.gen_random_states)
+            self._inside_generation_context = True
 
     def __exit__(self, exc_type, exc_value, traceback):
         print_gpu_memory_usage("Before vllm offload in sharding manager")
@@ -144,6 +256,7 @@ class FSDPVLLMShardingManager(BaseShardingManager):
         if self.device_mesh is not None:
             self.gen_random_states = torch.cuda.get_rng_state()
             torch.cuda.set_rng_state(self.torch_random_states)
+            self._inside_generation_context = False
 
     def preprocess_data(self, data: DataProto) -> DataProto:
         """All gather across tp group to make each rank has identical input."""

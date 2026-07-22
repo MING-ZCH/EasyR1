@@ -42,6 +42,130 @@ from .config import ActorConfig
 __all__ = ["DataParallelPPOActor"]
 
 
+def _corrected_torch_fallback_log_probs(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+    return VF.log_probs_from_logits(
+        logits,
+        labels,
+        correct_torch_fallback_logprob_sign=True,
+    )
+
+
+def resolve_logprob_function(fallback_mode: str):
+    """Resolve a feature-gated log-prob kernel without changing V36 defaults."""
+    mode = str(fallback_mode).strip().lower()
+    if mode not in ("legacy", "correct", "error"):
+        raise ValueError(
+            "torch_logprob_fallback_mode must be one of legacy, correct, or error, "
+            f"got {fallback_mode!r}."
+        )
+    if mode == "error" and not VF.FLAH_ATTN_CROSS_ENTROPY_LOSS_AVAILABLE:
+        raise RuntimeError(
+            "torch_logprob_fallback_mode=error requires the FlashAttention "
+            "cross-entropy kernel; refusing the historical positive-CE fallback."
+        )
+    if mode == "correct":
+        return _corrected_torch_fallback_log_probs
+    return VF.log_probs_from_logits
+
+
+def _is_grad_spike_against_ema(
+    grad_norm: float, ema: Optional[float], threshold: float, *, ignore_zero_ema: bool = False
+) -> bool:
+    """Apply legacy zero-EMA behavior unless the V37 safety mode opts out."""
+    if ema is None:
+        return False
+    if ignore_zero_ema and ema <= 0.0:
+        return False
+    return grad_norm > ema * threshold
+
+
+def _validate_adaptive_optimizer_rpc_counts(attempted: int, executed: int) -> None:
+    """Keep one scheduler/controller transition per adaptive actor RPC."""
+    if attempted != 1 or executed not in (0, 1) or executed > attempted:
+        raise RuntimeError(
+            "adaptive_actor_kl requires exactly one optimizer attempt per update_policy RPC; "
+            f"got attempted={attempted}, executed={executed}."
+        )
+
+
+def coherent_actual_loss_metrics(
+    policy_sum: float,
+    entropy_sum: float,
+    entropy_bonus_sum: float,
+    loss_token_count: float,
+    kl_sum: float,
+    kl_token_count: float,
+    kl_coef: float,
+) -> dict[str, float]:
+    """Compose actual-loss metrics from compatible token-weighted aggregates."""
+    values = (
+        policy_sum,
+        entropy_sum,
+        entropy_bonus_sum,
+        loss_token_count,
+        kl_sum,
+        kl_token_count,
+        kl_coef,
+    )
+    if not all(torch.isfinite(torch.tensor(float(value))).item() for value in values):
+        raise RuntimeError("Non-finite actual-loss aggregate.")
+    if loss_token_count <= 0 or kl_token_count <= 0 or kl_coef < 0:
+        raise RuntimeError("Invalid actual-loss token counts or KL coefficient.")
+    policy_mean = policy_sum / loss_token_count
+    entropy_mean = entropy_sum / loss_token_count
+    entropy_bonus_mean = entropy_bonus_sum / loss_token_count
+    kl_mean = kl_sum / kl_token_count
+    return {
+        "policy_loss": policy_mean,
+        "entropy_loss": entropy_mean,
+        "entropy_bonus": entropy_bonus_mean,
+        "kl_loss": kl_mean,
+        "kl_penalty": kl_coef * kl_mean,
+        "total_loss": policy_mean + kl_coef * kl_mean - entropy_bonus_mean,
+    }
+
+
+def scale_full_shard_token_sum(
+    local_token_sum: torch.Tensor,
+    global_token_count: torch.Tensor,
+    gradient_world_size: int,
+    gradient_accumulation: int = 1,
+) -> torch.Tensor:
+    """Scale a local token sum before the caller's accumulation division.
+
+    FSDP averages gradients over ``gradient_world_size`` ranks and the caller
+    later divides every microbatch loss by ``gradient_accumulation``.  This
+    factor makes the resulting averaged gradient exactly the global valid-token
+    mean when every microbatch contributes its local token sum.
+    """
+    if (
+        gradient_world_size <= 0
+        or gradient_accumulation <= 0
+        or global_token_count.numel() != 1
+        or global_token_count.item() <= 0
+    ):
+        raise RuntimeError("Invalid full-shard token-mean scaling inputs.")
+    denominator = global_token_count.to(device=local_token_sum.device, dtype=local_token_sum.dtype)
+    return local_token_sum * (gradient_world_size * gradient_accumulation) / denominator
+
+
+def masked_mean_to_token_sum(
+    masked_mean: torch.Tensor, valid_token_count: torch.Tensor, eps: float = 1e-8
+) -> torch.Tensor:
+    """Invert ``VF.masked_mean`` exactly for a scalar mean and detached count."""
+    if valid_token_count.numel() != 1 or valid_token_count.item() < 0:
+        raise RuntimeError("Invalid valid-token count for masked-mean reconstruction.")
+    denominator = valid_token_count.to(device=masked_mean.device, dtype=masked_mean.dtype) + eps
+    return masked_mean * denominator
+
+
+def validate_adaptive_actor_kl_topology(ulysses_size: int, fsdp_size: int, world_size: int) -> None:
+    if ulysses_size > 1:
+        raise RuntimeError("adaptive_actor_kl currently fails closed for Ulysses sequence parallelism.")
+    if 0 < fsdp_size < world_size:
+        raise RuntimeError("adaptive_actor_kl currently fails closed for hybrid-sharded FSDP.")
+
+
 def _handle_multimodal_logprob_mismatch(
     message: str,
     batch_size: int,
@@ -172,6 +296,8 @@ class DataParallelPPOActor(BasePPOActor):
         self._spike_brake_activated = False
         self._spike_history = []         # list of optimizer step numbers when spikes occurred
         self._optimizer_step_count = 0   # total optimizer steps for brake window tracking
+        self._last_optimizer_step_executed = False
+        self._last_optimizer_skip_reason = ""
         # Non-finite grad recovery (NaN/Inf): backoff + cooldown + emergency brake
         self._nonfinite_count = 0
         self._nonfinite_history = []
@@ -199,10 +325,138 @@ class DataParallelPPOActor(BasePPOActor):
         if self._fp16_monitor_enabled and self.rank == 0:
             print(f'[FP16Monitor] ENABLED: check every {self._fp16_monitor_every} optimizer steps')
 
+        self._grad_protection_config_identity = {
+            "version": 1,
+            "adaptive_actor_kl": bool(getattr(config, "adaptive_actor_kl", False)),
+            "spike_enabled": self._spike_enabled,
+            "spike_threshold": self._spike_threshold,
+            "spike_cooldown_steps": self._spike_cooldown_steps,
+            "spike_lr_factor": self._spike_lr_factor,
+            "ema_alpha": self._grad_norm_ema_alpha,
+            "brake_window": self._spike_brake_window,
+            "brake_max": self._spike_brake_max,
+            "nonfinite_cooldown_steps": self._nonfinite_cooldown_steps,
+            "nonfinite_lr_factor": self._nonfinite_lr_factor,
+            "nonfinite_brake_window": self._nonfinite_brake_window,
+            "nonfinite_brake_max": self._nonfinite_brake_max,
+            "absolute_cap": self._grad_spike_absolute_cap,
+            "max_grad_norm": float(config.max_grad_norm),
+            "optimizer_param_groups": len(actor_optimizer.param_groups) if actor_optimizer is not None else 0,
+            "configured_lr": float(config.optim.lr) if actor_optimizer is not None else None,
+        }
+        # FSDPCheckpointManager is intentionally actor-agnostic.  Attach narrow
+        # adaptive-only callbacks to the optimizer so its existing per-rank
+        # extra-state file can persist exact actor runtime state without
+        # changing legacy/V36 checkpoint and LR-override behavior.
+        if actor_optimizer is not None and bool(getattr(config, "adaptive_actor_kl", False)):
+            actor_optimizer._easy_r1_actor_state_getter = self.runtime_state_dict
+            actor_optimizer._easy_r1_actor_state_loader = self.load_runtime_state_dict
+
+        logprob_fn = resolve_logprob_function(
+            getattr(config, "torch_logprob_fallback_mode", "legacy")
+        )
         if config.use_torch_compile:
-            self.log_probs_from_logits = torch.compile(VF.log_probs_from_logits, dynamic=True)
+            self.log_probs_from_logits = torch.compile(logprob_fn, dynamic=True)
         else:
-            self.log_probs_from_logits = VF.log_probs_from_logits
+            self.log_probs_from_logits = logprob_fn
+
+    def runtime_state_dict(self) -> Dict[str, Any]:
+        return {
+            "version": 1,
+            "config_identity": dict(self._grad_protection_config_identity),
+            "grad_norm_ema": self._grad_norm_ema,
+            "spike_cooldown_remaining": self._spike_cooldown_remaining,
+            "original_lrs": None if self._original_lrs is None else list(self._original_lrs),
+            "current_lrs": [float(group["lr"]) for group in self.actor_optimizer.param_groups],
+            "spike_count": self._spike_count,
+            "spike_history": list(self._spike_history),
+            "spike_brake_activated": self._spike_brake_activated,
+            "nonfinite_count": self._nonfinite_count,
+            "nonfinite_history": list(self._nonfinite_history),
+            "optimizer_attempt_count": self._optimizer_step_count,
+            "last_optimizer_step_executed": self._last_optimizer_step_executed,
+            "last_optimizer_skip_reason": self._last_optimizer_skip_reason,
+            "fp16_monitor_step": self._fp16_monitor_step,
+        }
+
+    def load_runtime_state_dict(self, state: Optional[Dict[str, Any]]) -> None:
+        if state is None:
+            if bool(getattr(self.config, "adaptive_actor_kl", False)):
+                raise RuntimeError("adaptive_actor_kl checkpoint is missing per-rank actor runtime state.")
+            return  # adaptive-off legacy checkpoint
+        if not isinstance(state, dict) or state.get("version") != 1:
+            raise RuntimeError("Unsupported actor runtime checkpoint state.")
+        if state.get("config_identity") != self._grad_protection_config_identity:
+            raise RuntimeError("Actor runtime checkpoint configuration identity differs from this run.")
+
+        def _counter(name: str) -> int:
+            value = state.get(name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise RuntimeError(f"Invalid actor runtime counter {name}={value!r}.")
+            return value
+
+        attempt_count = _counter("optimizer_attempt_count")
+        spike_history = state.get("spike_history")
+        nonfinite_history = state.get("nonfinite_history")
+        for name, history in (("spike_history", spike_history), ("nonfinite_history", nonfinite_history)):
+            if not isinstance(history, list) or any(
+                isinstance(item, bool) or not isinstance(item, int) or item < 0 or item > attempt_count
+                for item in history
+            ):
+                raise RuntimeError(f"Invalid actor runtime {name}.")
+        current_lrs = state.get("current_lrs")
+        original_lrs = state.get("original_lrs")
+        group_count = len(self.actor_optimizer.param_groups)
+        if not isinstance(current_lrs, list) or len(current_lrs) != group_count:
+            raise RuntimeError("Actor runtime current_lrs do not match optimizer param groups.")
+        if original_lrs is not None and (not isinstance(original_lrs, list) or len(original_lrs) != group_count):
+            raise RuntimeError("Actor runtime original_lrs do not match optimizer param groups.")
+        for name, values in (("current_lrs", current_lrs), ("original_lrs", original_lrs or [])):
+            if any(not isinstance(value, (int, float)) or not torch.isfinite(torch.tensor(float(value))) or value < 0 for value in values):
+                raise RuntimeError(f"Invalid actor runtime {name}.")
+        ema = state.get("grad_norm_ema")
+        if ema is not None and (not isinstance(ema, (int, float)) or not torch.isfinite(torch.tensor(float(ema))) or ema < 0):
+            raise RuntimeError("Invalid actor runtime grad_norm_ema.")
+        for name in ("last_optimizer_step_executed", "spike_brake_activated"):
+            if type(state.get(name)) is not bool:
+                raise RuntimeError(f"Invalid actor runtime boolean {name}.")
+        skip_reason = state.get("last_optimizer_skip_reason")
+        if not isinstance(skip_reason, str):
+            raise RuntimeError("Invalid actor runtime last_optimizer_skip_reason.")
+
+        self._grad_norm_ema = None if ema is None else float(ema)
+        self._spike_cooldown_remaining = _counter("spike_cooldown_remaining")
+        self._original_lrs = None if original_lrs is None else [float(value) for value in original_lrs]
+        self._spike_count = _counter("spike_count")
+        self._spike_history = list(spike_history)
+        self._spike_brake_activated = state["spike_brake_activated"]
+        self._nonfinite_count = _counter("nonfinite_count")
+        self._nonfinite_history = list(nonfinite_history)
+        self._optimizer_step_count = attempt_count
+        self._last_optimizer_step_executed = state["last_optimizer_step_executed"]
+        self._last_optimizer_skip_reason = skip_reason
+        self._fp16_monitor_step = _counter("fp16_monitor_step")
+        for group, lr in zip(self.actor_optimizer.param_groups, current_lrs):
+            group["lr"] = float(lr)
+        # The worker's legacy post-load LR override compares against config.lr.
+        # During cooldown the exact current LR is intentionally below the base;
+        # mirror it here so that override cannot destroy restored runtime state.
+        self.config.optim.lr = float(current_lrs[0])
+
+    @staticmethod
+    def _distributed_agreed_int(name: str, value: int, device: torch.device) -> int:
+        if torch.distributed.is_available() and torch.distributed.is_initialized():
+            value_tensor = torch.tensor(int(value), dtype=torch.long, device=device)
+            minimum = value_tensor.clone()
+            maximum = value_tensor.clone()
+            torch.distributed.all_reduce(minimum, op=torch.distributed.ReduceOp.MIN)
+            torch.distributed.all_reduce(maximum, op=torch.distributed.ReduceOp.MAX)
+            if int(minimum.item()) != int(maximum.item()):
+                raise RuntimeError(
+                    f"Distributed {name} disagreement: min={int(minimum.item())}, max={int(maximum.item())}."
+                )
+            return int(minimum.item())
+        return int(value)
 
     def _forward_micro_batch(self, micro_batch: Dict[str, torch.Tensor], temperature: float) -> torch.Tensor:
         """
@@ -380,15 +634,37 @@ class DataParallelPPOActor(BasePPOActor):
         return log_probs
 
     def _optimizer_step(self) -> torch.Tensor:
-        if self._spike_enabled:
-            self._optimizer_step_count += 1
+        self._last_optimizer_step_executed = False
+        self._last_optimizer_skip_reason = ""
+        self._optimizer_step_count += 1
 
         if isinstance(self.actor_module, FSDP):
             grad_norm = self.actor_module.clip_grad_norm_(self.config.max_grad_norm)
         else:
             grad_norm = nn.utils.clip_grad_norm_(self.actor_module.parameters(), max_norm=self.config.max_grad_norm)
 
+        # Decide before any rank mutates optimizer parameters.  A disagreement
+        # must fail before a partial distributed update can occur.
+        decision = 0  # execute
         if not torch.isfinite(grad_norm):
+            decision = 1  # nonfinite
+        elif self._spike_enabled:
+            grad_norm_for_decision = float(grad_norm.detach().item())
+            if self._grad_norm_ema is None and grad_norm_for_decision > 0.0:
+                self._grad_norm_ema = grad_norm_for_decision
+            if self._grad_spike_absolute_cap > 0 and grad_norm_for_decision > self._grad_spike_absolute_cap:
+                decision = 2  # absolute cap
+            elif _is_grad_spike_against_ema(
+                grad_norm_for_decision,
+                self._grad_norm_ema,
+                self._spike_threshold,
+                ignore_zero_ema=bool(getattr(self.config, "adaptive_actor_kl", False)),
+            ):
+                decision = 3  # EMA spike
+        decision = self._distributed_agreed_int("optimizer decision", decision, grad_norm.device)
+
+        if decision == 1:
+            self._last_optimizer_skip_reason = "nonfinite_grad"
             self._nonfinite_count += 1
             current_lr = self.actor_optimizer.param_groups[0]["lr"]
             print(
@@ -470,20 +746,22 @@ class DataParallelPPOActor(BasePPOActor):
         # === Grad Norm Spike Detection & Adaptive LR Protection ===
         if self._spike_enabled:
             # Initialize EMA on first finite grad
-            if self._grad_norm_ema is None:
+            if self._grad_norm_ema is None and grad_norm_val > 0.0:
                 self._grad_norm_ema = grad_norm_val
 
             # === Absolute cap check (independent of EMA) ===
-            if self._grad_spike_absolute_cap > 0 and grad_norm_val > self._grad_spike_absolute_cap:
+            if decision == 2:
+                self._last_optimizer_skip_reason = "absolute_grad_cap"
                 if self.rank == 0:
                     print(f"[GradSpikeProtect] ABSOLUTE CAP triggered: "
                           f"grad_norm={grad_norm_val:.3f} > cap={self._grad_spike_absolute_cap:.1f}, skipping step")
                 self.actor_optimizer.zero_grad()
                 return grad_norm
 
-            is_spike = grad_norm_val > self._grad_norm_ema * self._spike_threshold
+            is_spike = decision == 3
 
             if is_spike:
+                self._last_optimizer_skip_reason = "grad_spike"
                 self._spike_count += 1
                 self._spike_history.append(self._optimizer_step_count)
                 if self.rank == 0:
@@ -520,6 +798,7 @@ class DataParallelPPOActor(BasePPOActor):
                           f"grad_norm={grad_norm_val:.4f}, LR={current_lrs[0]:.2e}")
                 # Do the step with reduced LR
                 self.actor_optimizer.step()
+                self._last_optimizer_step_executed = True
                 # Restore LR when cooldown ends
                 if self._spike_cooldown_remaining == 0:
                     self._restore_lr()
@@ -529,15 +808,23 @@ class DataParallelPPOActor(BasePPOActor):
             else:
                 # Normal step
                 self.actor_optimizer.step()
+                self._last_optimizer_step_executed = True
 
             # FIX: Update EMA only with non-spike AND non-cooldown values
             # During cooldown, grad_norms are elevated and would contaminate the EMA,
             # causing the spike threshold to ratchet up (positive feedback loop).
-            if not is_spike and self._spike_cooldown_remaining == 0:
-                self._grad_norm_ema = (1 - self._grad_norm_ema_alpha) * self._grad_norm_ema + self._grad_norm_ema_alpha * grad_norm_val
+            if not is_spike and self._spike_cooldown_remaining == 0 and grad_norm_val > 0.0:
+                if self._grad_norm_ema is None:
+                    self._grad_norm_ema = grad_norm_val
+                else:
+                    self._grad_norm_ema = (
+                        (1 - self._grad_norm_ema_alpha) * self._grad_norm_ema
+                        + self._grad_norm_ema_alpha * grad_norm_val
+                    )
         else:
             # Spike protection disabled — original behavior
             self.actor_optimizer.step()
+            self._last_optimizer_step_executed = True
 
         # === Structured per-step gradient health log ===
         if self.rank == 0 and self._spike_enabled:
@@ -634,8 +921,30 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_module.train()
 
         temperature = data.meta_info["temperature"]  # temperature must be in the data.meta_info to avoid slient error
+        adaptive_actor_kl = bool(data.meta_info.get("adaptive_actor_kl", False))
+        if adaptive_actor_kl != bool(self.config.adaptive_actor_kl):
+            raise ValueError("adaptive_actor_kl driver/worker configuration mismatch.")
+        if adaptive_actor_kl:
+            distributed_world_size = (
+                torch.distributed.get_world_size()
+                if torch.distributed.is_available() and torch.distributed.is_initialized()
+                else 1
+            )
+            fsdp_size = int(self.config.fsdp.fsdp_size)
+            validate_adaptive_actor_kl_topology(
+                int(self.config.ulysses_sequence_parallel_size), fsdp_size, distributed_world_size
+            )
+            if self.config.kl_penalty != "low_var_kl":
+                raise ValueError("adaptive_actor_kl only supports sampled-token low_var_kl.")
+            if os.environ.get("EASYR1_ALLOW_ZERO_MM_LOGPROB", "0").lower() in ("1", "true", "yes", "on"):
+                raise RuntimeError("adaptive_actor_kl forbids the zero multimodal log-probability fallback.")
+            adaptive_kl_coef = float(data.meta_info["adaptive_actor_kl_coef"])
+            if not torch.isfinite(torch.tensor(adaptive_kl_coef)) or adaptive_kl_coef < 0:
+                raise ValueError(f"Invalid adaptive actor KL coefficient: {adaptive_kl_coef}.")
+        else:
+            adaptive_kl_coef = 0.0
         select_keys = ["responses", "input_ids", "attention_mask", "position_ids", "old_log_probs", "advantages"]
-        if self.config.use_kl_loss and not self.config.disable_kl:
+        if (self.config.use_kl_loss or adaptive_actor_kl) and not self.config.disable_kl:
             select_keys.append("ref_log_probs")
 
         if "multi_modal_inputs" in data.non_tensor_batch.keys():
@@ -648,6 +957,14 @@ class DataParallelPPOActor(BasePPOActor):
         mini_batches = data.select(select_keys, non_tensor_select_keys).split(self.config.global_batch_size_per_device)
 
         metrics = defaultdict(list)
+        optimizer_steps_attempted = 0
+        optimizer_steps_executed = 0
+        adaptive_kl_sum = 0.0
+        adaptive_kl_count = 0.0
+        adaptive_policy_sum = 0.0
+        adaptive_entropy_sum = 0.0
+        adaptive_entropy_bonus_sum = 0.0
+        adaptive_loss_token_count = 0.0
         for _ in range(self.config.ppo_epochs):
             # Disable tqdm to avoid log spam
             # if self.rank == 0:
@@ -658,6 +975,17 @@ class DataParallelPPOActor(BasePPOActor):
                     self.config.global_batch_size_per_device // self.config.micro_batch_size_per_device_for_update
                 )
                 micro_batches = mini_batch.split(self.config.micro_batch_size_per_device_for_update)
+                if adaptive_actor_kl:
+                    mini_response_length = mini_batch.batch["responses"].size(1)
+                    local_valid_count = mini_batch.batch["attention_mask"][:, -mini_response_length:].sum().double()
+                    global_valid_count = local_valid_count.detach().clone()
+                    if torch.distributed.is_available() and torch.distributed.is_initialized():
+                        torch.distributed.all_reduce(global_valid_count, op=torch.distributed.ReduceOp.SUM)
+                        gradient_world_size = torch.distributed.get_world_size()
+                    else:
+                        gradient_world_size = 1
+                    if global_valid_count.item() <= 0:
+                        raise ValueError("adaptive_actor_kl received a mini-batch with zero valid response tokens.")
                 # Disable tqdm to avoid log spam
                 # if self.rank == 0:
                 #     micro_batches = tqdm(micro_batches, desc="Update policy", position=3)
@@ -702,7 +1030,7 @@ class DataParallelPPOActor(BasePPOActor):
                         
                         entropy_loss = -VF.masked_mean(log_probs, response_mask)  # estimator of entropy loss
 
-                        pg_loss, pg_clipfrac_higher, pg_clipfrac_lower, ppo_kl = core_algos.compute_policy_loss(
+                        policy_loss, pg_clipfrac_higher, pg_clipfrac_lower, ppo_kl = core_algos.compute_policy_loss(
                             old_log_probs=old_log_probs,
                             log_probs=log_probs,
                             advantages=advantages,
@@ -711,7 +1039,39 @@ class DataParallelPPOActor(BasePPOActor):
                             clip_ratio_high=self.config.clip_ratio_high,
                             clip_ratio_dual=self.config.clip_ratio_dual,
                         )
-                        if "ref_log_probs" in model_inputs:
+                        if adaptive_actor_kl:
+                            local_valid_count = response_mask.sum().detach()
+                            policy_token_sum = masked_mean_to_token_sum(policy_loss, local_valid_count)
+                            entropy_token_sum = masked_mean_to_token_sum(entropy_loss, local_valid_count)
+                            ref_log_probs = model_inputs["ref_log_probs"]
+                            kld = core_algos.compute_stable_low_var_kl(log_probs, ref_log_probs)
+                            local_kl_sum = (kld * response_mask).sum()
+                            entropy_bonus_coeff = float(getattr(self.config, "entropy_bonus_coeff", 0.0))
+                            local_objective_sum = policy_token_sum + adaptive_kl_coef * local_kl_sum
+                            if entropy_bonus_coeff > 0:
+                                local_objective_sum = local_objective_sum - entropy_bonus_coeff * entropy_token_sum
+
+                            # The caller below divides by gradient_accumulation;
+                            # the helper includes its exact inverse as well as
+                            # the inverse of FSDP/DDP rank averaging.
+                            total_loss = scale_full_shard_token_sum(
+                                local_objective_sum,
+                                global_valid_count,
+                                gradient_world_size,
+                                gradient_accumulation,
+                            )
+
+                            metric_token_count = float(local_valid_count.double().item())
+                            adaptive_loss_token_count += metric_token_count
+                            adaptive_policy_sum += float(policy_token_sum.detach().double().item())
+                            adaptive_entropy_sum += float(entropy_token_sum.detach().double().item())
+                            adaptive_kl_sum += float(local_kl_sum.detach().double().item())
+                            adaptive_kl_count += metric_token_count
+                            adaptive_entropy_bonus_sum += float(
+                                (entropy_bonus_coeff * entropy_token_sum).detach().double().item()
+                            )
+                        elif "ref_log_probs" in model_inputs:
+                            total_loss = policy_loss
                             ref_log_probs = model_inputs["ref_log_probs"]
                             # compute kl loss
                             kld = core_algos.compute_kl(
@@ -720,18 +1080,22 @@ class DataParallelPPOActor(BasePPOActor):
                                 kl_penalty=self.config.kl_penalty,
                             )
                             kl_loss = VF.masked_mean(kld, response_mask)
-                            pg_loss = pg_loss + kl_loss * self.config.kl_coef
+                            total_loss = total_loss + kl_loss * self.config.kl_coef
                             metrics["actor/kl_loss"] = kl_loss.detach().item()
                             metrics["actor/kl_coef"] = self.config.kl_coef
+                        else:
+                            total_loss = policy_loss
 
 
                         # DiVA-GRPO v3: Entropy preservation bonus
                         # Subtracting entropy_loss (which is -mean(log_probs)) from pg_loss
                         # encourages the policy to maintain higher entropy, preventing mode collapse.
                         if hasattr(self.config, 'entropy_bonus_coeff') and self.config.entropy_bonus_coeff > 0:
-                            pg_loss = pg_loss - self.config.entropy_bonus_coeff * entropy_loss
-                            metrics["actor/entropy_bonus"] = (self.config.entropy_bonus_coeff * entropy_loss).detach().item()
-                        loss = pg_loss / gradient_accumulation
+                            entropy_bonus = self.config.entropy_bonus_coeff * entropy_loss
+                            if not adaptive_actor_kl:
+                                total_loss = total_loss - entropy_bonus
+                                metrics["actor/entropy_bonus"] = entropy_bonus.detach().item()
+                        loss = total_loss / gradient_accumulation
                         
                         # Cache already cleared above; backward can proceed safely.
                         
@@ -771,7 +1135,14 @@ class DataParallelPPOActor(BasePPOActor):
                         raise e
 
                     batch_metrics = {
-                        "actor/pg_loss": pg_loss.detach().item(),
+                        # Preserve V36's dashboard meaning: actor/pg_loss was
+                        # the optimized objective including legacy KL/entropy.
+                        "actor/pg_loss": (
+                            policy_loss.detach().item()
+                            if adaptive_actor_kl
+                            else total_loss.detach().item()
+                        ),
+                        "actor/policy_loss": policy_loss.detach().item(),
                         "actor/pg_clipfrac_higher": pg_clipfrac_higher.detach().item(),
                         "actor/pg_clipfrac_lower": pg_clipfrac_lower.detach().item(),
                         "actor/entropy_loss": entropy_loss.detach().item(),
@@ -779,13 +1150,92 @@ class DataParallelPPOActor(BasePPOActor):
                     }
                     append_to_dict(metrics, batch_metrics)
 
+                optimizer_steps_attempted += 1
                 grad_norm = self._optimizer_step()
+                if getattr(self, "_last_optimizer_step_executed", False):
+                    optimizer_steps_executed += 1
                 spike_metrics = {"actor/grad_norm": grad_norm.detach().item()}
+                if adaptive_actor_kl:
+                    # V37 evidence needs the cumulative counter even when the
+                    # optional spike heuristic itself is disabled.
+                    spike_metrics["actor/nonfinite_grad_count"] = float(self._nonfinite_count)
                 if self._spike_enabled:
                     spike_metrics["actor/grad_norm_ema"] = self._grad_norm_ema if self._grad_norm_ema is not None else 0.0
                     spike_metrics["actor/spike_count"] = float(self._spike_count)
                     spike_metrics["actor/spike_cooldown"] = float(self._spike_cooldown_remaining)
                     spike_metrics["actor/nonfinite_grad_count"] = float(self._nonfinite_count)
                 append_to_dict(metrics, spike_metrics)
+
+        optimizer_steps_skipped = optimizer_steps_attempted - optimizer_steps_executed
+        if adaptive_actor_kl:
+            _validate_adaptive_optimizer_rpc_counts(
+                optimizer_steps_attempted, optimizer_steps_executed
+            )
+            metric_device = data.batch["responses"].device
+            optimizer_steps_attempted = self._distributed_agreed_int(
+                "optimizer_steps_attempted", optimizer_steps_attempted, metric_device
+            )
+            optimizer_steps_executed = self._distributed_agreed_int(
+                "optimizer_steps_executed", optimizer_steps_executed, metric_device
+            )
+            optimizer_steps_skipped = self._distributed_agreed_int(
+                "optimizer_steps_skipped", optimizer_steps_skipped, metric_device
+            )
+            nonfinite_count = self._distributed_agreed_int(
+                "nonfinite_grad_count", self._nonfinite_count, metric_device
+            )
+            # Replace per-microstep local observations with one rank-agreed
+            # cumulative value. Formal evidence must not infer agreement from
+            # a reduced mean that could hide divergent worker counters.
+            metrics["actor/nonfinite_grad_count"] = [float(nonfinite_count)]
+            metrics["actor/nonfinite_counter_agreement"] = [1.0]
+        metrics["actor/optimizer_steps_attempted"] = [float(optimizer_steps_attempted)]
+        metrics["actor/optimizer_steps_executed"] = [float(optimizer_steps_executed)]
+        metrics["actor/optimizer_steps_skipped"] = [float(optimizer_steps_skipped)]
+        metrics["actor/optimizer_counter_agreement"] = [1.0 if adaptive_actor_kl else 0.0]
+        if adaptive_actor_kl:
+            loss_aggregates = torch.tensor(
+                [
+                    adaptive_policy_sum,
+                    adaptive_entropy_sum,
+                    adaptive_entropy_bonus_sum,
+                    adaptive_kl_sum,
+                    adaptive_loss_token_count,
+                    adaptive_kl_count,
+                ],
+                dtype=torch.float64,
+                device=data.batch["responses"].device,
+            )
+            if torch.distributed.is_available() and torch.distributed.is_initialized():
+                torch.distributed.all_reduce(loss_aggregates, op=torch.distributed.ReduceOp.SUM)
+            global_loss_count = float(loss_aggregates[4].item())
+            global_kl_count = float(loss_aggregates[5].item())
+            if global_loss_count <= 0 or not torch.isfinite(loss_aggregates).all():
+                raise RuntimeError("adaptive_actor_kl produced invalid global actual-loss aggregates.")
+            if global_kl_count != global_loss_count:
+                raise RuntimeError(
+                    "adaptive_actor_kl loss components were aggregated over different valid-token counts."
+                )
+            actual = coherent_actual_loss_metrics(
+                policy_sum=float(loss_aggregates[0].item()),
+                entropy_sum=float(loss_aggregates[1].item()),
+                entropy_bonus_sum=float(loss_aggregates[2].item()),
+                loss_token_count=global_loss_count,
+                kl_sum=float(loss_aggregates[3].item()),
+                kl_token_count=global_kl_count,
+                kl_coef=adaptive_kl_coef,
+            )
+            metrics["actor/pg_loss"] = [actual["policy_loss"]]
+            metrics["actor/policy_loss"] = [actual["policy_loss"]]
+            metrics["actor/entropy_loss"] = [actual["entropy_loss"]]
+            metrics["actor/loss_token_count"] = [global_loss_count]
+            if actual["entropy_bonus"] != 0.0:
+                metrics["actor/entropy_bonus"] = [actual["entropy_bonus"]]
+            metrics["actor/kl_token_sum"] = [float(loss_aggregates[3].item())]
+            metrics["actor/kl_token_count"] = [global_kl_count]
+            metrics["actor/kl_loss"] = [actual["kl_loss"]]
+            metrics["actor/kl_coef"] = [adaptive_kl_coef]
+            metrics["actor/kl_penalty"] = [actual["kl_penalty"]]
+            metrics["actor/total_loss"] = [actual["total_loss"]]
 
         return metrics

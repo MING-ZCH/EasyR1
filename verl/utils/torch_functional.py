@@ -45,7 +45,12 @@ def log_probs_from_logits_flash_attn(logits: torch.Tensor, labels: torch.Tensor)
     return -output[0]
 
 
-def log_probs_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
+def log_probs_from_logits(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    *,
+    correct_torch_fallback_logprob_sign: bool = False,
+) -> torch.Tensor:
     """Compute log probs on the label ids given logits.
 
     We may use torch compile to speed up computing.
@@ -53,6 +58,9 @@ def log_probs_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> torch.T
     Args:
         logits (torch.Tensor): logits of the model, shape (batch_size, seqlen, vocab_size)
         labels (torch.Tensor): labels of the model, shape (batch_size, seqlen)
+        correct_torch_fallback_logprob_sign (bool): opt in to negating the
+            torch cross-entropy fallback. Defaults to ``False`` to preserve the
+            historical non-flash behavior.
 
     Returns:
         torch.Tensor: log probs of the labels, shape (batch_size, seqlen)
@@ -65,6 +73,11 @@ def log_probs_from_logits(logits: torch.Tensor, labels: torch.Tensor) -> torch.T
         output = log_probs_from_logits_flash_attn(logits, labels)
     else:  # fall back to torch kernel, upcast logits to fp32
         output = F.cross_entropy(logits.float(), labels, reduction="none")
+        # Keep the historical fallback convention by default.  Correcting it
+        # changes PPO ratios whenever flash-attn is unavailable, so callers
+        # must opt in explicitly instead of silently changing legacy runs.
+        if correct_torch_fallback_logprob_sign:
+            output = -output
 
     return output.view(*batch_dim)
 

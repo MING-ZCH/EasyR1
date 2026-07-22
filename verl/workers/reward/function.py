@@ -26,13 +26,19 @@ import torch
 from transformers import PreTrainedTokenizer
 
 from ...protocol import DataProto
+from ...utils.action_ledger import validate_action_event_row
+from ...utils.ray_environment import validate_v37_remote_environment
 from .config import RewardConfig
 
 
-class RewardScore(TypedDict):
+class RequiredRewardScore(TypedDict):
     overall: float
+
+
+class RewardScore(RequiredRewardScore, total=False):
     format: Optional[float]
     accuracy: Optional[float]
+    answer_correct: float
 
 
 SequentialRewardFunction = Callable[[str, str], RewardScore]
@@ -44,6 +50,7 @@ class FunctionRewardManager(ABC):
     """Reward manager for rule-based reward."""
 
     def __init__(self, config: RewardConfig, tokenizer: PreTrainedTokenizer):
+        validate_v37_remote_environment("reward worker")
         if config.reward_function is None:
             raise ValueError("Reward function is not provided.")
 
@@ -137,6 +144,17 @@ class SequentialFunctionRewardManager(FunctionRewardManager):
         # Pre-decode all responses and prepare kwargs (thread-safe prep)
         num_workers = int(os.environ.get("REWARD_NUM_WORKERS", "4"))
         batch_size = len(data)
+        action_event_mode = os.environ.get("ACTION_EVENT_REWARD_ENABLE", "0").lower() in ("1", "true", "yes")
+        reward_fail_closed = os.environ.get("V37_REWARD_FAIL_CLOSED", "0").lower() in ("1", "true", "yes")
+        action_ledger_rows = data.non_tensor_batch.get("action_event_ledger")
+        if action_event_mode and (action_ledger_rows is None or len(action_ledger_rows) != batch_size):
+            if reward_fail_closed:
+                raise RuntimeError(
+                    "V37 reward contract requires one action_event_ledger row per response."
+                )
+            # Legacy/debug behavior keeps a zero-score row and never falls back
+            # to decoded-text span guessing.
+            action_ledger_rows = [None] * batch_size
 
         def _compute_single_reward(i):
             """Compute reward for a single sample. Thread-safe."""
@@ -169,6 +187,36 @@ class SequentialFunctionRewardManager(FunctionRewardManager):
             kwargs["sample_index"] = i
             kwargs["is_eval"] = bool(getattr(data, "meta_info", {}).get("is_validation", False))
 
+            validated_action_events = None
+            if action_event_mode:
+                try:
+                    validated_action_events = validate_action_event_row(
+                        action_ledger_rows[i],
+                        int(response_length[i].item()),
+                        response_token_ids=valid_response_ids.tolist(),
+                        require_token_binding=True,
+                    )
+                except (TypeError, ValueError, KeyError) as exc:
+                    if reward_fail_closed:
+                        raise RuntimeError(
+                            f"Invalid V37 action ledger at row {i}: {exc}"
+                        ) from exc
+                    score = {
+                        "overall": 0.0,
+                        "format": 0.0,
+                        "content": 0.0,
+                        "answer": 0.0,
+                        "answer_correct": 0.0,
+                        "answer_exact": 0.0,
+                        "raw_success": 0.0,
+                        "trajectory_quality": 0.0,
+                        "point": 0.0,
+                        "invalid_generation": 1.0,
+                        "_action_ledger_invalid": 1.0,
+                    }
+                    return i, score, response_str, _has_images, _has_problem, [], []
+                kwargs["action_events"] = validated_action_events
+
             try:
                 score = self.reward_fn(response_str, ground_truth, **kwargs)
             except Exception as exc:
@@ -183,12 +231,88 @@ class SequentialFunctionRewardManager(FunctionRewardManager):
                     f"image_path={kwargs.get('image_path')} gt={str(ground_truth)} "
                     f"exc={type(exc).__name__}: {exc} tail='{response_tail}'"
                 )
+                if reward_fail_closed:
+                    raise RuntimeError(
+                        f"V37 reward function failed at row {i}: {type(exc).__name__}: {exc}"
+                    ) from exc
                 score = {"overall": 0.0, "format": 0.0, "content": 0.0, "answer": 0.0, "point": 0.0, "format_fail": 1.0, "stop_violation": 1.0}
 
             if not isinstance(score, dict) or "overall" not in score:
+                if reward_fail_closed:
+                    raise RuntimeError(f"V37 reward function returned an invalid score at row {i}.")
                 score = {"overall": 0.0, "format": 0.0, "content": 0.0, "answer": 0.0, "point": 0.0, "format_fail": 1.0, "stop_violation": 1.0}
 
-            return i, score, response_str, _has_images, _has_problem
+            # Preserve legacy reward functions: absence means the trainer must
+            # fall back to the historical shaped-answer/overall routing.  When
+            # a reward explicitly opts in, keep the channel strictly binary.
+            score = dict(score)
+            if reward_fail_closed:
+                required_fields = (
+                    "overall", "answer", "answer_correct", "raw_success", "trajectory_quality"
+                )
+                missing_fields = [field for field in required_fields if field not in score]
+                if missing_fields:
+                    raise RuntimeError(
+                        f"V37 reward score is missing required fields at row {i}: {missing_fields}"
+                    )
+                for field in required_fields:
+                    try:
+                        field_value = float(score[field])
+                    except (TypeError, ValueError, OverflowError) as exc:
+                        raise RuntimeError(
+                            f"V37 reward field {field!r} is not numeric at row {i}."
+                        ) from exc
+                    if not math.isfinite(field_value):
+                        raise RuntimeError(
+                            f"V37 reward field {field!r} is non-finite at row {i}."
+                        )
+                for field in ("answer_correct", "raw_success"):
+                    if float(score[field]) not in (0.0, 1.0):
+                        raise RuntimeError(
+                            f"V37 reward field {field!r} must be binary at row {i}."
+                        )
+            if "answer_correct" in score:
+                try:
+                    score["answer_correct"] = 1.0 if float(score["answer_correct"]) == 1.0 else 0.0
+                except (TypeError, ValueError, OverflowError):
+                    if reward_fail_closed:
+                        raise RuntimeError(f"Invalid V37 answer_correct at row {i}.")
+                    score["answer_correct"] = 0.0
+
+            if action_event_mode:
+                try:
+                    action_values = [float(value) for value in score.get("_action_event_values", [])]
+                    invalid_action_values = (
+                        len(action_values) != len(validated_action_events)
+                        or any(not math.isfinite(value) for value in action_values)
+                        or any(
+                            event.get("type") in ("cap", "abort") and action_values[event_idx] != 0.0
+                            for event_idx, event in enumerate(validated_action_events)
+                        )
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    invalid_action_values = True
+                if invalid_action_values:
+                    if reward_fail_closed:
+                        raise RuntimeError(f"Invalid V37 native action values at row {i}.")
+                    score.update(
+                        {
+                            "overall": 0.0,
+                            "format": 0.0,
+                            "content": 0.0,
+                            "answer": 0.0,
+                            "answer_correct": 0.0,
+                            "answer_exact": 0.0,
+                            "raw_success": 0.0,
+                            "trajectory_quality": 0.0,
+                            "point": 0.0,
+                            "invalid_generation": 1.0,
+                            "_action_ledger_invalid": 1.0,
+                        }
+                    )
+
+            ledger_contract = action_ledger_rows[i] if action_event_mode else None
+            return i, score, response_str, _has_images, _has_problem, validated_action_events, ledger_contract
 
         # Execute in parallel if num_workers > 1, otherwise sequential
         if num_workers > 1 and batch_size > 16:
@@ -198,7 +322,7 @@ class SequentialFunctionRewardManager(FunctionRewardManager):
             results = [_compute_single_reward(i) for i in range(batch_size)]
 
         # Gather results (sequential - fast)
-        for i, score, response_str, _has_images, _has_problem in results:
+        for i, score, response_str, _has_images, _has_problem, action_events, ledger_contract in results:
             if _has_images:
                 with_images_count += 1
             if _has_problem:
@@ -218,7 +342,13 @@ class SequentialFunctionRewardManager(FunctionRewardManager):
             # tensor (from fallback=placed rewards) and trigger AUX re-centering — silently
             # changing legacy behaviour. Gating on the env keeps the batch list aligned.
             _value_channel_active = os.environ.get("BOK_STEP_SIGNAL", "pointhit").strip().lower() in ("progress", "stoptiming")
-            if _process_reward_mode and "_step_rewards" in score:
+            if action_event_mode and int(response_length[i].item()) > 0:
+                reward_tensor[i, response_length[i] - 1] = float(score["overall"])
+            elif action_event_mode:
+                # Empty responses have no terminal token.  Their explicit abort
+                # marker is retained in metrics, but no negative indexing occurs.
+                pass
+            elif _process_reward_mode and "_step_rewards" in score and int(response_length[i].item()) > 0:
                 step_rewards = score["_step_rewards"]  # list of floats (per-turn point scores)
                 # Find </point> token positions in the response
                 _point_end_tag = "</point>"
@@ -266,13 +396,53 @@ class SequentialFunctionRewardManager(FunctionRewardManager):
                 else:
                     # Fallback: place entire reward at last token
                     reward_tensor[i, response_length[i] - 1] = score["overall"]
-            else:
+            elif int(response_length[i].item()) > 0:
                 reward_tensor[i, response_length[i] - 1] = score["overall"]
 
             if _process_reward_mode:
                 reward_metrics["_point_step_token_positions"].append(_step_token_positions)
                 if _value_channel_active:
                     reward_metrics["_point_step_value"].append(_step_values_at_positions)
+
+            if action_event_mode:
+                action_values = score.get("_action_event_values", [])
+                try:
+                    normalized_action_values = [float(value) for value in action_values]
+                    invalid_action_values = any(not math.isfinite(value) for value in normalized_action_values)
+                except (TypeError, ValueError, OverflowError):
+                    normalized_action_values = []
+                    invalid_action_values = True
+                if len(action_events) != len(normalized_action_values):
+                    invalid_action_values = True
+                elif any(
+                    event.get("type") in ("cap", "abort") and normalized_action_values[event_idx] != 0.0
+                    for event_idx, event in enumerate(action_events)
+                ):
+                    invalid_action_values = True
+                if score.get("_action_ledger_invalid", 0.0) or invalid_action_values:
+                    if reward_fail_closed:
+                        raise RuntimeError(f"Invalid V37 action ledger/value contract at row {i}.")
+                    reward_metrics["action_ledger_invalid"].append(1.0)
+                    reward_metrics["_action_events"].append([])
+                    reward_metrics["_action_event_values"].append([])
+                else:
+                    reward_metrics["_action_events"].append(ledger_contract)
+                    reward_metrics["_action_event_values"].append(normalized_action_values)
+                    reward_metrics["action_ledger_invalid"].append(0.0)
+                reward_metrics["action_event_count"].append(float(len(action_events)))
+                for event_type in ("point", "answer", "cap", "abort"):
+                    reward_metrics[f"action_{event_type}_count"].append(
+                        float(sum(event.get("type") == event_type for event in action_events))
+                    )
+
+            reward_metrics["_selector_task_scores"].append(float(score["overall"]))
+
+            # Keep one routing value per batch row. NaN means that this reward
+            # function did not opt in, so BoK falls back per prompt group to the
+            # historical shaped-answer routing instead of treating it as wrong.
+            reward_metrics["_answer_correct_for_routing"].append(
+                float(score["answer_correct"]) if "answer_correct" in score else float("nan")
+            )
 
             for key, value in score.items():
                 if not key.startswith("_"):  # skip internal keys
@@ -366,6 +536,8 @@ class BatchFunctionRewardManager(FunctionRewardManager):
     reward_fn: BatchRewardFunction
 
     def compute_reward(self, data: DataProto) -> Tuple[torch.Tensor, Dict[str, List[float]]]:
+        if os.environ.get("ACTION_EVENT_REWARD_ENABLE", "0").lower() in ("1", "true", "yes"):
+            raise RuntimeError("ACTION_EVENT_REWARD_ENABLE requires the sequential reward manager.")
         response_str, ground_truth = [], []
         response_ids = data.batch["responses"]
         response_length = data.batch["response_mask"].sum(dim=-1)
@@ -380,7 +552,16 @@ class BatchFunctionRewardManager(FunctionRewardManager):
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
         reward_metrics = defaultdict(list)
         for i, score in enumerate(scores):
+            score = dict(score)
+            if "answer_correct" in score:
+                try:
+                    score["answer_correct"] = 1.0 if float(score["answer_correct"]) == 1.0 else 0.0
+                except (TypeError, ValueError, OverflowError):
+                    score["answer_correct"] = 0.0
             reward_tensor[i, response_length[i] - 1] = score["overall"]
+            reward_metrics["_answer_correct_for_routing"].append(
+                float(score["answer_correct"]) if "answer_correct" in score else float("nan")
+            )
             for key, value in score.items():
                 reward_metrics[key].append(value)
 

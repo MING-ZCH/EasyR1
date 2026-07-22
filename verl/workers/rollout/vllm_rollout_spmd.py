@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import hashlib
 import os
 
 _H20_SIGFPE_WORKAROUND = (
@@ -55,6 +56,13 @@ from jinja2 import Template
 
 from ...protocol import DataProto
 from ...utils import torch_functional as VF
+from ...utils.action_ledger import (
+    build_native_action_event_row,
+    canonical_interleaved_stop_sequences,
+    classify_empty_generation,
+    make_action_event,
+    validate_action_tag_token_ids,
+)
 from ...utils.dataset import process_image, process_video
 from ...utils.tokenizer import get_processor
 from ...utils.torch_dtypes import PrecisionType
@@ -112,15 +120,20 @@ def _resolve_stop_token_id(tokenizer: PreTrainedTokenizer, stop_text: str) -> Op
     return None
 
 
-def _stop_reason_matches(stop_reason: Any, stop_text: str, stop_token_ids: List[int]) -> bool:
+def _stop_reason_matches(
+    stop_reason: Any, stop_text: str, stop_token_ids: List[int], *, exact_string: bool = False
+) -> bool:
     if stop_reason is None:
         return False
     if isinstance(stop_reason, str):
-        return stop_reason == stop_text or stop_text in stop_reason
+        return stop_reason == stop_text if exact_string else (stop_reason == stop_text or stop_text in stop_reason)
     if isinstance(stop_reason, int):
         return int(stop_reason) in set(int(x) for x in stop_token_ids)
     try:
-        return any(_stop_reason_matches(item, stop_text, stop_token_ids) for item in stop_reason)
+        return any(
+            _stop_reason_matches(item, stop_text, stop_token_ids, exact_string=exact_string)
+            for item in stop_reason
+        )
     except TypeError:
         return False
 
@@ -432,18 +445,40 @@ def _load_template_from_path(path: Optional[str]) -> Optional[str]:
     return content if content else None
 
 
-def _require_template_from_path(path: Optional[str], field_name: str) -> Optional[str]:
+def _require_template_from_path(
+    path: Optional[str],
+    field_name: str,
+    expected_sha256: Optional[str] = None,
+) -> Optional[str]:
     if not path:
+        if expected_sha256 is not None:
+            raise ValueError(f"{field_name} SHA256 was configured without a prompt file path")
         return None
-
-    content = _load_template_from_path(path)
-    if content:
-        return content
 
     candidate_paths = [path]
     if not os.path.isabs(path):
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
         candidate_paths.append(os.path.join(project_root, path))
+
+    resolved_path = next((candidate for candidate in candidate_paths if os.path.exists(candidate)), None)
+    if resolved_path is not None:
+        with open(resolved_path, "rb") as handle:
+            raw = handle.read()
+        if expected_sha256 is not None:
+            if re.fullmatch(r"[0-9a-f]{64}", expected_sha256) is None:
+                raise ValueError(f"Invalid expected SHA256 for {field_name}: {expected_sha256!r}")
+            actual_sha256 = hashlib.sha256(raw).hexdigest()
+            if actual_sha256 != expected_sha256:
+                raise RuntimeError(
+                    f"{field_name} SHA256 mismatch: expected={expected_sha256}, "
+                    f"actual={actual_sha256}, path={resolved_path}"
+                )
+        try:
+            content = raw.decode("utf-8").strip()
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"{field_name} is not valid UTF-8: {resolved_path}") from exc
+        if content:
+            return content
 
     raise FileNotFoundError(
         f"Failed to load {field_name} from '{path}'. Tried: {candidate_paths}. "
@@ -667,7 +702,9 @@ class vLLMRollout(BaseRollout):
         )
         self._interleaved_process_prompt_template = (
             _require_template_from_path(
-                self.config.interleaved_process_prompt_file, "interleaved_process_prompt_file"
+                self.config.interleaved_process_prompt_file,
+                "interleaved_process_prompt_file",
+                self.config.interleaved_process_prompt_sha256,
             )
             or self.config.interleaved_process_prompt_template
             or (
@@ -813,7 +850,7 @@ class vLLMRollout(BaseRollout):
         first_turn_prompt_template: Optional[str] = None,
         process_prompt_template: Optional[str] = None,
         step_info: Any = "?",
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, np.ndarray]:
         active_prompt_ids: List[List[int]] = []
         active_mm_data: List[Optional[Dict[str, Any]]] = []
         active_question_texts: List[str] = []
@@ -838,6 +875,14 @@ class vLLMRollout(BaseRollout):
                 active_question_texts.append(sample_question)
 
         response_token_ids: List[List[int]] = [[] for _ in active_prompt_ids]
+        action_event_ledgers: List[List[Dict[str, Any]]] = [[] for _ in active_prompt_ids]
+        native_turn_spans: List[List[Tuple[int, int, int]]] = [[] for _ in active_prompt_ids]
+        termination_types: List[Optional[str]] = [None for _ in active_prompt_ids]
+        termination_reasons: List[Optional[str]] = [None for _ in active_prompt_ids]
+        answer_span_starts: List[Optional[int]] = [None for _ in active_prompt_ids]
+        point_span_starts: List[Optional[int]] = [None for _ in active_prompt_ids]
+        answer_event_recorded: List[bool] = [False for _ in active_prompt_ids]
+        last_turn_spans: List[Optional[Tuple[int, int]]] = [None for _ in active_prompt_ids]
         active_flags: List[bool] = [True for _ in active_prompt_ids]
         point_counts: List[int] = [0 for _ in active_prompt_ids]
         answer_mode_flags: List[bool] = [False for _ in active_prompt_ids]
@@ -937,11 +982,34 @@ class vLLMRollout(BaseRollout):
                     turn2_suffix_ids = [_im_end_id] + _newline_ids + [_im_start_id] + _assistant_ids + _newline_ids
 
         stop_tag = self.config.interleaved_stop_tag or "</answer>"
+        point_open_tag = "<point>"
         point_close_tag = "</point>"
         answer_open_tag = "<answer>"
+        point_open_token_ids = self.tokenizer.encode(point_open_tag, add_special_tokens=False)
         point_close_token_ids = self.tokenizer.encode(point_close_tag, add_special_tokens=False)
         answer_close_token_ids = self.tokenizer.encode(stop_tag, add_special_tokens=False) if stop_tag else []
         answer_open_token_ids = self.tokenizer.encode(answer_open_tag, add_special_tokens=False)
+        action_event_mode = os.environ.get("ACTION_EVENT_REWARD_ENABLE", "0").lower() in ("1", "true", "yes")
+        strict_action_scheduler = os.environ.get(
+            "V37_STRICT_POINT_PARSER_CONTRACT", "0"
+        ).lower() in ("1", "true", "yes")
+        if action_event_mode and not strict_action_scheduler:
+            raise ValueError(
+                "ACTION_EVENT_REWARD_ENABLE requires V37_STRICT_POINT_PARSER_CONTRACT=1."
+            )
+        canonical_action_stops = list(canonical_interleaved_stop_sequences())
+        if strict_action_scheduler:
+            if stop_tag != "</answer>":
+                raise ValueError("V37 action ledger requires interleaved_stop_tag=</answer>.")
+            validate_action_tag_token_ids(
+                {
+                    "point_open": point_open_token_ids,
+                    "point_close": point_close_token_ids,
+                    "answer_open": answer_open_token_ids,
+                    "answer_close": answer_close_token_ids,
+                },
+                require_expected=True,
+            )
         per_turn_max_tokens = max(1, int(self.config.interleaved_per_turn_max_tokens))
         answer_turn_max_tokens = max(per_turn_max_tokens, int(self.config.interleaved_answer_turn_max_tokens))
         point_turn_use_answer_budget = bool(getattr(self.config, "interleaved_point_turn_use_answer_budget", False))
@@ -1000,6 +1068,8 @@ class vLLMRollout(BaseRollout):
                 for idx, flag in enumerate(active_flags):
                     if flag and turn_idx >= per_sample_max_turns[idx]:
                         active_flags[idx] = False
+                        termination_types[idx] = "cap"
+                        termination_reasons[idx] = "turn_cap"
 
                 normal_indices = [idx for idx in turn_indices if not answer_mode_flags[idx]]
                 answer_indices = [idx for idx in turn_indices if answer_mode_flags[idx]]
@@ -1031,13 +1101,33 @@ class vLLMRollout(BaseRollout):
                 # In guarded mode, normal point turns also get the answer upper bound so an
                 # early <answer> can complete in the same request. Well-formed point turns
                 # still stop at the first </point>, so they do not consume the full budget.
-                normal_point_max_tokens = answer_turn_max_tokens if point_turn_use_answer_budget else per_turn_max_tokens
-                normal_point_stop = ["</point>", "</answer>"] if point_turn_use_answer_budget else ["</point>", "<answer>"]
+                if strict_action_scheduler:
+                    # Both V37 A/B arms use the same strict scheduler. Early
+                    # answers must finish in this request, and all
+                    # request classes stop on the first complete action close;
+                    # the final token-native builder rejects any request that
+                    # somehow contains two closed actions.
+                    normal_point_max_tokens = answer_turn_max_tokens
+                    normal_point_stop = canonical_action_stops
+                else:
+                    # Preserve the V36/default-off scheduler exactly.
+                    normal_point_max_tokens = (
+                        answer_turn_max_tokens if point_turn_use_answer_budget else per_turn_max_tokens
+                    )
+                    normal_point_stop = (
+                        ["</point>", "</answer>"]
+                        if point_turn_use_answer_budget
+                        else ["</point>", "<answer>"]
+                    )
                 _run_generate(normal_point_indices, normal_point_max_tokens, stop_for_group=normal_point_stop)
-                _run_generate(normal_final_indices, answer_turn_max_tokens, stop_for_group=["</point>", "</answer>"])
+                _run_generate(
+                    normal_final_indices,
+                    answer_turn_max_tokens,
+                    stop_for_group=canonical_action_stops,
+                )
                 # Answer/long turns also stop at </point>. This prevents a malformed
                 # continuation from packing multiple point tags into one generation turn.
-                _run_generate(answer_indices, answer_turn_max_tokens, stop_for_group=["</point>", "</answer>"])
+                _run_generate(answer_indices, answer_turn_max_tokens, stop_for_group=canonical_action_stops)
 
                 if debug_enabled and self.rank == 0:
                     print(
@@ -1063,15 +1153,39 @@ class vLLMRollout(BaseRollout):
                 turn_count_number_mismatch = 0
                 turn_stall_candidates = 0
 
+                if strict_action_scheduler:
+                    completed_indices = {global_idx for global_idx, _ in completion_pairs}
+                    for missing_idx in set(turn_indices) - completed_indices:
+                        # A scheduler returning fewer RequestOutput rows than
+                        # submitted is an explicit V37 generation failure.
+                        active_flags[missing_idx] = False
+                        termination_types[missing_idx] = "abort"
+                        termination_reasons[missing_idx] = "generation_error"
+
                 for global_idx, output in completion_pairs:
                     completion = output.outputs[0] if output.outputs else None
                     token_ids = list(completion.token_ids) if completion is not None else []
                     stop_reason = getattr(completion, "stop_reason", None) if completion is not None else None
-                    stopped_on_point_close = _stop_reason_matches(stop_reason, point_close_tag, point_close_token_ids)
-                    stopped_on_answer_close = bool(stop_tag) and _stop_reason_matches(
-                        stop_reason, stop_tag, answer_close_token_ids
+                    finish_reason = getattr(completion, "finish_reason", None) if completion is not None else None
+                    event_stop_reason = stop_reason if stop_reason is not None else finish_reason
+                    stopped_on_point_close = _stop_reason_matches(
+                        stop_reason,
+                        point_close_tag,
+                        point_close_token_ids,
+                        exact_string=strict_action_scheduler,
                     )
-                    stopped_on_answer_open = _stop_reason_matches(stop_reason, answer_open_tag, answer_open_token_ids)
+                    stopped_on_answer_close = bool(stop_tag) and _stop_reason_matches(
+                        stop_reason,
+                        stop_tag,
+                        answer_close_token_ids,
+                        exact_string=strict_action_scheduler,
+                    )
+                    stopped_on_answer_open = _stop_reason_matches(
+                        stop_reason,
+                        answer_open_tag,
+                        answer_open_token_ids,
+                        exact_string=strict_action_scheduler,
+                    )
                     if stopped_on_point_close or stopped_on_answer_close or stopped_on_answer_open:
                         try:
                             decoded_before_stop = self.tokenizer.decode(token_ids, skip_special_tokens=False)
@@ -1087,26 +1201,44 @@ class vLLMRollout(BaseRollout):
                             token_ids.extend(answer_open_token_ids)
                     if not token_ids:
                         active_flags[global_idx] = False
+                        termination_types[global_idx] = "abort"
+                        termination_reasons[global_idx] = classify_empty_generation(
+                            completion_present=completion is not None,
+                            stop_reason=stop_reason,
+                            finish_reason=finish_reason,
+                        )
                         turn_empty += 1
                         continue
 
-                    remaining_budget = self.config.response_length - len(response_token_ids[global_idx])
+                    span_start = len(response_token_ids[global_idx])
+                    remaining_budget = self.config.response_length - span_start
                     if remaining_budget <= 0:
                         active_flags[global_idx] = False
+                        termination_types[global_idx] = "cap"
+                        termination_reasons[global_idx] = "token_cap"
                         continue
+                    generated_token_count = len(token_ids)
                     token_ids = token_ids[:remaining_budget]
+                    truncated = len(token_ids) < generated_token_count or str(finish_reason).lower() == "length"
 
                     response_token_ids[global_idx].extend(token_ids)
+                    span_end = len(response_token_ids[global_idx])
+                    native_turn_spans[global_idx].append((span_start, span_end, turn_idx))
+                    last_turn_spans[global_idx] = (span_start, span_end)
                     active_prompt_ids[global_idx].extend(token_ids)
                     decoded_text = self.tokenizer.decode(token_ids, skip_special_tokens=False)
                     if "<point" in decoded_text:
                         turn_point_tag_seen += 1
 
-                    control_combined = (control_tag_buffers[global_idx] + decoded_text)[-2048:]
+                    previous_control = control_tag_buffers[global_idx]
+                    raw_control_combined = previous_control + decoded_text
+                    control_combined = raw_control_combined[-2048:]
                     control_tag_buffers[global_idx] = control_combined
 
                     has_answer_open = "<answer>" in control_combined
                     has_answer_close = "</answer>" in control_combined
+                    if has_answer_open and answer_span_starts[global_idx] is None:
+                        answer_span_starts[global_idx] = span_start
                     
                     last_point_open = control_combined.rfind("<point")
                     last_point_close = control_combined.rfind("</point>")
@@ -1120,14 +1252,63 @@ class vLLMRollout(BaseRollout):
                     last_answer_close = control_combined.rfind("</answer>")
                     is_inside_answer = last_answer_open > last_answer_close
 
+                    point_search_start = max(0, len(previous_control) - len("<point") + 1)
+                    has_new_point_open = raw_control_combined.find("<point", point_search_start) >= 0
+                    if has_new_point_open and point_span_starts[global_idx] is None:
+                        point_span_starts[global_idx] = span_start
+
                     if has_answer_open:
                         turn_answer_open += 1
                     if has_answer_close:
                         turn_answer_closed += 1
 
+                    if has_answer_close and not answer_event_recorded[global_idx]:
+                        event_start = answer_span_starts[global_idx]
+                        if event_start is None:
+                            event_start = span_start
+                        action_event_ledgers[global_idx].append(
+                            make_action_event(
+                                ordinal=len(action_event_ledgers[global_idx]),
+                                event_type="answer",
+                                span_start=event_start,
+                                span_end=span_end,
+                                decision_start=event_start,
+                                decision_end=span_end,
+                                closed=True,
+                                truncated=truncated,
+                                turn_index=turn_idx,
+                                stop_reason=event_stop_reason,
+                            )
+                        )
+                        answer_event_recorded[global_idx] = True
+
                     if stop_tag and (stop_tag in decoded_text or stop_tag in control_combined):
                         active_flags[global_idx] = False
                         answer_mode_flags[global_idx] = False
+                        # A fully closed answer is terminal even when its close
+                        # lands exactly on the response boundary.
+                        termination_types[global_idx] = None
+                        termination_reasons[global_idx] = None
+                        continue
+
+                    if (
+                        strict_action_scheduler
+                        and len(response_token_ids[global_idx]) >= self.config.response_length
+                    ):
+                        active_flags[global_idx] = False
+                        termination_types[global_idx] = "cap"
+                        termination_reasons[global_idx] = "token_cap"
+                        continue
+
+                    # A plain EOS/stop that is not one of our control-tag stops is
+                    # an abort, not a turn cap.  Continuing after EOS would invent
+                    # a cap and make termination semantics ambiguous.
+                    if strict_action_scheduler and str(finish_reason).strip().lower() in ("eos", "stop", "stopped") and not (
+                        stopped_on_point_close or stopped_on_answer_close or stopped_on_answer_open
+                    ):
+                        active_flags[global_idx] = False
+                        termination_types[global_idx] = "abort"
+                        termination_reasons[global_idx] = "eos"
                         continue
 
                     if self.config.interleaved_append_process_prompt:
@@ -1230,6 +1411,24 @@ class vLLMRollout(BaseRollout):
                             first_image, pred_point, point_number=point_counts[global_idx]
                         )
                         turn_points += 1
+                        event_start = point_span_starts[global_idx]
+                        if event_start is None:
+                            event_start = span_start
+                        action_event_ledgers[global_idx].append(
+                            make_action_event(
+                                ordinal=len(action_event_ledgers[global_idx]),
+                                event_type="point",
+                                span_start=event_start,
+                                span_end=span_end,
+                                decision_start=event_start,
+                                decision_end=span_end,
+                                closed=True,
+                                truncated=truncated,
+                                turn_index=turn_idx,
+                                stop_reason=event_stop_reason,
+                            )
+                        )
+                        point_span_starts[global_idx] = None
 
                     updated_images = list(images)
                     updated_images[0] = first_image
@@ -1322,9 +1521,29 @@ class vLLMRollout(BaseRollout):
                     except Exception:
                         pass
 
-        return VF.pad_2d_list_to_length(
-            response_token_ids, self.pad_token_id, max_length=self.config.response_length
-        )
+        for idx, token_ids in enumerate(response_token_ids):
+            if active_flags[idx]:
+                termination_types[idx] = "cap"
+                termination_reasons[idx] = (
+                    "token_cap" if len(token_ids) >= self.config.response_length else "turn_cap"
+                )
+            if strict_action_scheduler:
+                # Rebuild from final generated IDs so split tags have exact
+                # spans and malformed closed payloads retain their ordinal.
+                action_event_ledgers[idx] = build_native_action_event_row(
+                    token_ids,
+                    point_open_ids=point_open_token_ids,
+                    point_close_ids=point_close_token_ids,
+                    answer_open_ids=answer_open_token_ids,
+                    answer_close_ids=answer_close_token_ids,
+                    turn_spans=native_turn_spans[idx],
+                    termination_type=termination_types[idx],
+                    termination_reason=termination_reasons[idx],
+                    return_envelope=True,
+                )
+
+        padded = VF.pad_2d_list_to_length(response_token_ids, self.pad_token_id, max_length=self.config.response_length)
+        return padded, np.asarray(action_event_ledgers, dtype=object)
 
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto) -> DataProto:
@@ -1480,7 +1699,7 @@ class vLLMRollout(BaseRollout):
                         f"first_exists={bool(first_turn_prompt_template)} process_exists={bool(process_prompt_template)}"
                     )
 
-                response_ids = self._generate_interleaved_responses(
+                response_ids, action_event_ledger = self._generate_interleaved_responses(
                     vllm_inputs=vllm_inputs,
                     desired_n=actual_n,
                     question_texts=question_texts,
@@ -1488,9 +1707,10 @@ class vLLMRollout(BaseRollout):
                     first_turn_prompt_template=first_turn_prompt_template,
                     process_prompt_template=process_prompt_template,
                     step_info=step_info,
-                ).to(
-                    input_ids.device
                 )
+                response_ids = response_ids.to(input_ids.device)
+                if os.environ.get("ACTION_EVENT_REWARD_ENABLE", "0").lower() in ("1", "true", "yes"):
+                    non_tensor_batch["action_event_ledger"] = action_event_ledger
             else:
                 completions: List[RequestOutput] = []
                 retries = 0

@@ -29,6 +29,7 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy, Place
 
 from ..base import ClassWithInitArgs, ResourcePool, Worker, WorkerGroup
 from ..base.decorator import MAGIC_ATTR
+from ...utils.ray_environment import collect_ray_worker_environment
 
 
 __all__ = ["Worker"]
@@ -111,7 +112,29 @@ class RayResourcePool(ResourcePool):
             for idx, bundles in enumerate(pg_scheme)
         ]
 
-        ray.get([pg.ready() for pg in pgs])
+        ready_refs = [pg.ready() for pg in pgs]
+        timeout_text = os.environ.get("RAY_PLACEMENT_GROUP_TIMEOUT_SECONDS", "").strip()
+        if timeout_text:
+            try:
+                timeout_seconds = float(timeout_text)
+            except ValueError as exc:
+                raise ValueError(
+                    "RAY_PLACEMENT_GROUP_TIMEOUT_SECONDS must be a positive number"
+                ) from exc
+            if timeout_seconds <= 0:
+                raise ValueError("RAY_PLACEMENT_GROUP_TIMEOUT_SECONDS must be positive")
+            try:
+                ray.get(ready_refs, timeout=timeout_seconds)
+            except ray.exceptions.GetTimeoutError as exc:
+                for pg in pgs:
+                    ray.util.remove_placement_group(pg)
+                raise RuntimeError(
+                    f"Ray placement groups were not ready within {timeout_seconds:g}s"
+                ) from exc
+        else:
+            # Preserve the historical behavior unless a V37/resource-safety
+            # launcher explicitly enables the bounded wait.
+            ray.get(ready_refs)
 
         self.pgs = pgs
         return pgs
@@ -269,7 +292,8 @@ class RayWorkerGroup(WorkerGroup):
                 rank += 1
 
                 # we pass in environment variable at option so that Worker can use environment variable to set
-                env_vars = {
+                env_vars = collect_ray_worker_environment()
+                env_vars.update({
                     "WORLD_SIZE": str(world_size),
                     "RANK": str(rank),
                     "WG_PREFIX": self.name_prefix,
@@ -290,7 +314,7 @@ class RayWorkerGroup(WorkerGroup):
                     "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS", "8"),
                     "NUMEXPR_NUM_THREADS": os.environ.get("NUMEXPR_NUM_THREADS", "8"),
                     "TORCH_NUM_THREADS": os.environ.get("TORCH_NUM_THREADS", "8"),
-                }
+                })
                 # This per-actor runtime_env replaces/overrides the Runner env for
                 # WorkerDict actors, so keep CUDA/vLLM/NCCL and StepCount launch
                 # knobs visible here too. Missing LD_LIBRARY_PATH can make remote
@@ -327,11 +351,6 @@ class RayWorkerGroup(WorkerGroup):
                 ):
                     if key in os.environ:
                         env_vars[key] = os.environ[key]
-                for key, val in os.environ.items():
-                    if key.startswith(("STEPCOUNT_", "TRAJ_", "EASYR1_", "INTERLEAVED_",
-                                       "BOK_", "PROCESS_REWARD_", "POLICY_LOSS_",
-                                       "GRAD_SPIKE_", "GRAD_NONFINITE_", "VCRL_")):
-                        env_vars[key] = val
                 if rank != 0:
                     env_vars["MASTER_ADDR"] = self._master_addr
                     env_vars["MASTER_PORT"] = self._master_port

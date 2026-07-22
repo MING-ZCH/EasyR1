@@ -20,11 +20,20 @@ from omegaconf import OmegaConf
 
 from ..single_controller.ray import RayWorkerGroup
 from ..utils.tokenizer import get_processor, get_tokenizer
+from ..utils.ray_environment import (
+    collect_ray_worker_environment,
+    validate_v37_remote_environment,
+)
 from ..workers.fsdp_workers import FSDPWorker
 from ..workers.reward import BatchFunctionRewardManager, SequentialFunctionRewardManager
 from .config import PPOConfig
 from .data_loader import create_dataloader
 from .ray_trainer import RayPPOTrainer, ResourcePoolManager, Role
+
+
+def _validate_v37_remote_environment() -> None:
+    """Fail before worker construction if a V37 Ray runtime lost arm semantics."""
+    validate_v37_remote_environment("Ray Runner")
 
 
 # please make sure main_task is not scheduled on head
@@ -33,6 +42,7 @@ class Runner:
     """A runner for RL training."""
 
     def run(self, config: PPOConfig):
+        _validate_v37_remote_environment()
         # print config
         print(json.dumps(config.to_dict(), indent=2))
 
@@ -111,83 +121,10 @@ def main():
     ppo_config.deep_post_init()
 
     if not ray.is_initialized():
-        # 从环境变量中获取 NCCL 超时设置，如果没有则使用默认值
-        nccl_timeout = os.environ.get("NCCL_TIMEOUT", "1800")  # 默认 30 分钟
-        torch_distributed_timeout = os.environ.get("TORCH_DISTRIBUTED_TIMEOUT", "1800")
         ray_address = os.environ.get("RAY_ADDRESS", "").strip()
         ray_address_candidates = os.environ.get("RAY_ADDRESS_CANDIDATES", "").strip()
-        
-        runtime_env = {
-            "env_vars": {
-                "TOKENIZERS_PARALLELISM": "true",
-                "NCCL_DEBUG": os.environ.get("NCCL_DEBUG", "WARN"),
-                "VLLM_LOGGING_LEVEL": "WARN",
-                "TORCH_NCCL_AVOID_RECORD_STREAMS": "1",
-                "PYTORCH_CUDA_ALLOC_CONF": os.environ.get(
-                    "PYTORCH_CUDA_ALLOC_CONF",
-                    "expandable_segments:True,max_split_size_mb:512,roundup_power2_divisions:16",
-                ),
-                "PYTHONUNBUFFERED": os.environ.get("PYTHONUNBUFFERED", "1"),
-                "PYTHONHASHSEED": os.environ.get("PYTHONHASHSEED", "0"),
-                # NCCL 超时配置（确保传递到 Ray worker）
-                "NCCL_TIMEOUT": nccl_timeout,
-                "TORCH_DISTRIBUTED_TIMEOUT": torch_distributed_timeout,
-                "TORCH_NCCL_ASYNC_ERROR_HANDLING": os.environ.get(
-                    "TORCH_NCCL_ASYNC_ERROR_HANDLING",
-                    os.environ.get("NCCL_ASYNC_ERROR_HANDLING", "1"),
-                ),
-                # CPU 线程限制（避免占用过多 CPU 资源影响 NCCL 通信）
-                "OMP_NUM_THREADS": os.environ.get("OMP_NUM_THREADS", "8"),
-                "MKL_NUM_THREADS": os.environ.get("MKL_NUM_THREADS", "8"),
-                "NUMEXPR_NUM_THREADS": os.environ.get("NUMEXPR_NUM_THREADS", "8"),
-                "TORCH_NUM_THREADS": os.environ.get("TORCH_NUM_THREADS", "8"),
-                # LD_LIBRARY_PATH for cusparselt
-                "LD_LIBRARY_PATH": os.environ.get("LD_LIBRARY_PATH", ""),
-            }
-        }
-        for key in (
-            "VLLM_USE_V1", "VLLM_ATTENTION_BACKEND",
-            "NCCL_IB_DISABLE_ECE", "NCCL_IB_DISABLE", "NCCL_IB_GID_INDEX",
-            "NCCL_IB_SL", "NCCL_IB_TC", "NCCL_IB_QPS_PER_CONNECTION",
-            "NCCL_IB_TIMEOUT", "NCCL_SOCKET_IFNAME", "GLOO_SOCKET_IFNAME",
-            "TP_SOCKET_IFNAME", "NCCL_IB_HCA", "NCCL_NET_GDR_LEVEL",
-            "NCCL_P2P_DISABLE", "NCCL_PXN_DISABLE",
-            "TORCH_NCCL_ASYNC_ERROR_HANDLING",
-        ):
-            if key in os.environ:
-                runtime_env["env_vars"][key] = os.environ[key]
-        # Pass ALL StepCount/trajectory/reward/BoK/grad-safety env vars to Ray workers.
-        # Without this, remote actors (FSDPWorker/reward workers) can't see launch-script
-        # overrides for these knobs and silently fall back to the hardcoded os.getenv(...)
-        # defaults baked into the reading code (dp_actor.py, core_algos.py, reward/function.py)
-        # -- this is NOT a config error on the launch-script side, it's a missing whitelist
-        # entry here. Confirmed bug (2026-07-02): GRAD_SPIKE_*/GRAD_NONFINITE_* were exported
-        # by v35's launch script (skip-bad-update, never-touch-LR spec) but never reached the
-        # actor process, which silently ran on dp_actor.py's built-in defaults instead
-        # (threshold=5.0x, lr_factor=0.1, brake_max=6/3) -- reproducing the exact v34 LR-crush
-        # failure mode (permanent LR halving after repeated spikes/nonfinite events) that the
-        # launch script was explicitly designed to avoid.
-        #   GRAD_SPIKE_ / GRAD_NONFINITE_ : gradient-spike & nonfinite-grad protection knobs
-        #                                   (dp_actor.py DataParallelPPOActor.__init__)
-        #   VCRL_                         : Variance-based Curriculum RL advantage shaping
-        #                                   (core_algos.py, same os.getenv-without-whitelist
-        #                                    bug class as BOK_, found during this audit)
-        for key, val in os.environ.items():
-            if key.startswith(("STEPCOUNT_", "TRAJ_", "EASYR1_", "INTERLEAVED_",
-                               "BOK_", "PROCESS_REWARD_", "POLICY_LOSS_",
-                               "GRAD_SPIKE_", "GRAD_NONFINITE_", "VCRL_")):
-                runtime_env["env_vars"][key] = val
-        # Also pass critical H20 SIGFPE fixes + other os.getenv-only knobs read inside remote
-        # actors (REWARD_NUM_WORKERS: workers/reward/function.py reward-computation thread pool
-        # size; same missing-whitelist bug class found alongside GRAD_SPIKE_/VCRL_ above).
-        for key in ("NVIDIA_TF32_OVERRIDE", "TORCH_ALLOW_TF32_CUBLAS_OVERRIDE", "DISABLE_ADDMM_CUDA_LT",
-                    "REWARD_NUM_WORKERS"):
-            if key in os.environ:
-                runtime_env["env_vars"][key] = os.environ[key]
-        # Keep training offline by default; only pass wandb bookkeeping vars.
-        for key in ("WANDB_API_KEY", "WANDB_MODE", "WANDB_DIR"):
-            if key in os.environ:
-                runtime_env["env_vars"][key] = os.environ[key]
+
+        runtime_env = {"env_vars": collect_ray_worker_environment()}
         if ray_address:
             addrs = []
             if ray_address_candidates:
